@@ -65,13 +65,20 @@ func TestE2EStreamOKCache(t *testing.T) {
 	if err != nil || text == "" || cached || model == "" || len(seen) == 0 {
 		t.Fatalf("stream: text=%q cached=%v err=%v seen=%d", text, cached, err, len(seen))
 	}
-	// повтор с ДРУГИМ вопросом — из кэша (вопрос не входит в ключ), без провайдера
+	// повтор с ТЕМ ЖЕ вопросом — из кэша, без провайдера (см. S04: вопрос входит в ключ)
 	n := len(seen)
 	ch2 := make(chan string, 64)
-	text2, _, cached2, err := gw.Stream(ctx, "", "daily", testPos, testCards, "ДРУГОЙ вопрос?", ch2)
+	text2, _, cached2, err := gw.Stream(ctx, "", "daily", testPos, testCards, "Вопрос?", ch2)
 	drain(ch2)
 	if err != nil || !cached2 || text2 != text || len(seen) != n {
 		t.Fatalf("cache: cached=%v err=%v calls=%d", cached2, err, len(seen))
+	}
+	// ДРУГОЙ вопрос — свежий вызов провайдера (S04: было PII-leak)
+	ch3 := make(chan string, 64)
+	_, _, cached3, err := gw.Stream(ctx, "", "daily", testPos, testCards, "ДРУГОЙ вопрос?", ch3)
+	drain(ch3)
+	if err != nil || cached3 {
+		t.Fatalf("other question must miss cache: cached=%v err=%v", cached3, err)
 	}
 }
 

@@ -54,11 +54,13 @@ func New(pg *pgxpool.Pool, en *entitlements.Service, gw *ai.Gateway, rf *referra
 }
 
 // fireReferralHook — хук рефералки после 1-го done-чтения (горутина, не блокирует).
+// S06: recover — паника хука не роняет процесс.
 func (s *Service) fireReferralHook(uid string) {
 	if s.rf == nil {
 		return
 	}
 	go func() {
+		defer apierr.Recover()
 		ctx := context.Background()
 		var n int
 		_ = s.pg.QueryRow(ctx,
@@ -108,8 +110,7 @@ type createRequest struct {
 func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	var req createRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное тело")
+	if !apierr.Decode(w, r, &req) {
 		return
 	}
 	key := r.Header.Get("Idempotency-Key")
@@ -120,6 +121,12 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужны spread_code и Idempotency-Key")
 		return
 	}
+	// S04: NUL-байты роняют PG (text запрещает \x00) → 422, не 500
+	if strings.ContainsRune(req.Question, 0) {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный вопрос")
+		return
+	}
+	req.Question = strings.TrimSpace(req.Question)
 	if utf8.RuneCountInString(req.Question) > 500 {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Вопрос длиннее 500 символов")
 		return
@@ -201,8 +208,11 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 
 // streamLive — живой SSE-стрим генерации: токены клиенту + сохранение в конце.
 // Обрыв клиентом (ctx cancel) → строка остается pending_fallback, допишет worker.
+// S06: общий дедлайн 25с (см. 02-interaction-next-go.md: 8с×2 + total SSE).
 func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadCode, question string, cards []cardDraw) {
-	positions, values, spreadName := s.aiInputs(r.Context(), spreadCode, cards)
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	positions, values, spreadName := s.aiInputs(ctx, spreadCode, cards)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -215,7 +225,8 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 	}
 	done := make(chan res, 1)
 	go func() {
-		text, model, _, err := s.gw.Stream(r.Context(), id, spreadName, positions, values, question, ch)
+		defer apierr.Recover() // S06
+		text, model, _, err := s.gw.Stream(ctx, id, spreadName, positions, values, question, ch)
 		done <- res{text, model, err}
 	}()
 	var sb strings.Builder
@@ -248,6 +259,7 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 
 // generate дописывает interpretation+status: AI при ключе, иначе fallback done.
 // При ошибке AI: fallback-текст + pending_fallback (воркер допишет, см. ai/worker.go).
+// S06: дедлайн 25с на всю генерацию.
 func (s *Service) generate(ctx context.Context, id, spreadCode, question string, cards []cardDraw) {
 	if s.gw == nil || !s.gw.Enabled() {
 		_, _ = s.pg.Exec(ctx,
@@ -255,6 +267,8 @@ func (s *Service) generate(ctx context.Context, id, spreadCode, question string,
 			s.fallbackText(ctx, spreadCode, cards), id)
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
 	positions, values, spreadName := s.aiInputs(ctx, spreadCode, cards)
 	ch := make(chan string, 256)
 	type res struct {
@@ -263,6 +277,7 @@ func (s *Service) generate(ctx context.Context, id, spreadCode, question string,
 	}
 	done := make(chan res, 1)
 	go func() {
+		defer apierr.Recover() // S06
 		text, _, _, err := s.gw.Stream(ctx, id, spreadName, positions, values, question, ch)
 		done <- res{text, err}
 	}()

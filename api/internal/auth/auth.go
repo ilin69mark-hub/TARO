@@ -48,7 +48,11 @@ func New(pg *pgxpool.Pool, rd *redis.Client) *Service {
 
 // VerifyInitData проверяет подпись Telegram WebApp initData (HMAC-SHA256, ключ WebAppData).
 // Возвращает tg_id. Протухший auth_date (>24ч) — ошибка.
+// S01 fail-closed: пустой botToken отвергается, кроме явного TG_ALLOW_EMPTY=1 (dev/тесты).
 func VerifyInitData(initData, botToken string) (int64, error) {
+	if botToken == "" && os.Getenv("TG_ALLOW_EMPTY") != "1" {
+		return 0, fmt.Errorf("no bot token")
+	}
 	q, err := url.ParseQuery(initData)
 	if err != nil {
 		return 0, fmt.Errorf("bad initData: %w", err)
@@ -57,13 +61,14 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 	if gotHash == "" {
 		return 0, fmt.Errorf("missing hash")
 	}
-	// auth_date свежесть
-	if ts := q.Get("auth_date"); ts != "" {
-		if unix, err := strconv.ParseInt(ts, 10, 64); err == nil {
-			if time.Since(time.Unix(unix, 0)) > 24*time.Hour {
-				return 0, fmt.Errorf("stale auth_date")
-			}
-		}
+	// auth_date обязателен и свеж (S01: без него initData вечный)
+	ts := q.Get("auth_date")
+	unix, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || ts == "" {
+		return 0, fmt.Errorf("missing auth_date")
+	}
+	if time.Since(time.Unix(unix, 0)) > 24*time.Hour {
+		return 0, fmt.Errorf("stale auth_date")
 	}
 	pairs := []string{}
 	for k, vv := range q {
@@ -154,7 +159,7 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		InitData    string `json:"initData"`
 		Fingerprint string `json:"fingerprint"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.InitData == "" {
+	if !apierr.Decode(w, r, &req) || req.InitData == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
@@ -169,12 +174,13 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rememberSession(r.Context(), id, UserTTL); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
 	writeCookie(w, tok, UserTTL)
+	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "is_new": isNew, "trial_days": trialDays})
+	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "is_new": isNew, "trial_days": trialDays, "csrf_token": csrf})
 }
 
 // anonRequest — POST /v1/auth/anon {uuid, fingerprint?}. IP — из X-Real-IP (ставит nginx).
@@ -183,7 +189,12 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		UUID        string `json:"uuid"`
 		Fingerprint string `json:"fingerprint"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UUID == "" {
+	if !apierr.Decode(w, r, &req) || req.UUID == "" {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный uuid")
+		return
+	}
+	// S08: мусор вместо UUID (ферма на случайных строках) → 422 до БД
+	if !isUUID(req.UUID) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный uuid")
 		return
 	}
@@ -197,6 +208,10 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 			apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком много регистраций, попробуй позже")
 			return
 		}
+		if err.Error() == "fp_mismatch" {
+			apierr.Write(w, http.StatusForbidden, "FP_MISMATCH", "Устройство не узнано, войди через Telegram")
+			return
+		}
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
 		return
 	}
@@ -206,12 +221,13 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rememberSession(r.Context(), id, UserTTL); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
 	writeCookie(w, tok, UserTTL)
+	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id})
+	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "csrf_token": csrf})
 }
 
 // TelegramLogin: вход/регистрация по initData. Новому TG-юзерам — trial 3д (1 раз).
@@ -244,11 +260,39 @@ func (s *Service) TelegramLogin(ctx context.Context, initData, fingerprint strin
 	return id, isNew, trialDays, nil
 }
 
+// isUUID проверяет формат 8-4-4-4-12 hex без внешних зависимостей (см. S08).
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // AnonLogin: вход/создание по uuid из localStorage. Лимит 20 reg/час/IP.
+// S08: uuid обязан быть валидным UUID (иначе 422 выше); при входе сверяем fingerprint:
+// чужой fingerprint на знакомом uuid → 403 (угон через XSS/расширение, см. аудит).
 func (s *Service) AnonLogin(ctx context.Context, uuid, fingerprint, ip string) (string, error) {
-	var id string
-	err := s.pg.QueryRow(ctx, `SELECT id FROM users WHERE anon_uuid=$1`, uuid).Scan(&id)
+	var id, storedFp string
+	err := s.pg.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,'') FROM users WHERE anon_uuid=$1`, uuid).Scan(&id, &storedFp)
 	if err == nil {
+		if storedFp != "" && fingerprint != "" && storedFp != fingerprint {
+			return "", fmt.Errorf("fp_mismatch")
+		}
+		if storedFp == "" && fingerprint != "" {
+			_, _ = s.pg.Exec(ctx, `UPDATE users SET fingerprint=$1 WHERE id=$2`, fingerprint, id)
+		}
 		return id, nil
 	}
 	if err != pgx.ErrNoRows {

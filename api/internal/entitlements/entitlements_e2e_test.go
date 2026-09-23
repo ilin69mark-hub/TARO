@@ -3,6 +3,7 @@ package entitlements
 
 import (
 	"testing"
+	"time"
 
 	"taro/api/internal/testutil"
 )
@@ -84,5 +85,25 @@ func TestE2ESingle(t *testing.T) {
 	v, err = s.Check(ctx, u, "decision")
 	if err != nil || v.Allow {
 		t.Fatalf("decision must deny: %+v err=%v", v, err)
+	}
+}
+
+func TestE2EPGConsume(t *testing.T) {
+	ctx, pg, rd := testutil.Live(t)
+	s := New(pg, rd)
+	u := testutil.NewUser(t, ctx, pg)
+
+	// PG-fallback daily: allow, allow? limit 1 → deny второй
+	ok, err := s.pgConsume(ctx, u, "daily", 1, mskDate(time.Now()))
+	if err != nil || !ok {
+		t.Fatalf("pg daily first: ok=%v err=%v", ok, err)
+	}
+	ok, err = s.pgConsume(ctx, u, "daily", 1, mskDate(time.Now()))
+	if err != nil || ok {
+		t.Fatalf("pg daily second must deny: ok=%v err=%v", ok, err)
+	}
+	// MSK-дата и понедельник sane
+	if mondayMSK(time.Now()) == "" || mskDate(time.Now()) == "" {
+		t.Fatal("empty dates")
 	}
 }

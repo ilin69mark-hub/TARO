@@ -82,7 +82,7 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		Provider       string `json:"provider"`
 		IdempotencyKey string `json:"idempotency_key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PlanCode == "" {
+	if !apierr.Decode(w, r, &req) || req.PlanCode == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен plan_code")
 		return
 	}
@@ -261,6 +261,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var upd tgUpdate
+	r.Body = http.MaxBytesReader(w, r.Body, apierr.MaxBody)
 	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil || upd.Message == nil || upd.Message.SuccessfulPayment == nil {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": true})
@@ -298,29 +299,29 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if planCode == "single_99" {
-		// разовый: какой спред — решает клиент следующим вызовом? Нет: single привязан к спреду
-		// через consume. Здесь создаем entitlement-заготовку без спреда? По Книге single
-		// гасится конкретным чтением — спред выбирает юзер. Храним entitlement со spread='?'
-		// Решение frozen здесь: single_entitlements требует spread_code → создаем строку
-		// на самый дорогой premium (celtic) с возможностью смены? Нет — честнее: ждем выбора.
-		// single_99 без выбора спреда не начисляем в подписку, entitlement создает /v1/readings
-		// по факту? Упрощение MVP: single_99 дает 30 дней? Нет!
-		// Финальное решение: single_99 = 1 чтение ЛЮБОГО premium: entitlement без привязки
-		// (spread_code='any'), гасится первым premium-чтением (см. readings T29-патч).
-		_, _ = tx.Exec(ctx,
+		// single_99 = 1 чтение ЛЮБОГО premium (spread_code='any'),
+		// гасится первым premium-чтением (см. readings T29-патч).
+		// S05: ошибка вставки → Rollback + 500 (ретрай TG даст duplicate, денег без услуги нет).
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO single_entitlements (user_id, spread_code, payment_id) VALUES ($1,'any',$2)`,
-			userID, paymentID)
+			userID, paymentID); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка начисления")
+			return
+		}
 	} else {
 		days := 30
 		if duration != nil && *duration > 0 {
 			days = *duration
 		}
-		_, _ = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)
 			SELECT $1,$2,$3,(SELECT price_rub FROM plans WHERE id=$2),
 			       GREATEST(COALESCE(MAX(valid_until), now()), now()) + make_interval(days => $4)
 			  FROM subscriptions WHERE user_id=$1 AND status='active'`,
-			userID, planID, planCode, days)
+			userID, planID, planCode, days); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка начисления")
+			return
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
@@ -338,8 +339,7 @@ func (s *Service) HandleVerify(w http.ResponseWriter, r *http.Request) {
 		PaymentID         string `json:"payment_id"`
 		ProviderPaymentID string `json:"provider_payment_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное тело")
+	if !apierr.Decode(w, r, &req) {
 		return
 	}
 	uid := auth.UserID(r.Context())
@@ -419,7 +419,7 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PaymentID string `json:"payment_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PaymentID == "" {
+	if !apierr.Decode(w, r, &req) || req.PaymentID == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен payment_id")
 		return
 	}

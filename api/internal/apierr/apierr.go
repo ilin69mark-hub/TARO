@@ -4,9 +4,9 @@ package apierr
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
-// Коды ошибок — единые на весь API (см. 04-api-spec.md).
 const (
 	CodeValidation   = "VALIDATION"
 	CodeRateLimited  = "RATE_LIMITED"
@@ -18,6 +18,7 @@ const (
 	CodeNotFound     = "NOT_FOUND"
 	CodeUnauthorized = "UNAUTHORIZED"
 	CodeForbidden    = "FORBIDDEN"
+	CodeUnavailable  = "UNAVAILABLE" // 503: зависимость (Redis/AI) недоступна, ретрай позже (см. S03)
 )
 
 type envelope struct {
@@ -34,4 +35,30 @@ func Write(w http.ResponseWriter, status int, code, messageRu string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(envelope{Error: errBody{Code: code, Message: messageRu}})
+}
+
+// MaxBody — лимит тела запроса (см. S06): auth 32KB, остальное 1MB.
+const MaxBody = 1 << 20
+
+// Decode читает JSON-тело с лимитом и строгим режимом (без unknown-полей).
+// Возвращает false + пишет 413/422 при переполнении/битом JSON.
+func Decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			Write(w, http.StatusRequestEntityTooLarge, CodeValidation, "Слишком большое тело")
+		} else {
+			Write(w, http.StatusUnprocessableEntity, CodeValidation, "Некорректное тело")
+		}
+		return false
+	}
+	return true
+}
+
+// Recover — recover для горутин (см. S06): паника гасится, процесс жив.
+// Использование: go func() { defer apierr.Recover(); ... }().
+func Recover() {
+	_ = recover()
 }

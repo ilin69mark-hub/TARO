@@ -26,7 +26,7 @@ func authRouter(t *testing.T) (*chi.Mux, *Service) {
 	_, pg, rd := testutil.Live(t)
 	svc := New(pg, rd)
 	r := chi.NewRouter()
-	r.Use(RequireCSRF)
+	r.Use(svc.RequireCSRF)
 	r.Post("/v1/auth/telegram", svc.HandleTelegram)
 	r.Post("/v1/auth/anon", svc.HandleAnon)
 	r.With(svc.RequireAuth).Post("/v1/auth/link", svc.HandleLink)
@@ -53,10 +53,12 @@ func craft(t *testing.T, botToken string, tgID int64) string {
 	return q.Encode()
 }
 
-func doAuth(r *chi.Mux, tok, method, path, body string) *httptest.ResponseRecorder {
+func doAuth(r *chi.Mux, tok, method, path, body, csrf string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-CSRF", "1")
+	if csrf != "" {
+		req.Header.Set("X-CSRF", csrf)
+	}
 	if tok != "" {
 		req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
 	}
@@ -68,7 +70,7 @@ func doAuth(r *chi.Mux, tok, method, path, body string) *httptest.ResponseRecord
 func TestE2EAuthHandlers(t *testing.T) {
 	t.Setenv("TG_BOT_TOKEN", "test-bot")
 	t.Setenv("JWT_SECRET", "test-secret")
-	r, _ := authRouter(t)
+	r, svc := authRouter(t)
 	// dev-Redis общий: чистим rate-ключи (иначе 20 reg/час бьет по своим же прогонам)
 	{
 		_, pg, rd := testutil.Live(t)
@@ -83,7 +85,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 
 	// anon (uuid уникален на прогон — иначе link-состояние перетекает, формат 8-4-4-4-12!)
 	anonUUID := "aaaaaaaa-" + hex4(base) + "-0000-0000-000000000000"
-	rec := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"`+anonUUID+`"}`)
+	rec := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"`+anonUUID+`"}`, "")
 	if rec.Code != 200 {
 		t.Fatalf("anon: %d %s", rec.Code, rec.Body.String())
 	}
@@ -101,11 +103,11 @@ func TestE2EAuthHandlers(t *testing.T) {
 
 	// telegram новый → trial 3
 	init := craft(t, "test-bot", base+1)
-	rec = doAuth(r, "", "POST", "/v1/auth/telegram", `{"initData":"`+url.QueryEscape(init)+`"}`)
+	rec = doAuth(r, "", "POST", "/v1/auth/telegram", `{"initData":"`+url.QueryEscape(init)+`"}`, "")
 	// initData уже url-encoded строкой? HandleTelegram ждет сырой initData query-string:
 	_ = rec
 	initRaw := craft(t, "test-bot", base+2)
-	rec = doAuth(r, "", "POST", "/v1/auth/telegram", `{"initData":`+strconv.Quote(initRaw)+`}`)
+	rec = doAuth(r, "", "POST", "/v1/auth/telegram", `{"initData":`+strconv.Quote(initRaw)+`}`, "")
 	if rec.Code != 200 {
 		t.Fatalf("telegram: %d %s", rec.Code, rec.Body.String())
 	}
@@ -123,7 +125,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 
 	// link: anon → tg 424244 (свободен) → attach + trial
 	init2 := craft(t, "test-bot", base+3)
-	rec = doAuth(r, cookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init2)+`}`)
+	rec = doAuth(r, cookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init2)+`}`, csrfOf(t, svc, anon["user_id"].(string)))
 	if rec.Code != 200 {
 		t.Fatalf("link: %d %s", rec.Code, rec.Body.String())
 	}
@@ -141,13 +143,13 @@ func TestE2EAuthHandlers(t *testing.T) {
 			newCookie = c.Value
 		}
 	}
-	rec = doAuth(r, newCookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init3)+`}`)
+	rec = doAuth(r, newCookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init3)+`}`, csrfOf(t, svc, linked["user_id"].(string)))
 	if rec.Code != 409 {
 		t.Fatalf("relink: want 409 got %d", rec.Code)
 	}
 
 	// merge: anon B → занятый tg (base+2): B удаляется, survivor — TG-юзер
-	recB := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"bbbbbbbb-`+hex4(base+1)+`-0000-0000-000000000000"}`)
+	recB := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"bbbbbbbb-`+hex4(base+1)+`-0000-0000-000000000000"}`, "")
 	if recB.Code != 200 {
 		t.Fatalf("anonB: %d %s", recB.Code, recB.Body.String())
 	}
@@ -161,7 +163,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 	}
 	uidB, _ := anonB["user_id"].(string)
 	initTaken := craft(t, "test-bot", base+2)
-	rec = doAuth(r, cookieB, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(initTaken)+`}`)
+	rec = doAuth(r, cookieB, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(initTaken)+`}`, csrfOf(t, svc, anonB["user_id"].(string)))
 	if rec.Code != 200 {
 		t.Fatalf("merge: %d %s", rec.Code, rec.Body.String())
 	}
@@ -181,4 +183,13 @@ func hex4(n int64) string {
 		s = "0" + s
 	}
 	return s[len(s)-4:]
+}
+
+func csrfOf(t *testing.T, svc *Service, uid string) string {
+	t.Helper()
+	v, err := svc.csrfFor(context.Background(), uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
 }

@@ -77,6 +77,8 @@ func keyPart(r *http.Request, byUser bool) string {
 }
 
 // Middleware проверяет лимит по первому совпавшему префиксу.
+// S03: ошибка Redis → fail-open (пропустить + залогировать): иначе лежащий Redis
+// превращается в DoS-усилитель (429 всем).
 func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, rl := range l.rules {
@@ -86,7 +88,11 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			key := "rl:" + rl.prefix + ":" + keyPart(r, rl.byUser)
 			ok, err := l.rd.Eval(r.Context(), windowLua,
 				[]string{key}, rl.rule.Max, rl.rule.Window).Int()
-			if err != nil || ok == 0 {
+			if err != nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if ok == 0 {
 				w.Header().Set("Retry-After", strconv.Itoa(rl.rule.Window))
 				apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком часто, попробуй позже")
 				return

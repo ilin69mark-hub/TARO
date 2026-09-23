@@ -67,6 +67,44 @@ func weekKey(now time.Time) string {
 	return strconv.Itoa(y) + "-W" + strconv.Itoa(w)
 }
 
+// mondayMSK возвращает дату понедельника текущей ISO-недели (для love_week, см. S03).
+func mondayMSK(now time.Time) string {
+	msk, _ := time.LoadLocation("Europe/Moscow")
+	if msk == nil {
+		msk = time.FixedZone("MSK", 3*3600)
+	}
+	local := now.In(msk)
+	wd := int(local.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	return local.AddDate(0, 0, -(wd - 1)).Format("2006-01-02")
+}
+
+// mondayMidnightMSK — unix следующего понедельника 00:00 MSK (TTL love-ключа, см. S03).
+func mondayMidnightMSK(now time.Time) int64 {
+	msk, _ := time.LoadLocation("Europe/Moscow")
+	if msk == nil {
+		msk = time.FixedZone("MSK", 3*3600)
+	}
+	local := now.In(msk)
+	wd := int(local.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	next := time.Date(local.Year(), local.Month(), local.Day()+(8-wd), 0, 0, 0, 0, msk)
+	return next.Unix()
+}
+
+// mskDate — сегодняшняя дата МСК.
+func mskDate(now time.Time) string {
+	msk, _ := time.LoadLocation("Europe/Moscow")
+	if msk == nil {
+		msk = time.FixedZone("MSK", 3*3600)
+	}
+	return now.In(msk).Format("2006-01-02")
+}
+
 // config читает лимит из app_config (дефолт при отсутствии).
 func (s *Service) config(ctx context.Context, key, def string) string {
 	var v string
@@ -88,12 +126,63 @@ func atoi(s, def string) int {
 }
 
 // consume выполняет Lua-потребление: true если влезли в лимит.
+// Ошибка Redis → (false, err): caller решает — PG-fallback (см. Check) или 503.
 func (s *Service) consume(ctx context.Context, key string, limit int, expireAt int64) (bool, error) {
 	n, err := s.rd.Eval(ctx, consumeLua, []string{key}, limit, expireAt).Int()
 	if err != nil {
 		return false, err
 	}
 	return n != -1, nil
+}
+
+// pgConsume — PG-fallback счетчика при недоступном Redis (см. S03).
+// Транзакция SELECT FOR UPDATE: атомарно в пределах PG. kind: "daily"|"love".
+func (s *Service) pgConsume(ctx context.Context, userID, kind string, limit int, period string) (bool, error) {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var used int
+	var curPeriod *string
+	var q string
+	if kind == "daily" {
+		q = `SELECT free_used_today, free_date::text FROM entitlements WHERE user_id=$1 FOR UPDATE`
+	} else {
+		q = `SELECT love_used_week, love_week::text FROM entitlements WHERE user_id=$1 FOR UPDATE`
+	}
+	err = tx.QueryRow(ctx, q, userID).Scan(&used, &curPeriod)
+	if err != nil {
+		// строки нет — создаем с used=0
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO entitlements (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+			return false, err
+		}
+		used, curPeriod = 0, nil
+	}
+	newVal := used + 1
+	if curPeriod == nil || *curPeriod != period {
+		newVal = 1 // новый период — сброс
+	}
+	if newVal > limit {
+		return false, nil // rollback через defer, 402 выше
+	}
+	if kind == "daily" {
+		_, err = tx.Exec(ctx,
+			`UPDATE entitlements SET free_used_today=$2, free_date=$3::date WHERE user_id=$1`,
+			userID, newVal, period)
+	} else {
+		_, err = tx.Exec(ctx,
+			`UPDATE entitlements SET love_used_week=$2, love_week=$3::date WHERE user_id=$1`,
+			userID, newVal, period)
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Check проверяет право на расклад (порядок frozen, см. 02-functional/05).
@@ -116,10 +205,13 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 		return Verdict{}, err
 	}
 	now := time.Now()
-	// 2. love для free — недельный счетчик
+	// 2. love для free — недельный счетчик (Redis, при ошибке — PG, см. S03)
 	if isLove {
 		weekly := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
-		ok, err := s.consume(ctx, "ent:"+userID+":love:"+weekKey(now), weekly, midnightMSK(now)+6*24*3600)
+		ok, err := s.consume(ctx, "ent:"+userID+":love:"+weekKey(now), weekly, mondayMidnightMSK(now))
+		if err != nil {
+			ok, err = s.pgConsume(ctx, userID, "love", weekly, mondayMSK(now))
+		}
 		if err != nil {
 			return Verdict{}, err
 		}
@@ -140,9 +232,13 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 		}
 		return Verdict{Reason: "limit_exceeded"}, nil
 	}
-	// 4. обычный free — дневной счетчик
+	// 4. обычный free — дневной счетчик (Redis, при ошибке — PG, см. S03).
+	// Ключ от MSK-даты (UTC ехал на 3ч, см. аудит S03).
 	daily := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
-	ok, err := s.consume(ctx, "ent:"+userID+":"+now.Format("2006-01-02"), daily, midnightMSK(now))
+	ok, err := s.consume(ctx, "ent:"+userID+":"+mskDate(now), daily, midnightMSK(now))
+	if err != nil {
+		ok, err = s.pgConsume(ctx, userID, "daily", daily, mskDate(now))
+	}
 	if err != nil {
 		return Verdict{}, err
 	}
@@ -219,7 +315,7 @@ func (s *Service) HandleMe(w http.ResponseWriter, r *http.Request) {
 	daily := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
 	weekly := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
 	now := time.Now()
-	freeUsed, _ := s.rd.Get(ctx, "ent:"+uid+":"+now.Format("2006-01-02")).Int()
+	freeUsed, _ := s.rd.Get(ctx, "ent:"+uid+":"+mskDate(now)).Int()
 	loveUsed, _ := s.rd.Get(ctx, "ent:"+uid+":love:"+weekKey(now)).Int()
 	freeLeft := daily - freeUsed
 	if freeLeft < 0 {

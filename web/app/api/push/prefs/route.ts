@@ -4,12 +4,10 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
 
+import { fwdHeaders } from "@/lib/proxy";
+
 function hdrs(req: NextRequest) {
-  return {
-    "Content-Type": "application/json",
-    "X-CSRF": "1",
-    Cookie: req.headers.get("cookie") || "",
-  };
+  return fwdHeaders(req);
 }
 
 // GET /api/push/prefs → Go (cookie дальше, см. V24).

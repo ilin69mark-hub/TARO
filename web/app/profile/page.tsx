@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { api } from "@/lib/api";
+import { api, csrf } from "@/lib/api";
 import { applyCalm, isCalm } from "@/components/Legal";
 import PushOptIn from "@/components/PushOptIn";
 import PushPrefs from "@/components/PushPrefs";
@@ -115,7 +115,7 @@ export default function ProfilePage() {
             await fetch("/api/me", {
               method: "DELETE",
               credentials: "include",
-              headers: { "X-CSRF": "1" },
+              headers: { "X-CSRF": csrf() },
             }).catch(() => undefined);
             try {
               localStorage.clear();

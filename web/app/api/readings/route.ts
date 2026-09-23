@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
+import { fwdHeaders } from "@/lib/proxy";
 
 // GET /api/readings?limit&offset&q → Go (cookie дальше, q только premium — 403 иначе).
 export async function GET(req: NextRequest) {
@@ -21,13 +22,7 @@ export async function GET(req: NextRequest) {
 // JSON — как есть. Idempotency-Key уходит дальше (см. T12).
 export async function POST(req: NextRequest) {
   const body = await req.text();
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "X-CSRF": "1",
-    Cookie: req.headers.get("cookie") || "",
-  };
-  const idem = req.headers.get("idempotency-key");
-  if (idem) headers["Idempotency-Key"] = idem;
+  const headers: Record<string, string> = fwdHeaders(req);
   const accept = req.headers.get("accept") || "";
   if (accept.includes("text/event-stream")) headers["Accept"] = accept;
   const res = await fetch(`${GO}/v1/readings`, { method: "POST", headers, body });

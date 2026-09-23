@@ -44,9 +44,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
       TG_STARS_SECRET_TOKEN: ${TG_STARS_SECRET_TOKEN:-dev-only-stars}
-      # VAPID dev-ключи (U21; на проде — свои через env хоста!)
-      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-BKApO8VWk4H1WeiqB1IHuJPVHPendNUt7KXbVIdGuhdOq3s2m3du4PMw-WtfuqaQnJIlFML1IBWjKKnNpgpjX6M}
-      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo}
+      # VAPID dev-ключи — ТОЛЬКО через .env (gitignored) или env хоста (см. S09).
+      # В git здесь плейсхолдеры: прод с незаданным env НЕ стартует.
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:?задай VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:?задай VAPID_PRIVATE_KEY}
     depends_on:
       - db
       - cache

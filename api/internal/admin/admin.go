@@ -69,7 +69,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		InitData string `json:"initData"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.InitData == "" {
+	if !apierr.Decode(w, r, &req) || req.InitData == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
@@ -238,8 +238,7 @@ type publishRequest struct {
 // пишет admin_audit + точечно инвалидирует кэш (<5с SLA).
 func (s *Service) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	var req publishRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное тело запроса")
+	if !apierr.Decode(w, r, &req) {
 		return
 	}
 	ctx := r.Context()

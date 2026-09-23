@@ -17,5 +17,8 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/public ./public
+# S09: non-root (встроенный user node), healthcheck
+USER node
 EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:3000/ || exit 1
 CMD ["npm", "run", "start"]

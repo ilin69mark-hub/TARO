@@ -80,15 +80,22 @@ func TestE2EPushHandlers(t *testing.T) {
 	if rec := do(tok, "POST", "/v1/push/prefs", `{"hour":20,"quiet":true}`); rec.Code != 200 {
 		t.Fatalf("set: %d", rec.Code)
 	}
-	// subscribe bad → 422; ok → 200; unsubscribe → 200
-	if rec := do(tok, "POST", "/v1/push/subscribe", `{"endpoint":"x"}`); rec.Code != 422 {
-		t.Fatalf("sub bad: want 422 got %d", rec.Code)
+	// subscribe bad → 422; SSRF (169.254, http, 127.0.0.1) → 422 (см. S02)
+	for _, bad := range []string{
+		`{"endpoint":"http://169.254.169.254/x","p256dh":"AA","auth":"BB"}`,
+		`{"endpoint":"http://example.com/x","p256dh":"AA","auth":"BB"}`,
+		`{"endpoint":"https://127.0.0.1:8081/x","p256dh":"AA","auth":"BB"}`,
+		`{"endpoint":"https://user:pass@push.example/x","p256dh":"AA","auth":"BB"}`,
+	} {
+		if rec := do(tok, "POST", "/v1/push/subscribe", bad); rec.Code != 422 {
+			t.Fatalf("ssrf %s: want 422 got %d", bad[:40], rec.Code)
+		}
 	}
-	sub := `{"endpoint":"https://push.example/e2e1","p256dh":"AA","auth":"BB"}`
+	sub := `{"endpoint":"https://example.com/e2e1","p256dh":"AA","auth":"BB"}`
 	if rec := do(tok, "POST", "/v1/push/subscribe", sub); rec.Code != 200 {
 		t.Fatalf("sub: %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := do(tok, "DELETE", "/v1/push/unsubscribe", `{"endpoint":"https://push.example/e2e1"}`); rec.Code != 200 {
+	if rec := do(tok, "DELETE", "/v1/push/unsubscribe", `{"endpoint":"https://example.com/e2e1"}`); rec.Code != 200 {
 		t.Fatalf("unsub: %d", rec.Code)
 	}
 	// вечерняя/стрик/реминдер/статы без подписок — ok с нулями

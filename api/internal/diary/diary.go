@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -44,6 +45,9 @@ type entryRequest struct {
 }
 
 func (s *Service) validate(uid string, req entryRequest) string {
+	if strings.ContainsRune(req.Body, 0) {
+		return "Некорректный текст" // S04: NUL роняет PG
+	}
 	if len([]rune(req.Body)) < 1 || len([]rune(req.Body)) > 10000 {
 		return "Текст от 1 до 10000 символов"
 	}
@@ -57,8 +61,7 @@ func (s *Service) validate(uid string, req entryRequest) string {
 func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	var req entryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное тело")
+	if !apierr.Decode(w, r, &req) {
 		return
 	}
 	if msg := s.validate(uid, req); msg != "" {
@@ -162,8 +165,7 @@ func (s *Service) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req entryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное тело")
+	if !apierr.Decode(w, r, &req) {
 		return
 	}
 	if msg := s.validate(uid, req); msg != "" {

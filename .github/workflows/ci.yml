@@ -69,6 +69,13 @@ jobs:
           -path /migrations
           -database "postgres://taro:ci-only@localhost:5432/taro?sslmode=disable" up
       # D2: тесты гоняются всегда; e2e со Skip получают сервисы выше и НЕ скипаются в CI
-      - run: go test ./...
-      # D2: тесты гоняются всегда; e2e со Skip получают сервисы выше и НЕ скипаются в CI
-      - run: go test ./...
+      - run: go test -race -count=1 ./...
+
+  security:
+    # S09: секреты и .env никогда не попадают в git
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test ! -e .env || (echo ".env committed!" && exit 1)
+      - run: test -z "$(grep -rn '11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo' --exclude-dir=.git . || true)"
+      - run: test -z "$(git ls-files | grep -E '(^|/)\.env$' || true)"

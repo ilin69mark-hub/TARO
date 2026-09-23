@@ -20,6 +20,7 @@ type userCtxKey struct{}
 
 // RequireAuth — middleware: JWT из cookie taro_jwt + живой sess:<uid> → user_id в контекст.
 // DEL sess (logout, merge проигравшего) инвалидирует токен мгновенно. Иначе 401.
+// S03: ошибка Redis → 503 (не 401 — сессия может быть жива, Redis просто лежит).
 func (s *Service) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(CookieName)
@@ -32,7 +33,12 @@ func (s *Service) RequireAuth(next http.Handler) http.Handler {
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия истекла, войди снова")
 			return
 		}
-		if n, err := s.rd.Exists(r.Context(), sessKey(uid)).Result(); err != nil || n == 0 {
+		n, err := s.rd.Exists(r.Context(), sessKey(uid)).Result()
+		if err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		if n == 0 {
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 			return
 		}
@@ -57,7 +63,7 @@ func (s *Service) HandleLink(w http.ResponseWriter, r *http.Request) {
 		InitData    string `json:"initData"`
 		Fingerprint string `json:"fingerprint"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.InitData == "" {
+	if !apierr.Decode(w, r, &req) || req.InitData == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
@@ -81,7 +87,7 @@ func (s *Service) HandleLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rememberSession(r.Context(), survivor, UserTTL); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
 	writeCookie(w, tok, UserTTL)

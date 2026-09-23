@@ -4,11 +4,9 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
 
-const headers = (req: NextRequest) => ({
-  "Content-Type": "application/json",
-  "X-CSRF": "1",
-  Cookie: req.headers.get("cookie") || "",
-});
+import { fwdHeaders } from "@/lib/proxy";
+
+const headers = (req: NextRequest) => fwdHeaders(req);
 
 async function fwd(res: Response) {
   const body = await res.arrayBuffer();

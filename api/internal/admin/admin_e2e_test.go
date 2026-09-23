@@ -116,8 +116,9 @@ func TestE2EAdminLogin(t *testing.T) {
 	if rec := acall(r, "", "POST", "/v1/admin/login", `{"initData":"user=%7B%22id%22%3A1%7D&hash=x"}`); rec.Code != 401 {
 		t.Fatalf("bad login: want 401 got %d", rec.Code)
 	}
-	// позитивный: craft с пустым токеном (env пуст) + whitelist
+	// позитивный: craft с пустым токеном (env пуст) + whitelist; S01 требует TG_ALLOW_EMPTY=1
 	t.Setenv("TG_BOT_TOKEN", "")
+	t.Setenv("TG_ALLOW_EMPTY", "1")
 	t.Setenv("ADMIN_TG_IDS", "777001")
 	init := craftInit(t, 777001)
 	rec := acall(r, "", "POST", "/v1/admin/login", `{"initData":`+quote(init)+`}`)

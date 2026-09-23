@@ -70,7 +70,7 @@ func (s *Service) HandleAge(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Confirmed bool `json:"confirmed"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Confirmed {
+	if !apierr.Decode(w, r, &req) || !req.Confirmed {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужно подтверждение 18+")
 		return
 	}

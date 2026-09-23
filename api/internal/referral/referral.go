@@ -90,7 +90,7 @@ func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code string `json:"code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+	if !apierr.Decode(w, r, &req) || req.Code == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен код")
 		return
 	}

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -58,16 +59,58 @@ type subRequest struct {
 	Auth     string `json:"auth"`
 }
 
-// HandleSubscribe — POST /v1/push/subscribe: upsert по endpoint.
+// validEndpoint — SSRF-allowlist (см. S02): только https, без userinfo,
+// хост не private/loopback/link-local (проверяем и литерал, и DNS-ответ).
+func validEndpoint(ctx context.Context, raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return fmt.Errorf("bad url")
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("https only")
+	}
+	if u.User != nil {
+		return fmt.Errorf("no userinfo")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("no host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("blocked ip")
+		}
+		return nil
+	}
+	// DNS: все ответы должны быть публичными (защита от rebinding — на момент subscribe)
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addrs) == 0 {
+		return fmt.Errorf("dns fail")
+	}
+	for _, a := range addrs {
+		if isBlockedIP(a.IP) {
+			return fmt.Errorf("blocked resolved ip")
+		}
+	}
+	return nil
+}
+
+// isBlockedIP — private, loopback, link-local, multicast, unspecified.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// HandleSubscribe — POST /v1/push/subscribe: upsert по endpoint (SSRF-allowlist, см. S02).
 func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	var req subRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Endpoint == "" || req.P256DH == "" || req.Auth == "" {
+	if !apierr.Decode(w, r, &req) || req.Endpoint == "" || req.P256DH == "" || req.Auth == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужны endpoint, p256dh, auth")
 		return
 	}
-	if _, err := url.ParseRequestURI(req.Endpoint); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный endpoint")
+	if err := validEndpoint(r.Context(), req.Endpoint); err != nil {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимый endpoint")
 		return
 	}
 	_, err := s.pg.Exec(r.Context(), `
@@ -88,7 +131,7 @@ func (s *Service) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Endpoint string `json:"endpoint"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Endpoint == "" {
+	if !apierr.Decode(w, r, &req) || req.Endpoint == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен endpoint")
 		return
 	}
@@ -117,7 +160,7 @@ func (s *Service) HandleGetPrefs(w http.ResponseWriter, r *http.Request) {
 // HandleSetPrefs — POST /v1/push/prefs {hour, quiet}.
 func (s *Service) HandleSetPrefs(w http.ResponseWriter, r *http.Request) {
 	var p Prefs
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Hour < 0 || p.Hour > 23 {
+	if !apierr.Decode(w, r, &p) || p.Hour < 0 || p.Hour > 23 {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Час 0–23")
 		return
 	}

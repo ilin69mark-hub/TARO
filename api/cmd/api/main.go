@@ -54,6 +54,7 @@ func main() {
 	gw.StartWorker(workerCtx, pg, 30*time.Second)
 	// тик протухания pending-платежей 15м (см. T29)
 	go func() {
+		defer apierr.Recover() // S06
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
 		for {
@@ -61,14 +62,19 @@ func main() {
 			case <-workerCtx.Done():
 				return
 			case <-t.C:
-				_, _ = py.ExpirePending(context.Background())
+				func() {
+					defer apierr.Recover() // S06
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_, _ = py.ExpirePending(ctx)
+				}()
 			}
 		}
 	}()
 
 	r := chi.NewRouter()
-	// CSRF для всех POST/PUT/DELETE (кроме Stars-webhook с Secret-Token — см. T29).
-	r.Use(auth.RequireCSRF)
+	// CSRF per-session (метод — нужен Redis, см. S07). Webhook исключен внутри.
+	r.Use(au.RequireCSRF)
 	// Go rate limits — второй рубеж после nginx (см. V31, 04-api-spec.md).
 	r.Use(ratelimit.New(rd).Middleware)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {

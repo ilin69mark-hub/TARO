@@ -1,5 +1,6 @@
-# api-admin — только 127.0.0.1:8081, наружу не публикуется (см. ADR-06, BACKLOG T02).
+# api-admin — только 127.0.0.1:8081, наружу НЕ публикуется (см. ADR-06, BACKLOG T02).
 # Доступ — только SSH-туннель: ssh -L 8081:127.0.0.1:8081 vps
+# EXPOSE убран намеренно чтобы не вводить в заблуждение (см. S09).
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -8,7 +9,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /api-admin ./cmd/admin
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# S09: tzdata (MSK-время!), non-root, healthcheck
+RUN apk add --no-cache ca-certificates tzdata wget && adduser -D -u 10001 app
 COPY --from=build /api-admin /api-admin
-EXPOSE 8081
+USER app
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8081/healthz || exit 1
 ENTRYPOINT ["/api-admin"]

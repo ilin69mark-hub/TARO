@@ -11,6 +11,7 @@ import (
 )
 
 // StartWorker запускает горутину-воркер до отмены ctx.
+// S06: recover на каждой итерации — паника drain не роняет процесс.
 func (g *Gateway) StartWorker(ctx context.Context, pg *pgxpool.Pool, tick time.Duration) {
 	go func() {
 		t := time.NewTicker(tick)
@@ -20,7 +21,10 @@ func (g *Gateway) StartWorker(ctx context.Context, pg *pgxpool.Pool, tick time.D
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				g.drainOnce(ctx, pg)
+				func() {
+					defer func() { _ = recover() }()
+					g.drainOnce(ctx, pg)
+				}()
 			}
 		}
 	}()
@@ -73,7 +77,10 @@ func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) {
 	}
 	rows.Close()
 	for _, j := range jobs {
-		text := g.complete(ctx, j.spread, j.positions, j.cards, j.question)
+		// S06: дедлайн 30с на джобу, иначе висячие горутины при деградации провайдера
+		jctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		text := g.complete(jctx, j.spread, j.positions, j.cards, j.question)
+		cancel()
 		if text == "" {
 			continue // AI все еще лежит — оставляем pending_fallback
 		}

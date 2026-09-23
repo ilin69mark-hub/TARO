@@ -1,15 +1,21 @@
-// API-клиент web→same-origin /api (см. T16, 04-architecture/02).
-// Все POST несут X-CSRF (требует Go, см. internal/auth/session.go).
-// Cookie taro_jwt — httpOnly, шлет браузер сам (credentials: include).
+// API-клиент web→same-origin /api (см. T16, 04-architecture/02, S07).
+// CSRF: per-session токен из cookie taro_csrf (ставит Go при login, см. issueCSRF).
+// Прокси его НЕ инжектит — форвардит клиентский (см. S07).
 import { track, events } from "./analytics";
 
-const CSRF = "1";
+export function csrf(): string {  try {
+    const m = document.cookie.match(/(?:^|;\s*)taro_csrf=([^;]*)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  } catch {
+    return "";
+  }
+}
 
 async function req(path: string, init: RequestInit = {}) {
   const res = await fetch(`/api${path}`, {
     credentials: "include",
     ...init,
-    headers: { "Content-Type": "application/json", "X-CSRF": CSRF, ...(init.headers || {}) },
+    headers: { "Content-Type": "application/json", "X-CSRF": csrf(), ...(init.headers || {}) },
   });
   if (res.status === 402) {
     const body = await res.json().catch(() => ({}));
@@ -55,7 +61,7 @@ function bumpPaywalls(): void {
   const res = await fetch("/api/readings", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream", "X-CSRF": CSRF },
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream", "X-CSRF": csrf() },
     body: JSON.stringify(body),
   });
   if (res.status === 402) {
