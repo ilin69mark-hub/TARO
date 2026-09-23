@@ -1,6 +1,9 @@
 import { ImageResponse } from "@vercel/og";
 import { NextRequest } from "next/server";
 
+// OG динамический (query q/s), без prerender.
+export const dynamic = "force-dynamic";
+
 // OG-картинка 1200×630 (см. U11). Только вопрос + название расклада из query,
 // БЕЗ толкования (приватность: толкование видит только владелец, см. U12).
 export const runtime = "nodejs";

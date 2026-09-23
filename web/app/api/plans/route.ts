@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+
+// Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
+export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
 
 // GET /api/plans → Go (публичные цены, см. T18).
