@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #0b0b14;
+  color: #f5f0e6;
+}
+
+/* Фокус gold (см. 05-design/02-palette.md, D5): видимый ринг везде. */
+:focus-visible {
+  outline: 2px solid #d4af37;
+  outline-offset: 2px;
+}
+
+/* CA-вспышка переворота 300мс (см. 05-animations.md, D7): только появление карт.
+   calm/reduced-motion гасят через правила ниже. */
+@keyframes ca-flip {
+  0% {
+    text-shadow: -2px 0 0 rgba(255, 0, 80, 0.7), 2px 0 0 rgba(0, 220, 255, 0.7);
+    opacity: 0.4;
+  }
+  100% {
+    text-shadow: none;
+    opacity: 1;
+  }
+}
+
+.ca-flip {
+  animation: ca-flip 0.3s ease-out;
+}
+
+/* Спокойный режим + reduced-motion: гасим анимации (см. 04-a11y.md, T20).
+   Полный маппинг R3F/CA/shake — в T28. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.calm *,
+.calm *::before,
+.calm *::after {
+  animation: none !important;
+  transition: none !important;
+}

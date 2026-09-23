@@ -1,0 +1,10 @@
+node_modules/
+.next/
+dist/
+*.log
+.DS_Store
+
+# Секреты — только env VPS, никогда в git (см. Книгу 03-nonfunctional/02)
+.env
+.env.*
+!.env.example

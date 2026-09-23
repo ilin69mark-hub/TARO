@@ -1,0 +1,348 @@
+// Package ai — шлюз OpenRouter (см. docs/project-book/04-architecture/06).
+// Таймауты едино: 8с request ×2 ретрая (второй — fallback-модель) + 25с total SSE.
+// Breaker: 5×5xx/1мин → open 5мин → half-open 1 probe. Состояние в Redis.
+// Логи: каждый вызов → ai_logs (prompt_hash без PII: spread+cards+model).
+package ai
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	// RequestTimeout — 8с на один запрос (см. 02-interaction-next-go.md).
+	RequestTimeout = 8 * time.Second
+	// BreakerThreshold — 5 ошибок 5xx за минуту → open.
+	BreakerThreshold = 5
+	// BreakerOpen — 5 минут open.
+	BreakerOpen = 5 * time.Minute
+	// CacheTTL — 7 дней для ai:cache (см. 05-cache-redis.md).
+	CacheTTL = 7 * 24 * time.Hour
+)
+
+// Config — параметры из app_config.ai + дефолты.
+type Config struct {
+	Model       string
+	Fallback    string
+	MaxTokens   int
+	Temperature float64
+}
+
+// Gateway — клиент OpenRouter с breaker и логами.
+type Gateway struct {
+	pg      *pgxpool.Pool
+	rd      *redis.Client
+	http    *http.Client
+	apiKey  string
+	apiKey2 string
+}
+
+// New возвращает шлюз. Без OPENROUTER_API_KEY — Enabled()=false, только fallback.
+func New(pg *pgxpool.Pool, rd *redis.Client) *Gateway {
+	return &Gateway{
+		pg: pg, rd: rd,
+		http:    &http.Client{Timeout: RequestTimeout},
+		apiKey:  os.Getenv("OPENROUTER_API_KEY"),
+		apiKey2: os.Getenv("OPENROUTER_API_KEY_2"),
+	}
+}
+
+// Enabled — есть ли ключ для живых вызовов.
+func (g *Gateway) Enabled() bool { return g.apiKey != "" }
+
+// LoadConfig читает app_config.ai (дефолты из сида T04).
+func (g *Gateway) LoadConfig(ctx context.Context) Config {
+	cfg := Config{Model: "openai/gpt-4o-mini", Fallback: "anthropic/claude-3-haiku", MaxTokens: 900, Temperature: 0.7}
+	var raw json.RawMessage
+	if err := g.pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='ai'`).Scan(&raw); err != nil {
+		return cfg
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return cfg
+	}
+	if v, ok := m["model"].(string); ok && v != "" {
+		cfg.Model = v
+	}
+	if v, ok := m["fallback"].(string); ok && v != "" {
+		cfg.Fallback = v
+	}
+	if v, ok := m["max_tokens"].(float64); ok && v > 0 {
+		cfg.MaxTokens = int(v)
+	}
+	if v, ok := m["temperature"].(float64); ok {
+		cfg.Temperature = v
+	}
+	return cfg
+}
+
+// SystemPrompt — каркас v1 (см. 06-ai-pipeline.md).
+const SystemPrompt = `Ты бережный таролог-психолог. Пишешь по-русски, без запугиваний, ` +
+	`без медицины и юриспруденции. Структура: 1) суть 2-3 предложения. ` +
+	`2) по каждой карте 2-3 предложения с привязкой к позиции. ` +
+	`3) совет + 2 вопроса для рефлексии. ` +
+	`Запрещены слова про смерть, порчу, неизбежный развод и диагнозы.`
+
+// BuildUserPrompt собирает user-часть: расклад + карты со значениями из БД + вопрос.
+func BuildUserPrompt(spreadName string, positions []Position, cards []CardValue, question string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Расклад «%s». Позиции:\n", spreadName)
+	for i, p := range positions {
+		fmt.Fprintf(&sb, "%d) %s — %s\n", i+1, p.Label, p.Meaning)
+	}
+	sb.WriteString("Карты:\n")
+	for _, c := range cards {
+		val := c.Upright
+		orient := "прямая"
+		if c.Reversed {
+			val = c.ReversedText
+			orient = "перевернутая"
+		}
+		fmt.Fprintf(&sb, "- %s (%s, позиция %d): %s\n", c.Name, orient, c.Position+1, val)
+	}
+	if question != "" {
+		fmt.Fprintf(&sb, "Вопрос: %s", question)
+	}
+	return sb.String()
+}
+
+// Position — позиция расклада. CardValue — карта со значениями.
+type Position struct {
+	Label   string `json:"label"`
+	Meaning string `json:"meaning"`
+}
+
+// CardValue — карта + значения из БД.
+type CardValue struct {
+	Name         string
+	Upright      string
+	ReversedText string
+	Reversed     bool
+	Position     int
+	CardID       int
+}
+
+// PromptHash — sha256 без PII (model+spread+cards, вопрос исключен).
+func PromptHash(model, spread string, cards []CardValue) string {
+	var sb strings.Builder
+	sb.WriteString(model + "|" + spread + "|")
+	for _, c := range cards {
+		fmt.Fprintf(&sb, "%d:%t;", c.CardID, c.Reversed)
+	}
+	sum := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// CacheKey — ai:cache:<model>:<spread>:<cards_hash> (без вопроса — PII, см. 05-cache-redis.md).
+func CacheKey(model, spread string, cards []CardValue) string {
+	return "ai:cache:" + model + ":" + spread + ":" + PromptHash(model, spread, cards)[:16]
+}
+
+// openRouterURL — база API (OPENROUTER_BASE_URL для тестов с мок-сервером, см. D-покрытие).
+func openRouterURL() string {
+	if base := os.Getenv("OPENROUTER_BASE_URL"); base != "" {
+		return base
+	}
+	return "https://openrouter.ai/api/v1"
+}
+
+// breakerKey — ai:breaker:<model>.
+func breakerKey(model string) string { return "ai:breaker:" + model }
+
+// breakerOpen проверяет open-состояние.
+func (g *Gateway) breakerOpen(ctx context.Context, model string) bool {
+	n, _ := g.rd.Exists(ctx, breakerKey(model)).Result()
+	return n > 0
+}
+
+// breakerFail фиксирует ошибку; при пороге — open на 5 мин. Возвращает open ли сейчас.
+func (g *Gateway) breakerFail(ctx context.Context, model string) {
+	key := breakerKey(model) + ":fails"
+	n, _ := g.rd.Incr(ctx, key).Result()
+	if n == 1 {
+		_ = g.rd.Expire(ctx, key, time.Minute).Err()
+	}
+	if n >= BreakerThreshold {
+		_ = g.rd.Set(ctx, breakerKey(model), "open", BreakerOpen).Err()
+		_ = g.rd.Del(ctx, key).Err()
+	}
+}
+
+// log пишет строку ai_logs.
+func (g *Gateway) log(ctx context.Context, readingID, model, hash string, in, out int, latency time.Duration, status, errText string) {
+	var rid any
+	if readingID != "" {
+		rid = readingID
+	}
+	_, _ = g.pg.Exec(ctx, `
+		INSERT INTO ai_logs (reading_id, model, prompt_hash, tokens_in, tokens_out, latency_ms, status, error)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		rid, model, hash, in, out, latency.Milliseconds(), status, errText)
+}
+
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatRequest struct {
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	MaxTokens   int           `json:"max_tokens"`
+	Temperature float64       `json:"temperature"`
+	Stream      bool          `json:"stream"`
+}
+
+// doStream выполняет один SSE-запрос к OpenRouter, токены — в out.
+func (g *Gateway) doStream(ctx context.Context, model, system, user string, cfg Config, key string, out chan<- string) (int, error) {
+	body, _ := json.Marshal(chatRequest{
+		Model:       model,
+		Messages:    []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
+		MaxTokens:   cfg.MaxTokens,
+		Temperature: cfg.Temperature,
+		Stream:      true,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", openRouterURL()+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("HTTP-Referer", "https://taro.local")
+	req.Header.Set("X-Title", "Online Taro")
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return resp.StatusCode, fmt.Errorf("provider %d", resp.StatusCode)
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return resp.StatusCode, fmt.Errorf("provider %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	tokens := 0
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				tokens++
+				select {
+				case out <- ch.Delta.Content:
+				case <-ctx.Done():
+					return tokens, ctx.Err()
+				}
+			}
+		}
+	}
+	return tokens, sc.Err()
+}
+
+// Stream стримит толкование: кэш → primary → fallback. Токены идут в out (закрывается).
+// Возвращает полный текст, модель, изКэша ли. Ошибки обеих моделей → err (caller ставит pending_fallback).
+func (g *Gateway) Stream(ctx context.Context, readingID, spread string, positions []Position, cards []CardValue, question string, out chan<- string) (string, string, bool, error) {
+	defer close(out)
+	cfg := g.LoadConfig(ctx)
+	hash := PromptHash(cfg.Model, spread, cards)
+	start := time.Now()
+	if !g.Enabled() {
+		return "", "", false, fmt.Errorf("no api key")
+	}
+	// кэш без вопроса (см. 05-cache-redis.md)
+	if cached, err := g.rd.Get(ctx, CacheKey(cfg.Model, spread, cards)).Result(); err == nil && cached != "" {
+		for _, w := range strings.Split(cached, " ") {
+			select {
+			case out <- w + " ":
+			case <-ctx.Done():
+				return cached, cfg.Model, true, nil
+			}
+		}
+		g.log(ctx, readingID, cfg.Model, hash, 0, 0, time.Since(start), "ok", "cache_hit")
+		return cached, cfg.Model, true, nil
+	}
+	models := []string{cfg.Model, cfg.Fallback}
+	keys := []string{g.apiKey, g.apiKey2}
+	var lastErr error
+	for i, model := range models {
+		if g.breakerOpen(ctx, model) {
+			lastErr = fmt.Errorf("breaker open for %s", model)
+			continue
+		}
+		key := keys[0]
+		if i == 1 && keys[1] != "" {
+			key = keys[1]
+		}
+		tokens := 0
+		var sb strings.Builder
+		inner := make(chan string, 64)
+		done := make(chan error, 1)
+		go func() {
+			_, err := g.doStream(ctx, model, SystemPrompt, BuildUserPrompt(spread, positions, cards, question), cfg, key, inner)
+			close(inner)
+			done <- err
+		}()
+		var runErr error
+		for t := range inner {
+			sb.WriteString(t)
+			tokens++
+			select {
+			case out <- t:
+			case <-ctx.Done():
+				runErr = ctx.Err()
+			}
+		}
+		if err := <-done; err != nil {
+			runErr = err
+		}
+		text := sb.String()
+		if runErr != nil {
+			lastErr = runErr
+			if isServerError(runErr) {
+				g.breakerFail(ctx, model)
+			}
+			g.log(ctx, readingID, model, hash, 0, tokens, time.Since(start), "failed", runErr.Error())
+			continue
+		}
+		_ = g.rd.Set(ctx, CacheKey(cfg.Model, spread, cards), text, CacheTTL).Err()
+		g.log(ctx, readingID, model, hash, 0, tokens, time.Since(start), "ok", "")
+		return text, model, false, nil
+	}
+	return "", "", false, lastErr
+}
+
+func isServerError(err error) bool {
+	return strings.Contains(err.Error(), "provider 5")
+}

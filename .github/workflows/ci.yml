@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      # D4: PII-grep — вопрос/толкование никогда не уходят в аналитику
+      - run: test -z "$(grep -rn 'track(events\.[a-zA-Z]*, {[^}]*\(question\|interpretation\)' lib app components || true)"
+      - run: npm test
+      - run: npm run build
+
+  api:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taro
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: taro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U taro"
+          --health-interval=5s --health-timeout=5s --health-retries=5
+      cache:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=5
+    env:
+      DATABASE_URL: postgres://taro:ci-only@localhost:5432/taro?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      JWT_SECRET: ci-only-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - run: gofmt -l . && test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go build ./...
+      # D2: схема для e2e-тестов (миграции по порядку, как deploy/migrate.sh)
+      - run: >
+          docker run --rm --network host
+          -v ${{ github.workspace }}/api/migrations:/migrations
+          migrate/migrate:v4.18.2
+          -path /migrations
+          -database "postgres://taro:ci-only@localhost:5432/taro?sslmode=disable" up
+      # D2: тесты гоняются всегда; e2e со Skip получают сервисы выше и НЕ скипаются в CI
+      - run: go test ./...
+      # D2: тесты гоняются всегда; e2e со Skip получают сервисы выше и НЕ скипаются в CI
+      - run: go test ./...

@@ -1,0 +1,14 @@
+# api-admin — только 127.0.0.1:8081, наружу не публикуется (см. ADR-06, BACKLOG T02).
+# Доступ — только SSH-туннель: ssh -L 8081:127.0.0.1:8081 vps
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /api-admin ./cmd/admin
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /api-admin /api-admin
+EXPOSE 8081
+ENTRYPOINT ["/api-admin"]

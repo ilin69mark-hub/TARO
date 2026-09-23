@@ -1,0 +1,14 @@
+-- 001_schema.down.sql
+DROP TABLE IF EXISTS admin_audit;
+DROP TABLE IF EXISTS app_config;
+DROP TABLE IF EXISTS ai_logs;
+DROP TABLE IF EXISTS referrals;
+DROP TABLE IF EXISTS entitlements;
+DROP TABLE IF EXISTS single_entitlements;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS readings;
+DROP TABLE IF EXISTS cards;
+DROP TABLE IF EXISTS spreads;
+DROP TABLE IF EXISTS plans;
+DROP TABLE IF EXISTS users;
