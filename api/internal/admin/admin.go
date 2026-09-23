@@ -113,8 +113,13 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RequireAdmin — middleware: taro_admin JWT (sub=admin:<uid>) + живой sess:admin + роль.
+// S10: либо X-Admin-Token == ADMIN_API_TOKEN (cron/server-to-server, только с localhost).
 func (s *Service) RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tok := os.Getenv("ADMIN_API_TOKEN"); tok != "" && r.Header.Get("X-Admin-Token") == tok {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminCtxKey{}, "cron")))
+			return
+		}
 		c, err := r.Cookie(AdminCookie)
 		if err != nil {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
@@ -323,7 +328,7 @@ func (s *Service) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	diffJSON, _ := json.Marshal(req)
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO admin_audit (admin_id, action, diff) VALUES ($1,'config:publish',$2)`,
+		`INSERT INTO admin_audit (admin_id, action, diff) VALUES (NULLIF($1,'cron')::uuid,'config:publish',$2)`,
 		AdminID(ctx), diffJSON); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось записать аудит")
 		return
@@ -375,7 +380,7 @@ func (s *Service) HandleRotateSeasonal(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	_, _ = s.pg.Exec(ctx,
-		`INSERT INTO admin_audit (admin_id, action, diff) VALUES ($1,'rotate-seasonal',$2)`,
+		`INSERT INTO admin_audit (admin_id, action, diff) VALUES (NULLIF($1,'cron')::uuid,'rotate-seasonal',$2)`,
 		AdminID(ctx), raw)
 	_ = s.rd.Del(ctx, spreads.CacheKey).Err()
 	_ = s.rd.Del(ctx, PlansCacheKey).Err()

@@ -70,6 +70,8 @@ services:
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
       # TG-ID админов через запятую (см. D1, 02-functional/07). На проде — реальный ID!
       ADMIN_TG_IDS: ${ADMIN_TG_IDS:-}
+      # Токен server-to-server для cron (см. S10). Только localhost. На проде — длинный случайный!
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
     depends_on:
       - db
       - cache

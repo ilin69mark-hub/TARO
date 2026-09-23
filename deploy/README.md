@@ -14,14 +14,15 @@
    Проверка: `ss -tlnp | grep 8081` — снаружи `curl http://VPS:8081/healthz` → timeout.
 3. `docker compose up -d db cache`, `./deploy/migrate.sh up` (DATABASE_URL внутрь сети db).
 4. `docker compose build && docker compose up -d`.
-5. Cron (см. V22, U25, V23 — все ручки только через SSH-туннель :8081):
+5. Cron (S10: с X-Admin-Token из env хоста, иначе RequireAdmin даст 403!):
    ```
    0 4 * * * /opt/taro/deploy/backup.sh
-   5 0 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/rotate-seasonal -H 'Content-Type: application/json' -d '{}'
-   5 21 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/push-evening -H 'Content-Type: application/json' -d '{}'
-   30 21 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/push-streak-risk -H 'Content-Type: application/json' -d '{}'
-   0 9 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/remind-expiring -H 'Content-Type: application/json' -d '{}'
+   5 0 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/rotate-seasonal -H "X-Admin-Token: $ADMIN_API_TOKEN" -H 'Content-Type: application/json' -d '{}' | logger -t taro-rotate
+   5 21 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/push-evening -H "X-Admin-Token: $ADMIN_API_TOKEN" -H 'Content-Type: application/json' -d '{}' | logger -t taro-evening
+   30 21 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/push-streak-risk -H "X-Admin-Token: $ADMIN_API_TOKEN" -H 'Content-Type: application/json' -d '{}' | logger -t taro-streak
+   0 9 * * * curl -s -X POST http://127.0.0.1:8081/v1/admin/remind-expiring -H "X-Admin-Token: $ADMIN_API_TOKEN" -H 'Content-Type: application/json' -d '{}' | logger -t taro-remind
    ```
+   ADMIN_API_TOKEN — в env хоста (длинный случайный, только localhost). Без него cron молча получал 403 (см. S10).
 
 ## Доступ к админке
 Только SSH-туннель: `ssh -L 8081:127.0.0.1:8081 user@VPS`, затем `http://127.0.0.1:8081/v1/admin/config`.
