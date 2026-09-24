@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -106,7 +107,7 @@ func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code string `json:"code"`
 	}
-	if !apierr.Decode(w, r, &req) || req.Code == "" {
+	if !apierr.Decode(w, r, &req) || req.Code == "" || len(req.Code) > 16 || strings.ContainsRune(req.Code, 0) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен код")
 		return
 	}

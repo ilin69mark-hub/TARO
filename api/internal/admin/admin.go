@@ -298,12 +298,24 @@ func (s *Service) HandlePublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if p.PriceRub != nil {
+			if *p.PriceRub <= 0 || *p.PriceRub > 100000 {
+				apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректная цена: "+p.Code)
+				return
+			}
 			cur.price = *p.PriceRub
 		}
 		if p.Stars != nil {
+			if *p.Stars <= 0 || *p.Stars > 100000 {
+				apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректные stars: "+p.Code)
+				return
+			}
 			cur.stars = *p.Stars
 		}
 		if p.Duration != nil {
+			if *p.Duration <= 0 || *p.Duration > 3650 {
+				apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный срок: "+p.Code)
+				return
+			}
 			cur.dur = p.Duration
 		}
 		if p.Active != nil {

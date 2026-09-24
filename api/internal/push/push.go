@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,6 +108,11 @@ func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req subRequest
 	if !apierr.Decode(w, r, &req) || req.Endpoint == "" || req.P256DH == "" || req.Auth == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужны endpoint, p256dh, auth")
+		return
+	}
+	if len(req.Endpoint) > 512 || len(req.P256DH) > 256 || len(req.Auth) > 128 ||
+		strings.ContainsRune(req.Endpoint, 0) || strings.ContainsRune(req.P256DH, 0) || strings.ContainsRune(req.Auth, 0) {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимые данные подписки")
 		return
 	}
 	if err := validEndpoint(r.Context(), req.Endpoint); err != nil {
