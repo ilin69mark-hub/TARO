@@ -2,55 +2,44 @@
 
 import { useEffect, useState } from "react";
 
-import { csrf } from "../lib/api";
-
-// 18+ gate: модалка при первом входе + запись age_confirmed_at (см. 08-risks/02, T15/T20).
+// E11-режим «честный»: 18+ enforced только на оплате (сервер, age_confirmed_at).
+// Эта модалка — НЕ гейт и НЕ проверка возраста, а разовое напоминание (см. OWNER E11).
+// Флаг taro_notice — только «показано», ничего не подтверждает.
 export default function AgeGate() {
   const [show, setShow] = useState(false);
 
   useEffect(() => {
     try {
-      if (!localStorage.getItem("taro_age")) setShow(true);
+      if (!localStorage.getItem("taro_notice")) setShow(true);
     } catch {
       setShow(true);
     }
   }, []);
 
-  async function confirm() {
-    // Аудит B: метку ставим ТОЛЬКО после 200 от сервера (раньше врали себе при 403).
+  function dismiss() {
     try {
-      const res = await fetch("/api/me/age", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
-        body: JSON.stringify({ confirmed: true }),
-      });
-      if (!res.ok) return; // сервер не записал — модалку не прячем
-      try {
-        localStorage.setItem("taro_age", "1");
-      } catch {
-        /* ignore */
-      }
+      localStorage.setItem("taro_notice", "1");
     } catch {
-      return; // offline — модалку не прячем
+      /* ignore */
     }
     setShow(false);
   }
 
   if (!show) return null;
   return (
-    <div role="dialog" aria-modal="true" aria-label="Подтверждение возраста" className="fixed inset-0 z-30 flex items-center justify-center bg-deep/90 p-6">
+    <div role="dialog" aria-modal="true" aria-label="Важная информация" className="fixed inset-0 z-30 flex items-center justify-center bg-deep/90 p-6">
       <div className="w-full max-w-sm rounded-3xl border border-gold/40 bg-elev p-6 text-center">
-        <p className="text-xl font-semibold text-paper">Тебе есть 18?</p>
+        <p className="text-xl font-semibold text-paper">Прежде чем начать</p>
         <p className="mt-2 text-sm text-mist">
           Онлайн Таро — инструмент самопознания и рефлексии. Не является медицинской,
           психологической, юридической или финансовой услугой. Решения принимаете вы.
+          Оплата доступна строго с 18 лет.
         </p>
         <button
-          onClick={confirm}
+          onClick={dismiss}
           className="mt-5 inline-flex h-12 w-full items-center justify-center rounded-2xl bg-gradient-to-br from-gold to-goldsoft text-sm font-semibold uppercase tracking-wider text-deep active:scale-95"
         >
-          Да, мне есть 18
+          Понятно
         </button>
       </div>
     </div>

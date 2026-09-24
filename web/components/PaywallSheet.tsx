@@ -39,16 +39,25 @@ export default function PaywallSheet({
   async function confirmAdult(v: boolean) {
     setAdult(v);
     if (!v) return;
+    // E11-честный: метку кешируем только после 200 сервера (иначе врём себе при 403).
     try {
-      localStorage.setItem("taro_age", "1");
-      await fetch("/api/me/age", {
+      const res = await fetch("/api/me/age", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
         body: JSON.stringify({ confirmed: true }),
-      }).catch(() => undefined);
+      });
+      if (!res.ok) {
+        setAdult(false);
+        return;
+      }
+      try {
+        localStorage.setItem("taro_age", "1");
+      } catch {
+        /* ignore */
+      }
     } catch {
-      /* ignore */
+      setAdult(false);
     }
   }
 
