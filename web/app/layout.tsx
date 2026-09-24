@@ -43,7 +43,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <Onboarding />
         <div className="pb-20">{children}</div>
         <footer className="mx-auto max-w-md px-4 pb-24 text-center text-xs text-mist">
-          Онлайн Таро — инструмент самопознания, не медицинская услуга. 18+
+          Онлайн Таро — инструмент самопознания и рефлексии. Не является медицинской,
+          психологической, юридической или финансовой услугой. Решения принимаете вы. 18+
         </footer>
         <InstallPrompt />
         <TabBar />

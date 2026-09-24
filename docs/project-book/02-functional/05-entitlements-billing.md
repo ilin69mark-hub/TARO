@@ -3,6 +3,7 @@
 > Статус: `frozen v1.0 (2026-09-23)`. Связи: `07-admin-config.md`, `04-architecture/03-database-schema.md` (`plans`, `entitlements`).
 
 > Решение frozen: trial 3 дня за привязку TG — ДА (Must); разовый расклад 99₽ — оставляем в MVP (Must).
+> E09-решение (frozen 2026-09-23): базовая цена 299₽/мес, A/B выключен (`ab.price_month.enabled=false`).
 
 ## Дефолты (меняются в админке без кода, источник — `app_config` + `plans`)
 | Параметр | Дефолт | Где крутится |

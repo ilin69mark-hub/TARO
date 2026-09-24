@@ -17,6 +17,9 @@
 - Админка: вкл/выкл `is_active`, порядок `sort_order`, перевод в premium, сезонные (ex. `fullmoon` — создать за 5 мин копией, включить на 3 дня).
 - API `GET /v1/spreads` отдает только `is_active=true`, кэш Redis 5 мин (`spreads:list:v1`).
 - Удалять нельзя, только деактивировать (история чтений ссылается).
+- E18-решение (frozen 2026-09-23): `newyear` — окно 25.12–14.01 через `spreads.seasonal` + cron;
+  `fullmoon` — окна ±3 дня от полнолуния проставляются вручную раз в месяц (5 мин в админке:
+  Publish нового окна). Автолунный календарь — не делаем (overengineering для 3 дней).
 
 ## Acceptance
 - Given `celtic.is_active=false`, When GET spreads, Then его нет, старые readings открываются.

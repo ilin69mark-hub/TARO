@@ -35,7 +35,8 @@ export default function AgeGate() {
       <div className="w-full max-w-sm rounded-3xl border border-gold/40 bg-elev p-6 text-center">
         <p className="text-xl font-semibold text-paper">Тебе есть 18?</p>
         <p className="mt-2 text-sm text-mist">
-          Онлайн Таро — инструмент самопознания, не медицинская услуга.
+          Онлайн Таро — инструмент самопознания и рефлексии. Не является медицинской,
+          психологической, юридической или финансовой услугой. Решения принимаете вы.
         </p>
         <button
           onClick={confirm}

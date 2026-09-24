@@ -9,6 +9,10 @@
 | Boosty | RU-карты, подписки | комиссия 7–10%, редирект наружу, модерация эзотерики | №2 (мес. 3) |
 | ЮKassa | карты/СБП, чеки | нужен ИП/самозанятость + KYC, дольше | №3 (когда >100 платных) |
 
+> E07-режим «быстро подключить» (frozen 2026-09-23): скелет 501 за флагом готов,
+> суммы дублируются в `amount_rub`, абстракция провайдеров готова. Для подключения
+> нужны только: KYC + credentials в env + webhook-обработчик. Без них — 501 с объяснением.
+
 ## Флоу Stars (идемпотентный)
 1. `POST /v1/payments/stars/invoice {plan_code}` → `createInvoiceLink (stars_amount из plans)` → отдаем `invoice_link`. Цены: 299₽ = 199 Stars (≈1.5₽/Star, округление в конфиге `plans.stars_amount`).
 2. Юзер платит в TG → `POST /v1/payments/stars/webhook` (проверка `Secret-Token` header + IP TG, не путать с HMAC initData) → `INSERT payments … ON CONFLICT(provider_payment_id) DO NOTHING RETURNING` → начисляем `valid_until = max(now(),valid_until)+duration` только если `inserted=true`, иначе `200 {ok:true, duplicate:true}`. Ретраи TG безопасны.

@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { paywallHits } from "@/lib/api";
+import { paywallHits, csrf } from "@/lib/api";
 
 // Paywall-sheet: snap снизу, цены из plans (не хардкод, см. 02-functional/05, T18).
 export type Plan = { code: string; price_rub: number; stars_amount: number; duration_days: number | null };
@@ -24,13 +24,42 @@ export default function PaywallSheet({
   abPrice?: number; // U22: A/B цена month_299 (0 = выкл)
   onClose: () => void;
 }) {
+  // E17: чекбокс 18+ обязателен — без него бэк дает 403 (age_confirmed_at).
+  // Состояние переживает сессии (localStorage) + пишется на сервер один раз.
+  const [adult, setAdult] = useState(false);
+
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("taro_age") === "1") setAdult(true);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  async function confirmAdult(v: boolean) {
+    setAdult(v);
+    if (!v) return;
+    try {
+      localStorage.setItem("taro_age", "1");
+      await fetch("/api/me/age", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
+        body: JSON.stringify({ confirmed: true }),
+      }).catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+  }
+
   async function pay(code: string) {
+    if (!adult) return; // кнопка disabled, двойная защита
     // D6: Stars-invoice через прокси; в TG открываем нативно, иначе новая вкладка.
     try {
       const res = await fetch("/api/payments/stars/invoice", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF": "1" },
+        headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
         body: JSON.stringify({ plan_code: code }),
       });
       if (!res.ok) return;
@@ -76,6 +105,15 @@ export default function PaywallSheet({
       >
         <p className="text-xl font-semibold text-paper">Заглянем глубже?</p>
         <p className="mt-1 text-sm text-mist">На сегодня бесплатные карты закончились</p>
+        <label className="mt-3 flex cursor-pointer items-center gap-2 rounded-2xl border border-white/10 p-3">
+          <input
+            type="checkbox"
+            checked={adult}
+            onChange={(e) => confirmAdult(e.target.checked)}
+            className="h-5 w-5 accent-[#D4AF37]"
+          />
+          <span className="text-sm text-paper">Мне есть 18, я понимаю условия выше</span>
+        </label>
         <ul className="mt-4 space-y-3">
           {ordered.map((p) => (
             <li
@@ -92,7 +130,9 @@ export default function PaywallSheet({
                 </p>
                 <button
                   onClick={() => pay(p.code)}
-                  className="mt-1 rounded-xl bg-gradient-to-br from-gold to-goldsoft px-4 py-1.5 text-sm font-semibold text-deep active:scale-95"
+                  disabled={!adult}
+                  title={adult ? undefined : "Сначала подтверди 18+"}
+                  className="mt-1 rounded-xl bg-gradient-to-br from-gold to-goldsoft px-4 py-1.5 text-sm font-semibold text-deep active:scale-95 disabled:opacity-40"
                 >
                   Оплатить
                 </button>
