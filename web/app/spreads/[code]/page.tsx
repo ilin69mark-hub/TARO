@@ -18,6 +18,9 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [abPrice, setAbPrice] = useState(0);
   const [error, setError] = useState("");
+  // Аудит C: ключ попытки живёт до успеха — retry после обрыва НЕ жрёт квоту повторно.
+  // Новый ключ — только явным сбросом (newAttempt после успеха/провала с paywall).
+  const [attemptKey, setAttemptKey] = useState("");
   const [spreadName, setSpreadName] = useState(params.code);
 
   useEffect(() => {
@@ -43,24 +46,29 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
     }
   }
 
-  async function draw() {
+  async function draw(isRetry = false) {
     setBusy(true);
     setText("");
     setPaywall(false);
     setError("");
     setReadingId("");
     try {
-      const key = crypto.randomUUID();
+      // retry тем же ключом (идемпотентность сервера), новая попытка — новым
+      const key = isRetry && attemptKey ? attemptKey : crypto.randomUUID();
+      setAttemptKey(key);
       const res = await postReadingSSE(
         { spread_code: params.code, question: question || undefined, idempotency_key: key },
         (t) => setText((prev) => prev + t)
       );
       setReadingId(res.reading_id);
+      setAttemptKey(""); // успех — ключ отработан
       bumpReadingCount(); // install-промпт после 2-го (см. T19)
     } catch (e: unknown) {
       const err = e as { code?: string; message?: string };
-      if (err.code === "LIMIT_EXCEEDED") openPaywall();
-      else setError(err.message || "Не получилось вытянуть карты");
+      if (err.code === "LIMIT_EXCEEDED") {
+        setAttemptKey(""); // paywall — это финал попытки, не retry
+        openPaywall();
+      } else setError(err.message || "Не получилось вытянуть карты");
     } finally {
       setBusy(false);
     }
@@ -85,7 +93,9 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
         className="mt-6 w-full rounded-2xl border border-white/10 bg-card p-4 text-base text-paper placeholder:text-mist"
       />
       <button
-        onClick={draw}
+        onClick={() => {
+          void draw();
+        }}
         disabled={busy}
         className="mt-4 inline-flex h-12 w-full items-center justify-center rounded-2xl bg-gradient-to-br from-gold to-goldsoft text-sm font-semibold uppercase tracking-wider text-deep active:scale-95 disabled:opacity-50"
       >
@@ -93,9 +103,22 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
       </button>
       {paywall && <PaywallSheet plans={plans} abPrice={abPrice} onClose={() => setPaywall(false)} />}
       {error && (
-        <p role="alert" className="mt-6 text-base text-mist">
-          {error}
-        </p>
+        <>
+          <p role="alert" className="mt-6 text-base text-mist">
+            {error}
+          </p>
+          {attemptKey && (
+            <button
+              onClick={() => {
+                void draw(true);
+              }}
+              disabled={busy}
+              className="mt-2 text-sm text-gold disabled:opacity-50"
+            >
+              Попробовать снова (без повторного списания)
+            </button>
+          )}
+        </>
       )}
       {text && (
         <div

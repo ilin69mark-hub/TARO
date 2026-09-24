@@ -152,6 +152,14 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if err := mergeCountersTx(ctx, tx, other, current); err != nil {
 		return "", false, err
 	}
+	// Аудит C: перенос мог продублировать trial_3d (у обоих был) — оставляем max valid_until.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM subscriptions s USING subscriptions keep
+		 WHERE s.user_id=$1 AND s.plan_code='trial_3d'
+		   AND keep.user_id=$1 AND keep.plan_code='trial_3d'
+		   AND s.id <> keep.id AND s.valid_until <= keep.valid_until`, other); err != nil {
+		return "", false, err
+	}
 	if err := grantTrialTx(ctx, tx, other, tgID, fingerprint); err != nil {
 		return "", false, err
 	}
@@ -165,19 +173,25 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	return other, true, nil
 }
 
-// mergeCountersTx сливает счетчики free/love как max(survivor, loser).
+// mergeCountersTx сливает счетчики free/love/referral как max(survivor, loser).
+// Аудит C: раньше referral-поля терялись → кап 30д обходился слияниями.
 func mergeCountersTx(ctx context.Context, tx pgx.Tx, survivor, loser string) error {
 	type counters struct {
 		freeUsed int
 		freeDate *string
 		loveUsed int
 		loveWeek *string
+		refMonth int
+		refKey   *string
+		refLife  int
 	}
 	read := func(uid string) (counters, error) {
 		var c counters
 		err := tx.QueryRow(ctx,
-			`SELECT free_used_today, free_date::text, love_used_week, love_week::text
-			   FROM entitlements WHERE user_id=$1`, uid).Scan(&c.freeUsed, &c.freeDate, &c.loveUsed, &c.loveWeek)
+			`SELECT free_used_today, free_date::text, love_used_week, love_week::text,
+			        COALESCE(referral_bonus_month,0), referral_bonus_month_key,
+			        COALESCE(referral_bonus_lifetime,0)
+			   FROM entitlements WHERE user_id=$1`, uid).Scan(&c.freeUsed, &c.freeDate, &c.loveUsed, &c.loveWeek, &c.refMonth, &c.refKey, &c.refLife)
 		if err == pgx.ErrNoRows {
 			return counters{}, nil
 		}
@@ -201,15 +215,25 @@ func mergeCountersTx(ctx context.Context, tx pgx.Tx, survivor, loser string) err
 	if b.loveWeek != nil && (loveWeek == nil || *b.loveWeek > *loveWeek) {
 		loveWeek = b.loveWeek
 	}
+	// referral-кап: max по месяцу (ключи совпали) + max lifetime; разные месяцы — берём больший
+	refMonth, refKey := a.refMonth, a.refKey
+	if a.refKey == nil || (b.refKey != nil && (*b.refKey > *a.refKey || (*b.refKey == *a.refKey && b.refMonth > refMonth))) {
+		refMonth, refKey = b.refMonth, b.refKey
+	}
+	refLife := max(a.refLife, b.refLife)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO entitlements (user_id, free_used_today, free_date, love_used_week, love_week)
-		VALUES ($1,$2,$3::date,$4,$5::date)
+		INSERT INTO entitlements (user_id, free_used_today, free_date, love_used_week, love_week,
+		  referral_bonus_month, referral_bonus_month_key, referral_bonus_lifetime)
+		VALUES ($1,$2,$3::date,$4,$5::date,$6,$7,$8)
 		ON CONFLICT (user_id) DO UPDATE SET
 		  free_used_today = EXCLUDED.free_used_today,
 		  free_date = EXCLUDED.free_date,
 		  love_used_week = EXCLUDED.love_used_week,
-		  love_week = EXCLUDED.love_week`,
-		survivor, freeUsed, freeDate, loveUsed, loveWeek)
+		  love_week = EXCLUDED.love_week,
+		  referral_bonus_month = EXCLUDED.referral_bonus_month,
+		  referral_bonus_month_key = EXCLUDED.referral_bonus_month_key,
+		  referral_bonus_lifetime = EXCLUDED.referral_bonus_lifetime`,
+		survivor, freeUsed, freeDate, loveUsed, loveWeek, refMonth, refKey, refLife)
 	return err
 }
 

@@ -27,6 +27,19 @@ export default function PaywallSheet({
   // E17: чекбокс 18+ обязателен — без него бэк дает 403 (age_confirmed_at).
   // Состояние переживает сессии (localStorage) + пишется на сервер один раз.
   const [adult, setAdult] = useState(false);
+  // Аудит C: stable idempotency-ключ на тариф (свежий UUID на клик давал двойные списания)
+  // + busy-guard от даблклика.
+  const [keys, setKeys] = useState<Record<string, string>>({});
+  const [paying, setPaying] = useState<string | null>(null);
+
+  function keyFor(code: string): string {
+    let k = keys[code];
+    if (!k) {
+      k = crypto.randomUUID();
+      setKeys((prev) => ({ ...prev, [code]: k }));
+    }
+    return k;
+  }
 
   useEffect(() => {
     try {
@@ -62,25 +75,34 @@ export default function PaywallSheet({
   }
 
   async function pay(code: string) {
-    if (!adult) return; // кнопка disabled, двойная защита
+    if (!adult || paying) return; // кнопка disabled + in-flight guard от даблклика
+    setPaying(code);
     // D6: Stars-invoice через прокси; в TG открываем нативно, иначе новая вкладка.
     try {
       const res = await fetch("/api/payments/stars/invoice", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
-        // idempotency_key обязателен сервером (аудит B: без него дубли pending)
-        body: JSON.stringify({ plan_code: code, idempotency_key: crypto.randomUUID() }),
+        // idempotency_key стабилен на тариф до успеха (аудит C: свежий UUID на клик давал дубли)
+        body: JSON.stringify({ plan_code: code, idempotency_key: keyFor(code) }),
       });
       if (!res.ok) return;
       const { invoice_link } = await res.json();
       // Аудит B: ссылка только t.me, иначе фишинг через скомпрометированный ответ
       if (typeof invoice_link !== "string" || !/^https:\/\/(t\.me|telegram\.me)\//.test(invoice_link)) return;
+      // успех: ротируем ключ для следующей покупки
+      setKeys((prev) => {
+        const next = { ...prev };
+        delete next[code];
+        return next;
+      });
       const tg = (window as unknown as { Telegram?: { WebApp?: { openInvoice?: (u: string) => void } } }).Telegram?.WebApp;
       if (tg?.openInvoice) tg.openInvoice(invoice_link);
       else window.open(invoice_link, "_blank", "noopener");
     } catch {
       /* ignore */
+    } finally {
+      setPaying(null);
     }
   }
   // U26: упершимся 3+ раз показываем single_99 первым
@@ -142,11 +164,11 @@ export default function PaywallSheet({
                 </p>
                 <button
                   onClick={() => pay(p.code)}
-                  disabled={!adult}
+                  disabled={!adult || paying !== null}
                   title={adult ? undefined : "Сначала подтверди 18+"}
                   className="mt-1 rounded-xl bg-gradient-to-br from-gold to-goldsoft px-4 py-1.5 text-sm font-semibold text-deep active:scale-95 disabled:opacity-40"
                 >
-                  Оплатить
+                  {paying === p.code ? "Создаём счёт…" : "Оплатить"}
                 </button>
               </div>
             </li>

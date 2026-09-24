@@ -121,7 +121,7 @@ func (g *Gateway) monthlyExhausted(ctx context.Context, cfg Config) bool {
 	}
 	var n int
 	if err := g.pg.QueryRow(ctx,
-		`SELECT COUNT(*) FROM ai_logs WHERE status='ok' AND created_at >= date_trunc('month', now())`).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM ai_logs WHERE status='ok' AND error <> 'cache_hit' AND created_at >= date_trunc('month', now())`).Scan(&n); err != nil {
 		return false // БД недоступна — не блокируем (fail-open чтения, запись всё равно залогируется)
 	}
 	return n >= cfg.MonthlyCalls

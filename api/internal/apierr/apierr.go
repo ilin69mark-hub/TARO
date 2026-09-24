@@ -37,7 +37,8 @@ func Write(w http.ResponseWriter, status int, code, messageRu string) {
 	_ = json.NewEncoder(w).Encode(envelope{Error: errBody{Code: code, Message: messageRu}})
 }
 
-// MaxBody — лимит тела запроса (см. S06): auth 32KB, остальное 1MB.
+// MaxBody — единый лимит тела запроса 1MB (аудит C: отдельных 32KB для auth нет —
+// старый комментарий врал; при нужде ввести MaxBodyAuth отдельно в auth-хендлерах).
 const MaxBody = 1 << 20
 
 // Decode читает JSON-тело с лимитом и строгим режимом (без unknown-полей).

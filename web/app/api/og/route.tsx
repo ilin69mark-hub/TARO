@@ -12,7 +12,8 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const title = (searchParams.get("q") || "Мой расклад").slice(0, 80);
   const spread = (searchParams.get("s") || "Таро").slice(0, 40);
-  return new ImageResponse(
+  // Аудит C: рендер детерминирован от q/s — кэшируем сутки (CPU-DoS mitigation + nginx zone og).
+  const res = new ImageResponse(
     (
       <div
         style={{
@@ -36,4 +37,6 @@ export async function GET(req: NextRequest) {
     ),
     { width: 1200, height: 630 }
   );
+  res.headers.set("Cache-Control", "public, max-age=86400, immutable");
+  return res;
 }

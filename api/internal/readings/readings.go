@@ -133,35 +133,56 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	// Аудит B: сериализуем повторы по ключу — двойной клик не списывает квоту дважды.
-	// Lock обязан жить на ОДНОМ соединении: пиним conn из пула на весь хендлер.
+	// Аудит C: locked-секция — в хелпере со своим conn (пул не висит всю SSE-сессию).
+	id, _, cards, ok := s.prepareReading(w, r, uid, key, req)
+	if !ok {
+		return // ответ уже записан (повтор/paywall/кризис/ошибка)
+	}
+	// SSE + живой AI: стримим токены по мере генерации (tee в HTTP и в аккумулятор).
+	// Иначе: догенерируем синхронно и отдаем JSON {reading_id}.
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") && s.gw != nil && s.gw.Enabled() {
+		s.streamLive(w, r, id, req.SpreadCode, req.Question, cards)
+		s.fireReferralHook(uid)
+		return
+	}
+	s.generate(ctx, id, req.SpreadCode, req.Question, cards)
+	s.respondReading(w, r, uid, id)
+	s.fireReferralHook(uid)
+}
+
+// prepareReading — вся быстрая работа под advisory-lock на запиненном conn:
+// find/insert pending → Check квоты → single-consume. Возвращает ok=false если
+// ответ уже записан. Conn и lock освобождаются ДО долгой генерации (аудит C:
+// иначе 10 висящих SSE съедают весь пул MaxConns=10).
+func (s *Service) prepareReading(w http.ResponseWriter, r *http.Request, uid, key string, req createRequest) (string, entitlements.Verdict, []cardDraw, bool) {
+	ctx := r.Context()
 	conn, err := s.pg.Acquire(ctx)
 	if err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	defer conn.Release()
 	lockKey := "reading:" + uid + ":" + key
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, lockKey); err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	defer func() {
 		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, lockKey)
 	}()
-	db := conn // все SQL хендлера — через запиненное соединение
+	db := conn // все SQL секции — через запиненное соединение
 	// спред активен? + число позиций
 	var positions json.RawMessage
 	var isPremium bool
 	if err := db.QueryRow(ctx,
 		`SELECT positions, is_premium FROM spreads WHERE code=$1 AND is_active`, req.SpreadCode).Scan(&positions, &isPremium); err != nil {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный расклад")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	var posCount []any
 	if err := json.Unmarshal(positions, &posCount); err != nil || len(posCount) == 0 {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Битый расклад")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	// идемпотентность ДО списания лимита: повтор возвращает существующее.
 	// Мёртвые строки (cancelled/failed) — удаляем, ключ освобождается под fresh-вставку.
@@ -171,17 +192,17 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 			_, _ = db.Exec(ctx, `DELETE FROM readings WHERE id=$1`, existing)
 		} else {
 			s.respondReading(w, r, uid, existing)
-			return
+			return "", entitlements.Verdict{}, nil, false
 		}
 	}
 	// кризис — до лимитов и без списания: безопасность важнее квоты
 	if isCrisis(req.Question) {
 		id := s.createFiltered(ctx, w, uid, req, key, len(posCount))
 		if id == "" {
-			return
+			return "", entitlements.Verdict{}, nil, false
 		}
 		s.respondReading(w, r, uid, id)
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	seed := time.Now().UnixNano()
 	cards := draw(seed, len(posCount))
@@ -199,22 +220,22 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		// race: второй запрос вставил первым — возвращаем его
 		if existing := s.findByKey(ctx, uid, key); existing != "" {
 			s.respondReading(w, r, uid, existing)
-			return
+			return "", entitlements.Verdict{}, nil, false
 		}
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	// лимиты (consume внутри Check) — ПОСЛЕ вставки; отказ → строка в cancelled, квота цела
 	v, err := s.en.Check(ctx, uid, req.SpreadCode)
 	if err != nil {
 		_, _ = db.Exec(ctx, `UPDATE readings SET status='failed' WHERE id=$1`, id)
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить лимит")
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	if !v.Allow {
 		_, _ = db.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id)
 		s.writePaywall(w, r)
-		return
+		return "", entitlements.Verdict{}, nil, false
 	}
 	if v.Reason == "single" {
 		tag, err := db.Exec(ctx,
@@ -224,23 +245,13 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 			// Статус cancelled легален с миграции 018; ошибку Exec не глотаем, а проверяем.
 			if _, uerr := db.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id); uerr != nil {
 				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
-				return
+				return "", entitlements.Verdict{}, nil, false
 			}
 			s.writePaywall(w, r)
-			return
+			return "", entitlements.Verdict{}, nil, false
 		}
 	}
-	// SSE + живой AI: стримим токены по мере генерации (tee в HTTP и в аккумулятор).
-	// Иначе: догенерируем синхронно и отдаем JSON {reading_id}.
-	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") && s.gw != nil && s.gw.Enabled() {
-		s.streamLive(w, r, id, req.SpreadCode, req.Question, cards)
-		s.fireReferralHook(uid)
-		return
-	}
-	s.generate(ctx, id, req.SpreadCode, req.Question, cards)
-	_ = isPremium
-	s.respondReading(w, r, uid, id)
-	s.fireReferralHook(uid)
+	return id, v, cards, true
 }
 
 // streamLive — живой SSE-стрим генерации: токены клиенту + сохранение в конце.

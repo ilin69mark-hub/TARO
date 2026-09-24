@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -258,7 +259,10 @@ type tgUpdate struct {
 // HandleWebhook — POST /v1/payments/stars/webhook (Secret-Token, без CSRF).
 func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	secret := os.Getenv("TG_STARS_SECRET_TOKEN")
-	if secret == "" || secret == "dev-only-stars" || r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != secret {
+	got := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+	// Аудит C: сравнение за константное время (timing side-channel на !=).
+	if secret == "" || secret == "dev-only-stars" || len(got) != len(secret) ||
+		subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeBadSign, "Bad secret token")
 		return
 	}
@@ -430,6 +434,8 @@ func (s *Service) ExpirePending(ctx context.Context) (int64, error) {
 
 // HandleRefund — POST /v1/admin/refund {payment_id} (только :8081, см. T29).
 // refundStarPayment в TG + payments=refunded + subscriptions.valid_until -= duration.
+// Аудит C: двухфазно (succeeded→refunding→refunded) — внешний TG-вызов НЕ держит
+// строковый лок; повтор/рестарт упирается в guard и получает 409, не двойной возврат.
 func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PaymentID string `json:"payment_id"`
@@ -439,27 +445,27 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	tx, err := s.pg.Begin(ctx)
-	if err != nil {
-		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
-		return
-	}
-	defer tx.Rollback(ctx)
 	var userID, planCode string
 	var duration *int
 	var tgCharge *string
-	// Аудит B: SELECT ... FOR UPDATE внутри tx — двойной клик не делает двойной возврат.
-	err = tx.QueryRow(ctx, `
+	err := s.pg.QueryRow(ctx, `
 		SELECT p.user_id, p.plan_code, pl.duration_days, NULLIF(p.provider_payment_id,'')
 		  FROM payments p JOIN plans pl ON pl.id=p.plan_id
-		 WHERE p.id=$1 AND p.status='succeeded' FOR UPDATE OF p`, req.PaymentID).Scan(&userID, &planCode, &duration, &tgCharge)
+		 WHERE p.id=$1 AND p.status IN ('succeeded','refunding')`, req.PaymentID).Scan(&userID, &planCode, &duration, &tgCharge)
 	if err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
 		return
 	}
+	// Фаза 1: быстрая пометка refunding с guard — повтор упирается сюда, лока нет.
+	tag, err := s.pg.Exec(ctx,
+		`UPDATE payments SET status='refunding' WHERE id=$1 AND status IN ('succeeded','refunding')`, req.PaymentID)
+	if err != nil || tag.RowsAffected() == 0 {
+		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
+		return
+	}
 	// TODO: user_id для refundStarPayment — tg_id юзера
 	var tgID *int64
-	_ = tx.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, userID).Scan(&tgID)
+	_ = s.pg.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, userID).Scan(&tgID)
 	tgAttempted := false
 	if tgID != nil && tgCharge != nil {
 		charge := ""
@@ -467,14 +473,17 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 			charge = parts[1]
 		}
 		if charge != "" {
-			// D3: ошибка TG — 502 БЕЗ пометки refunded (раньше молча резали подписку!)
-			tgAttempted = true
-			if _, err := s.tgCall(ctx, "refundStarPayment", map[string]any{
-				"user_id": *tgID, "telegram_payment_charge_id": charge,
-			}); err != nil {
-				apierr.Write(w, http.StatusBadGateway, "TG_REFUND_FAILED", "Telegram не вернул Stars, подписка не тронута")
-				return
-			}
+		// D3: ошибка TG — 502 БЕЗ пометки refunded (раньше молча резали подписку!).
+		// Аудит C: откатываем и фазу 1 (refunding→succeeded) — повторная попытка чистая.
+		tgAttempted = true
+		if _, err := s.tgCall(ctx, "refundStarPayment", map[string]any{
+			"user_id": *tgID, "telegram_payment_charge_id": charge,
+		}); err != nil {
+			_, _ = s.pg.Exec(ctx,
+				`UPDATE payments SET status='succeeded' WHERE id=$1 AND status='refunding'`, req.PaymentID)
+			apierr.Write(w, http.StatusBadGateway, "TG_REFUND_FAILED", "Telegram не вернул Stars, подписка не тронута")
+			return
+		}
 		}
 	}
 	days := 30
@@ -486,8 +495,14 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		// без TG-данных (старые/anon-платежи): только ручная пометка, след в note (см. D3)
 		note = "manual-no-tg-data"
 	}
-	// Аудит B: guard по статусу + RowsAffected — повторный refund получает 409, не двойной срез.
-	tag, err := tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1 AND status='succeeded'`,
+	// Фаза 2: финал короткой транзакцией с guard (строка уже refunding — наша).
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	defer tx.Rollback(ctx)
+	tag, err = tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1 AND status='refunding'`,
 		req.PaymentID, note)
 	if err != nil || tag.RowsAffected() == 0 {
 		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
