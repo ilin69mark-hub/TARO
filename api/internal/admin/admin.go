@@ -261,10 +261,11 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 	switch k {
 	case "ai":
 		var m struct {
-			Model       *string  `json:"model"`
-			Fallback    *string  `json:"fallback"`
-			MaxTokens   *float64 `json:"max_tokens"`
-			Temperature *float64 `json:"temperature"`
+			Model        *string  `json:"model"`
+			Fallback     *string  `json:"fallback"`
+			MaxTokens    *float64 `json:"max_tokens"`
+			Temperature  *float64 `json:"temperature"`
+			MonthlyCalls *float64 `json:"monthly_calls"`
 		}
 		if json.Unmarshal(v, &m) != nil {
 			return false
@@ -278,6 +279,9 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 			return false
 		}
 		if m.Temperature != nil && (*m.Temperature < 0 || *m.Temperature > 2) {
+			return false
+		}
+		if m.MonthlyCalls != nil && (*m.MonthlyCalls < 0 || *m.MonthlyCalls > 10000000) {
 			return false
 		}
 		return true

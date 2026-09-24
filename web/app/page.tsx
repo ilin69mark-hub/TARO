@@ -18,7 +18,9 @@ export default function Home() {
   return (
     <main className="flex min-h-screen flex-col items-center justify-center bg-deep px-6 text-center">
       <SmoothScroll />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(JSON_LD) }} />
+      {/* JSON-LD только из статической константы; user/AI-текст — никогда (аудит B).
+          </ экранирован: иначе будущая переменная даст stored-XSS в script-контексте. */}
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(JSON_LD).replace(/</g, "\\u003c") }} />
       <p className="text-sm uppercase tracking-[0.2em] text-gold">Онлайн Таро</p>
       <h1 className="mt-4 max-w-xl font-display text-4xl font-semibold leading-tight text-paper">
         Задай вопрос. Вытяни карты. Услышь себя.

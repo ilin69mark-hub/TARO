@@ -38,6 +38,8 @@ export async function generateMetadata({
   return {
     title: `${q} — Онлайн Таро`,
     robots: { index: false, follow: false },
+    // Аудит B: вопрос уже в URL — хотя бы не течём дальше через Referer (токен-шеринг — follow-up).
+    referrer: "no-referrer",
     openGraph: {
       title: q,
       description: s,

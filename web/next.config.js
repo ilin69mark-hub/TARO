@@ -19,7 +19,7 @@ const nextConfig = {
             // NB: script 'unsafe-inline' обязателен для Next.js (иначе белый экран);
             // защита — object/frame/connect/img-ограничения + React-эскейп текстов.
             value:
-              "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
+              "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://eu.posthog.com; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
           },
         ],
       },
