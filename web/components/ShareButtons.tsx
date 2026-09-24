@@ -1,14 +1,45 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { track, events } from "@/lib/analytics";
 
 // Кнопки шеринга результата (см. U13): TG-поделиться + копировать ссылку.
-// Ссылка ведет на /share (превью без толкования, см. U12). share_done — в аналитику (U14).
-export default function ShareButtons({ question, spread }: { question: string; spread: string }) {
+// Приватная ссылка /share/:token (без PII в URL); пока токен грузится — legacy ?q=.
+import { csrf } from "@/lib/api";
+
+export default function ShareButtons({
+  question,
+  spread,
+  readingId,
+}: {
+  question: string;
+  spread: string;
+  readingId: string;
+}) {
   const [copied, setCopied] = useState(false);
+  const [token, setToken] = useState("");
+
+  // Токен стабилен на расклад (сервер), StrictMode double-effect безопасен.
+  useEffect(() => {
+    let live = true;
+    fetch("/api/share", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
+      body: JSON.stringify({ reading_id: readingId }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (live && j?.token) setToken(j.token);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [readingId]);
 
   function link(): string {
+    if (token) return new URL(`/share/${token}`, window.location.origin).toString();
     const url = new URL("/share", window.location.origin);
     if (question) url.searchParams.set("q", question.slice(0, 80));
     url.searchParams.set("s", spread.slice(0, 40));

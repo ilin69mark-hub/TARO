@@ -94,6 +94,8 @@ func main() {
 	r.With(au.RequireAuth).Get("/v1/readings", rd_.HandleList)
 	r.With(au.RequireAuth).Get("/v1/readings/{id}", rd_.HandleGet)
 	r.With(au.RequireAuth).Get("/v1/streak/me", rd_.HandleStreak) // U20
+	r.With(au.RequireAuth).Post("/v1/share", rd_.HandleCreateShare) // токен-шеринг (приватные ссылки)
+	r.Get("/v1/share/{token}", rd_.HandleGetShare) // публично, превью без толкования
 	r.With(au.RequireAuth).Get("/v1/referral/me", rf.HandleMe)
 	r.With(au.RequireAuth).Post("/v1/referral/apply", rf.HandleApply)
 	r.With(au.RequireAuth).Delete("/v1/me", mv.HandleDelete)

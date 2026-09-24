@@ -65,7 +65,7 @@ export default async function ReadingPage({ params }: { params: { id: string } }
           </p>
         )}
       </div>
-      {!r.locked && <ShareButtons question={r.question} spread={r.spread} />}
+      {!r.locked && <ShareButtons question={r.question} spread={r.spread} readingId={r.id} />}
       {!r.locked && (
         <Link
           href={`/diary?reading=${r.id}`}

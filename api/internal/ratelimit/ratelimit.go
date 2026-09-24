@@ -58,6 +58,7 @@ func New(rd *redis.Client) *Limiter {
 		{"/v1/readings", true, true, Rule{60, 10}},
 		{"/v1/spreads", false, false, Rule{60, 60}},
 		{"/v1/admin/", true, true, Rule{60, 30}},
+		{"/v1/share", false, false, Rule{60, 30}}, // публичное превью: доступность важнее строгости
 	}
 	return l
 }

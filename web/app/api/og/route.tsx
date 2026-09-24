@@ -10,8 +10,23 @@ export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const title = (searchParams.get("q") || "Мой расклад").slice(0, 80);
-  const spread = (searchParams.get("s") || "Таро").slice(0, 40);
+  // Токен-шеринг: вопрос тянем сервером по токену (в URL вопроса нет).
+  const t = searchParams.get("t") || "";
+  let title = (searchParams.get("q") || "Мой расклад").slice(0, 80);
+  let spread = (searchParams.get("s") || "Таро").slice(0, 40);
+  if (/^[0-9a-f]{32}$/.test(t)) {
+    try {
+      const base = process.env.API_INTERNAL_URL || "http://localhost:8080";
+      const r = await fetch(`${base}/v1/share/${encodeURIComponent(t)}`, { cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        if (typeof j?.question === "string" && j.question) title = j.question.slice(0, 80);
+        if (typeof j?.spread === "string" && j.spread) spread = j.spread.slice(0, 40);
+      }
+    } catch {
+      /* fallback на дефолт */
+    }
+  }
   // Аудит C: рендер детерминирован от q/s — кэшируем сутки (CPU-DoS mitigation + nginx zone og).
   const res = new ImageResponse(
     (
