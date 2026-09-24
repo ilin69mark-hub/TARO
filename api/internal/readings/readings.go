@@ -521,7 +521,7 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.pg.Query(ctx, `
 		SELECT id, spread_code, question, left(interpretation, 160), created_at
-		  FROM readings WHERE user_id=$1 AND ($3='' OR question ILIKE '%'||$3||'%')
+		  FROM readings WHERE user_id=$1 AND status NOT IN ('cancelled','failed') AND ($3='' OR question ILIKE '%'||$3||'%')
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, q, offset)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить историю")

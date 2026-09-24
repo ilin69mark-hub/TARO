@@ -105,7 +105,8 @@ func TestSendToLocalServer(t *testing.T) {
 
 	s := &Service{http: &http.Client{}}
 	t.Setenv("VAPID_PRIVATE_KEY", "11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo")
-	st, err := s.send(t.Context(), Subscription{
+	// doSend: крипто-путь без endpoint-политики (политика — в send(),loopback там запрещён)
+	st, err := s.doSend(t.Context(), Subscription{
 		Endpoint: srv.URL,
 		P256DH:   pubB64,
 		Auth:     b64enc(authB),
@@ -115,6 +116,16 @@ func TestSendToLocalServer(t *testing.T) {
 	}
 	if !bytes.HasPrefix([]byte(gotAuth), []byte("vapid t=")) || gotEnc != "aes128gcm" || len(gotBody) == 0 {
 		t.Fatalf("headers: %q %q body=%d", gotAuth, gotEnc, len(gotBody))
+	}
+}
+
+// send обязан отвергать loopback/http до сети (аудит B: rebinding-защита).
+func TestSendRejectsLocal(t *testing.T) {
+	s := New(nil)
+	for _, ep := range []string{"http://127.0.0.1:1/x", "https://127.0.0.1/x", "http://localhost/x"} {
+		if _, err := s.send(t.Context(), Subscription{Endpoint: ep}, []byte("x")); err == nil {
+			t.Fatalf("send accepted %s", ep)
+		}
 	}
 }
 

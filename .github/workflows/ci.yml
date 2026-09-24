@@ -24,6 +24,9 @@ jobs:
       - run: test -z "$(grep -rn 'track(events\.[a-zA-Z]*, {[^}]*\(question\|interpretation\)' lib app components || true)"
       - run: npm test
       - run: npm run build
+        env:
+          NEXT_PUBLIC_BASE_URL: https://ci.local
+          NEXT_PUBLIC_POSTHOG_KEY: ci-disabled
 
   api:
     runs-on: ubuntu-latest

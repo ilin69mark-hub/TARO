@@ -506,6 +506,11 @@ func (s *Service) send(ctx context.Context, sub Subscription, payload []byte) (i
 	if err := validEndpoint(ctx, sub.Endpoint); err != nil {
 		return 0, err
 	}
+	return s.doSend(ctx, sub, payload)
+}
+
+// doSend — чистая отправка (крипто + POST); валидация endpoint — в send() выше.
+func (s *Service) doSend(ctx context.Context, sub Subscription, payload []byte) (int, error) {
 	priv, err := vapidKey()
 	if err != nil {
 		return 0, err
