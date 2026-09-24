@@ -29,10 +29,14 @@ letters, watermark, logo, blurry, low quality, neon cyberpunk, cartoon
 - [ ] Палитра: ночь #0B0B14 + золото #D4AF37, без неона
 - [ ] Симметрия эмблемы по центру
 
-## Техблок (все файлы)
-- Исходник 1024px → даунскейл 512px → WebP q80 (<90KB)
-- Имя = image_key из сида (major-00-fool.webp … major-21-world.webp)
-- Класть в `web/public/cards/`, контракт в `web/public/cards/README.md`
+## Техблок (все файлы) — РАЗМЕРЫ frozen
+- Формат: портрет **5:8** (совпадает с UI `aspect 5/8` в `CardArt` — без кропа!).
+- Исходник генерации: **1000×1600 px**.
+- Доставка: даунскейл **500×800 px**, WebP q80, **<90KB** каждый.
+- Blur-плейсхолдер 20px (генерит код).
+- Печать (если понадобится): 70×112мм, 300dpi из исходника.
+- Имя = image_key из сида (major-00-fool.webp … major-21-world.webp).
+- Класть в `web/public/cards/`, контракт в `web/public/cards/README.md`.
 
 ## Файлы
 - `major-00-fool.md` … `major-21-world.md` — сцена + акценты + ловушки брака
