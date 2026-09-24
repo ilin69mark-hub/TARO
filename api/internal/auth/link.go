@@ -120,7 +120,7 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 		if _, err := tx.Exec(ctx, `UPDATE users SET tg_id=$1 WHERE id=$2`, tgID, current); err != nil {
 			return "", false, err
 		}
-		if err := grantTrialTx(ctx, tx, current); err != nil {
+		if err := grantTrialTx(ctx, tx, current, tgID, fingerprint); err != nil {
 			return "", false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -152,7 +152,7 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if err := mergeCountersTx(ctx, tx, other, current); err != nil {
 		return "", false, err
 	}
-	if err := grantTrialTx(ctx, tx, other); err != nil {
+	if err := grantTrialTx(ctx, tx, other, tgID, fingerprint); err != nil {
 		return "", false, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id=$1`, current); err != nil {
@@ -213,22 +213,23 @@ func mergeCountersTx(ctx context.Context, tx pgx.Tx, survivor, loser string) err
 	return err
 }
 
-// grantTrialTx — trial внутри транзакции (проверка subscriptions trial_3d).
-func grantTrialTx(ctx context.Context, tx pgx.Tx, userID string) error {
-	var n int
-	if err := tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM subscriptions WHERE user_id=$1 AND plan_code='trial_3d'`, userID).Scan(&n); err != nil {
+// grantTrialTx — trial внутри транзакции через несгораемый trial_grants (см. аудит B).
+func grantTrialTx(ctx context.Context, tx pgx.Tx, userID string, tgID int64, fingerprint string) error {
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO trial_grants (tg_id, fingerprint, user_id) VALUES ($1,$2,$3)
+		 ON CONFLICT (tg_id) DO NOTHING`, tgID, fingerprint, userID)
+	if err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
+	if tag.RowsAffected() == 0 {
+		return nil // trial уже был на этот tg_id
 	}
 	var planID string
 	if err := tx.QueryRow(ctx,
 		`SELECT id FROM plans WHERE code='trial_3d' AND is_active ORDER BY valid_from DESC LIMIT 1`).Scan(&planID); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)
 		 VALUES ($1,$2,'trial_3d',0, now() + interval '3 days')`, userID, planID)
 	return err

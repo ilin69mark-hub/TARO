@@ -135,7 +135,7 @@ func TestE2ESSEReplay(t *testing.T) {
 
 func TestE2EStreamLive(t *testing.T) {
 	// живой SSE-стрим через мок-OpenRouter (см. streamLive, D-покрытие)
-	t.Setenv("OPENROUTER_API_KEY", "test-key")
+	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"Живой "}}]}`)

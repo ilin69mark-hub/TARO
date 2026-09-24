@@ -271,17 +271,30 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	sp := upd.Message.SuccessfulPayment
 	ctx := r.Context()
+	// Аудит B: сверяем сумму/валюту/отправителя ДО начислений (раньше начисляли вслепую).
+	if sp.Currency != "XTR" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": "currency"})
+		return
+	}
 	// ищем pending по payload=payment_id
 	var paymentID, userID, planCode, planID string
 	var duration *int
+	var expStars int
+	var ownerTg *int64
 	err := s.pg.QueryRow(ctx, `
-		SELECT p.id, p.user_id, p.plan_code, p.plan_id, pl.duration_days
-		  FROM payments p JOIN plans pl ON pl.id=p.plan_id
-		 WHERE p.id=$1 AND p.status='pending'`, sp.InvoicePayload).Scan(&paymentID, &userID, &planCode, &planID, &duration)
+		SELECT p.id, p.user_id, p.plan_code, p.plan_id, pl.duration_days, p.stars, u.tg_id
+		  FROM payments p JOIN plans pl ON pl.id=p.plan_id JOIN users u ON u.id=p.user_id
+		 WHERE p.id=$1 AND p.status='pending'`, sp.InvoicePayload).Scan(&paymentID, &userID, &planCode, &planID, &duration, &expStars, &ownerTg)
 	if err != nil {
 		// уже обработан или чужой — идемпотентный ok (ретраи TG)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "duplicate": true})
+		return
+	}
+	if sp.TotalAmount != expStars || (upd.Message.From != nil && ownerTg != nil && upd.Message.From.ID != *ownerTg) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": "amount_mismatch"})
 		return
 	}
 	tx, err := s.pg.Begin(ctx)
@@ -426,20 +439,27 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	defer tx.Rollback(ctx)
 	var userID, planCode string
 	var duration *int
 	var tgCharge *string
-	err := s.pg.QueryRow(ctx, `
-		SELECT p.user_id, p.plan_code, pl.duration_days, NULLIF(p.provider_payment_id,'') 
+	// Аудит B: SELECT ... FOR UPDATE внутри tx — двойной клик не делает двойной возврат.
+	err = tx.QueryRow(ctx, `
+		SELECT p.user_id, p.plan_code, pl.duration_days, NULLIF(p.provider_payment_id,'')
 		  FROM payments p JOIN plans pl ON pl.id=p.plan_id
-		 WHERE p.id=$1 AND p.status='succeeded'`, req.PaymentID).Scan(&userID, &planCode, &duration, &tgCharge)
+		 WHERE p.id=$1 AND p.status='succeeded' FOR UPDATE OF p`, req.PaymentID).Scan(&userID, &planCode, &duration, &tgCharge)
 	if err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
 		return
 	}
 	// TODO: user_id для refundStarPayment — tg_id юзера
 	var tgID *int64
-	_ = s.pg.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, userID).Scan(&tgID)
+	_ = tx.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, userID).Scan(&tgID)
 	tgAttempted := false
 	if tgID != nil && tgCharge != nil {
 		charge := ""
@@ -466,15 +486,11 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		// без TG-данных (старые/anon-платежи): только ручная пометка, след в note (см. D3)
 		note = "manual-no-tg-data"
 	}
-	tx, err := s.pg.Begin(ctx)
-	if err != nil {
-		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
-		return
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1`,
-		req.PaymentID, note); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось оформить возврат")
+	// Аудит B: guard по статусу + RowsAffected — повторный refund получает 409, не двойной срез.
+	tag, err := tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1 AND status='succeeded'`,
+		req.PaymentID, note)
+	if err != nil || tag.RowsAffected() == 0 {
+		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
 		return
 	}
 	// valid_until -= duration (min now); истекшие помечаем revoked (см. 02-functional/05)

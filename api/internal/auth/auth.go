@@ -321,13 +321,14 @@ func (s *Service) AnonLogin(ctx context.Context, uuid, fingerprint, ip string) (
 	return id, nil
 }
 
-// GrantTrial выдает trial_3d 1 раз на связку tg_id+fingerprint.
+// GrantTrial выдает trial_3d 1 раз на tg_id (несгораемый реестр trial_grants,
+// переживает DELETE юзера — раньше COUNT по subscriptions давал вечный trial, см. аудит B).
 // Возвращает granted. Идемпотентен: повторный вызов — false без дубля.
 func GrantTrial(ctx context.Context, pg *pgxpool.Pool, userID string, tgID int64, fingerprint string) (bool, error) {
-	// trial уже был у этого юзера?
+	// trial уже был на этот tg_id (включая удалённых юзеров)?
 	var n int
 	if err := pg.QueryRow(ctx,
-		`SELECT COUNT(*) FROM subscriptions WHERE user_id=$1 AND plan_code='trial_3d'`, userID).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM trial_grants WHERE tg_id=$1`, tgID).Scan(&n); err != nil {
 		return false, err
 	}
 	if n > 0 {
@@ -337,6 +338,19 @@ func GrantTrial(ctx context.Context, pg *pgxpool.Pool, userID string, tgID int64
 	if err := pg.QueryRow(ctx,
 		`SELECT id FROM plans WHERE code='trial_3d' AND is_active ORDER BY valid_from DESC LIMIT 1`).Scan(&planID); err != nil {
 		return false, err
+	}
+	if _, err := pg.Exec(ctx,
+		`INSERT INTO trial_grants (tg_id, fingerprint, user_id) VALUES ($1,$2,$3)
+		 ON CONFLICT (tg_id) DO NOTHING`, tgID, fingerprint, userID); err != nil {
+		return false, err
+	}
+	var inserted bool
+	if err := pg.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM trial_grants WHERE tg_id=$1 AND user_id=$2)`, tgID, userID).Scan(&inserted); err != nil {
+		return false, err
+	}
+	if !inserted {
+		return false, nil // race: другой запрос успел первым
 	}
 	_, err := pg.Exec(ctx,
 		`INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)

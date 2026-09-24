@@ -56,16 +56,24 @@ type Gateway struct {
 
 // New возвращает шлюз. Без OPENROUTER_API_KEY — Enabled()=false, только fallback.
 func New(pg *pgxpool.Pool, rd *redis.Client) *Gateway {
+	// Аудит B: БЕЗ общего Client.Timeout — он резал живой SSE-стрим на 8с.
+	// Дедлайны только через ctx (25с streamLive / 30с worker); хендшейк ограничен ниже.
 	return &Gateway{
 		pg: pg, rd: rd,
-		http:    &http.Client{Timeout: RequestTimeout},
+		http: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: RequestTimeout,
+			},
+		},
 		apiKey:  os.Getenv("OPENROUTER_API_KEY"),
 		apiKey2: os.Getenv("OPENROUTER_API_KEY_2"),
 	}
 }
 
-// Enabled — есть ли ключ для живых вызовов.
-func (g *Gateway) Enabled() bool { return g.apiKey != "" }
+// Enabled — есть ли ключ для живых вызовов (мусор вида "x"/"dev" не включает путь).
+func (g *Gateway) Enabled() bool {
+	return len(g.apiKey) >= 20 && !strings.HasPrefix(g.apiKey, "dev")
+}
 
 // LoadConfig читает app_config.ai (дефолты из сида T04).
 func (g *Gateway) LoadConfig(ctx context.Context) Config {

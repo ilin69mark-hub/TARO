@@ -16,9 +16,16 @@ async function fwd(res: Response) {
   });
 }
 
+// id дневника — UUID: allowlist + encode (аудит B: был traversal в Go).
+const ID_RE = /^[0-9a-fA-F-]{8,64}$/;
+function badId() {
+  return NextResponse.json({ error: { message_ru: "Некорректный id" } }, { status: 422 });
+}
+
 // GET /api/diary/:id → Go.
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const res = await fetch(`${GO}/v1/diary/${params.id}`, {
+  if (!ID_RE.test(params.id)) return badId();
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
     headers: { Cookie: req.headers.get("cookie") || "" },
     cache: "no-store",
   });
@@ -27,8 +34,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
 
 // PUT /api/diary/:id → Go.
 export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
+  if (!ID_RE.test(params.id)) return badId();
   const body = await req.text();
-  const res = await fetch(`${GO}/v1/diary/${params.id}`, {
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
     method: "PUT",
     headers: headers(req),
     body,
@@ -38,7 +46,8 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
 
 // DELETE /api/diary/:id → Go.
 export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
-  const res = await fetch(`${GO}/v1/diary/${params.id}`, {
+  if (!ID_RE.test(params.id)) return badId();
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
     method: "DELETE",
     headers: headers(req),
   });

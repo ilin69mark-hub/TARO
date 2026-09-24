@@ -133,10 +133,27 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// Аудит B: сериализуем повторы по ключу — двойной клик не списывает квоту дважды.
+	// Lock обязан жить на ОДНОМ соединении: пиним conn из пула на весь хендлер.
+	conn, err := s.pg.Acquire(ctx)
+	if err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	defer conn.Release()
+	lockKey := "reading:" + uid + ":" + key
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, lockKey); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, lockKey)
+	}()
+	db := conn // все SQL хендлера — через запиненное соединение
 	// спред активен? + число позиций
 	var positions json.RawMessage
 	var isPremium bool
-	if err := s.pg.QueryRow(ctx,
+	if err := db.QueryRow(ctx,
 		`SELECT positions, is_premium FROM spreads WHERE code=$1 AND is_active`, req.SpreadCode).Scan(&positions, &isPremium); err != nil {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный расклад")
 		return
@@ -146,10 +163,16 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Битый расклад")
 		return
 	}
-	// идемпотентность ДО списания лимита: повтор возвращает существующее
+	// идемпотентность ДО списания лимита: повтор возвращает существующее.
+	// Мёртвые строки (cancelled/failed) — удаляем, ключ освобождается под fresh-вставку.
 	if existing := s.findByKey(ctx, uid, key); existing != "" {
-		s.respondReading(w, r, uid, existing)
-		return
+		var st string
+		if err := db.QueryRow(ctx, `SELECT status FROM readings WHERE id=$1`, existing).Scan(&st); err != nil || st == "cancelled" || st == "failed" {
+			_, _ = db.Exec(ctx, `DELETE FROM readings WHERE id=$1`, existing)
+		} else {
+			s.respondReading(w, r, uid, existing)
+			return
+		}
 	}
 	// кризис — до лимитов и без списания: безопасность важнее квоты
 	if isCrisis(req.Question) {
@@ -160,23 +183,14 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		s.respondReading(w, r, uid, id)
 		return
 	}
-	// лимиты (consume внутри Check)
-	v, err := s.en.Check(ctx, uid, req.SpreadCode)
-	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить лимит")
-		return
-	}
-	if !v.Allow {
-		s.writePaywall(w, r)
-		return
-	}
 	seed := time.Now().UnixNano()
 	cards := draw(seed, len(posCount))
 	cardsJSON, _ := json.Marshal(cards)
 
-	// вставляем pending: строка существует до генерации (SSE-обрыв → докачка/воркер)
+	// Аудит B: вставляем pending ДО списания квоты — падение вставки не сжигает лимит.
+	// Повторный конкурент заблокирован advisory-lock выше, ON CONFLICT — пояс поверх.
 	var id string
-	err = s.pg.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key)
 		VALUES ($1,$2,$3,$4,'', $5,1,'pending',$6)
 		ON CONFLICT (user_id, idempotency_key) DO NOTHING
@@ -190,12 +204,28 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
 		return
 	}
+	// лимиты (consume внутри Check) — ПОСЛЕ вставки; отказ → строка в cancelled, квота цела
+	v, err := s.en.Check(ctx, uid, req.SpreadCode)
+	if err != nil {
+		_, _ = db.Exec(ctx, `UPDATE readings SET status='failed' WHERE id=$1`, id)
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить лимит")
+		return
+	}
+	if !v.Allow {
+		_, _ = db.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id)
+		s.writePaywall(w, r)
+		return
+	}
 	if v.Reason == "single" {
-		tag, err := s.pg.Exec(ctx,
+		tag, err := db.Exec(ctx,
 			`UPDATE single_entitlements SET consumed_reading_id=$1 WHERE id=$2 AND consumed_reading_id IS NULL`, id, v.SingleID)
 		if err != nil || tag.RowsAffected() == 0 {
-			// race: второй запрос потребил single первым — откатываем pending и просим оплатить
-			_, _ = s.pg.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id)
+			// race: второй запрос потребил single первым — откатываем pending и просим оплатить.
+			// Статус cancelled легален с миграции 018; ошибку Exec не глотаем, а проверяем.
+			if _, uerr := db.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id); uerr != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return
+			}
 			s.writePaywall(w, r)
 			return
 		}
@@ -232,7 +262,16 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 	}
 	done := make(chan res, 1)
 	go func() {
-		defer apierr.Recover() // S06
+		// Аудит B: паника обязана разблокировать done+ch и попасть в лог (было: вечный hang).
+		defer func() {
+			if rec := recover(); rec != nil {
+				_, _ = s.pg.Exec(context.Background(),
+					`INSERT INTO ai_logs (reading_id, model, prompt_hash, status, error) VALUES ($1,'', '', 'failed', $2)`,
+					id, fmt.Sprintf("stream panic: %v", rec))
+				close(ch)
+				done <- res{"", "", fmt.Errorf("stream panic: %v", rec)}
+			}
+		}()
 		text, model, _, err := s.gw.Stream(ctx, id, spreadName, positions, values, question, ch)
 		done <- res{text, model, err}
 	}()
@@ -284,7 +323,16 @@ func (s *Service) generate(ctx context.Context, id, spreadCode, question string,
 	}
 	done := make(chan res, 1)
 	go func() {
-		defer apierr.Recover() // S06
+		// Аудит B: см. streamLive выше — паника разблокирует done+ch и логируется.
+		defer func() {
+			if rec := recover(); rec != nil {
+				_, _ = s.pg.Exec(context.Background(),
+					`INSERT INTO ai_logs (reading_id, model, prompt_hash, status, error) VALUES ($1,'', '', 'failed', $2)`,
+					id, fmt.Sprintf("stream panic: %v", rec))
+				close(ch)
+				done <- res{"", fmt.Errorf("stream panic: %v", rec)}
+			}
+		}()
 		text, _, _, err := s.gw.Stream(ctx, id, spreadName, positions, values, question, ch)
 		done <- res{text, err}
 	}()
@@ -365,7 +413,7 @@ func (s *Service) findByKey(ctx context.Context, uid, key string) string {
 // respondReading: SSE при Accept: text/event-stream, иначе JSON {reading_id}.
 func (s *Service) respondReading(w http.ResponseWriter, r *http.Request, uid, id string) {
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-		s.streamReading(w, r, id)
+		s.streamReading(w, r, uid, id)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -373,10 +421,11 @@ func (s *Service) respondReading(w http.ResponseWriter, r *http.Request, uid, id
 }
 
 // streamReading стримит сохраненный текст токенами-словами (T13: живые токены OpenRouter).
-func (s *Service) streamReading(w http.ResponseWriter, r *http.Request, id string) {
+// Аудит B: фильтр по владельцу в SQL (было: любой id без проверки — спящий IDOR).
+func (s *Service) streamReading(w http.ResponseWriter, r *http.Request, uid, id string) {
 	var text, status string
 	if err := s.pg.QueryRow(r.Context(),
-		`SELECT interpretation, status FROM readings WHERE id=$1`, id).Scan(&text, &status); err != nil {
+		`SELECT interpretation, status FROM readings WHERE id=$1 AND user_id=$2`, id, uid).Scan(&text, &status); err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Расклад не найден")
 		return
 	}
@@ -515,11 +564,11 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	var spread, question, interp, status string
 	var cards json.RawMessage
 	var created time.Time
-	var owner string
+	// Аудит B: владелец фильтруется в SQL, чужая строка не читается вообще.
 	err := s.pg.QueryRow(ctx, `
-		SELECT user_id, spread_code, question, cards, interpretation, status, created_at
-		  FROM readings WHERE id=$1`, id).Scan(&owner, &spread, &question, &cards, &interp, &status, &created)
-	if err != nil || owner != uid {
+		SELECT spread_code, question, cards, interpretation, status, created_at
+		  FROM readings WHERE id=$1 AND user_id=$2`, id, uid).Scan(&spread, &question, &cards, &interp, &status, &created)
+	if err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Расклад не найден")
 		return
 	}

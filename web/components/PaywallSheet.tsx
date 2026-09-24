@@ -60,10 +60,13 @@ export default function PaywallSheet({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
-        body: JSON.stringify({ plan_code: code }),
+        // idempotency_key обязателен сервером (аудит B: без него дубли pending)
+        body: JSON.stringify({ plan_code: code, idempotency_key: crypto.randomUUID() }),
       });
       if (!res.ok) return;
       const { invoice_link } = await res.json();
+      // Аудит B: ссылка только t.me, иначе фишинг через скомпрометированный ответ
+      if (typeof invoice_link !== "string" || !/^https:\/\/(t\.me|telegram\.me)\//.test(invoice_link)) return;
       const tg = (window as unknown as { Telegram?: { WebApp?: { openInvoice?: (u: string) => void } } }).Telegram?.WebApp;
       if (tg?.openInvoice) tg.openInvoice(invoice_link);
       else window.open(invoice_link, "_blank", "noopener");

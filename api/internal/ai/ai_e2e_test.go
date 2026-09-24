@@ -34,7 +34,7 @@ func mockServer(t *testing.T, mode string, seen *[]string) *httptest.Server {
 func testGateway(t *testing.T) (context.Context, *pgxpool.Pool, *redis.Client, *Gateway) {
 	t.Helper()
 	ctx, pg, rd := testutil.Live(t)
-	t.Setenv("OPENROUTER_API_KEY", "test-key")
+	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
 	// e2e-тесты делят dev-Redis: чистим AI-ключи чтобы не ловить чужой кэш/breaker
 	iter := rd.Scan(ctx, 0, "ai:*", 100).Iterator()
 	for iter.Next(ctx) {

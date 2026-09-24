@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 
+import { csrf } from "../lib/api";
+
 // 18+ gate: модалка при первом входе + запись age_confirmed_at (см. 08-risks/02, T15/T20).
 export default function AgeGate() {
   const [show, setShow] = useState(false);
@@ -15,16 +17,22 @@ export default function AgeGate() {
   }, []);
 
   async function confirm() {
+    // Аудит B: метку ставим ТОЛЬКО после 200 от сервера (раньше врали себе при 403).
     try {
-      localStorage.setItem("taro_age", "1");
-      await fetch("/api/me/age", {
+      const res = await fetch("/api/me/age", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF": "1" },
+        headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
         body: JSON.stringify({ confirmed: true }),
-      }).catch(() => undefined);
+      });
+      if (!res.ok) return; // сервер не записал — модалку не прячем
+      try {
+        localStorage.setItem("taro_age", "1");
+      } catch {
+        /* ignore */
+      }
     } catch {
-      /* offline — локальная метка уже стоит */
+      return; // offline — модалку не прячем
     }
     setShow(false);
   }
