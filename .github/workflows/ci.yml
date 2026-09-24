@@ -85,3 +85,7 @@ jobs:
             grep -q "id: $id" docs/security-exceptions.yml || (echo "exception $id без записи в yml!" && exit 1)
           done
           echo "exceptions OK"
+      # Fail-open флаги dev-авторизации — никогда в прод-конфигах (только код default-off + тесты)
+      - run: |
+          test -z "$(grep -rn 'TG_ALLOW_EMPTY=1\|TG_ALLOW_DEV_BOT=1' docker-compose.yml deploy/ .github/ .env.example 2>/dev/null || true)" \
+            || (echo "dev-auth flag в прод-конфиге!" && exit 1)

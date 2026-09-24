@@ -18,32 +18,53 @@ export function getUuid(): string {
 }
 
 // S08: отдельный fingerprint браузера (не uuid): кража только uuid без fp не входит.
+// Аудит B: fp больше не храним в localStorage (XSS забирал пару целиком).
+// Порядок: память → legacy localStorage → генерация (только в память).
+// Сервер ставит httpOnly cookie taro_fp; после первого успеха чистим legacy.
+let memFp = "";
 export function getFp(): string {
-  let fp = localStorage.getItem(FPKEY);
-  if (!fp) {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    fp = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    localStorage.setItem(FPKEY, fp);
+  if (memFp) return memFp;
+  try {
+    const legacy = localStorage.getItem(FPKEY);
+    if (legacy) {
+      memFp = legacy;
+      return memFp;
+    }
+  } catch {
+    /* ignore */
   }
-  return fp;
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  memFp = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return memFp;
+}
+
+function dropLegacyFp(): void {
+  memFp = memFp || "";
+  try {
+    localStorage.removeItem(FPKEY);
+  } catch {
+    /* ignore */
+  }
 }
 
 export async function ensureAuth(): Promise<void> {
   const tg = (window as unknown as { Telegram?: { WebApp?: { initData?: string } } }).Telegram?.WebApp;
   if (tg?.initData) {
-    await fetch("/api/auth/telegram", {
+    const res = await fetch("/api/auth/telegram", {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
       body: JSON.stringify({ initData: tg.initData }),
     }).catch(() => undefined);
+    if (res?.ok) dropLegacyFp();
     return;
   }
-  await fetch("/api/auth/anon", {
+  const res = await fetch("/api/auth/anon", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
     body: JSON.stringify({ uuid: getUuid(), fingerprint: getFp() }),
   }).catch(() => undefined);
+  if (res?.ok) dropLegacyFp();
 }

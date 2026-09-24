@@ -315,8 +315,20 @@ func (s *Service) HandleMe(w http.ResponseWriter, r *http.Request) {
 	daily := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
 	weekly := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
 	now := time.Now()
-	freeUsed, _ := s.rd.Get(ctx, "ent:"+uid+":"+mskDate(now)).Int()
-	loveUsed, _ := s.rd.Get(ctx, "ent:"+uid+":love:"+weekKey(now)).Int()
+	// Аудит B: при мёртвом Redis дисплей падал в 0 (врал полную квоту) — читаем PG.
+	freeUsed, err := s.rd.Get(ctx, "ent:"+uid+":"+mskDate(now)).Int()
+	if err != nil {
+		_ = s.pg.QueryRow(ctx,
+			`SELECT free_used_today FROM entitlements WHERE user_id=$1 AND free_date=$2::date`,
+			uid, mskDate(now)).Scan(&freeUsed)
+	}
+	loveUsed, err := s.rd.Get(ctx, "ent:"+uid+":love:"+weekKey(now)).Int()
+	if err != nil {
+		// love_week в PG — date понедельника (mondayMSK), не ISO-ключ Redis
+		_ = s.pg.QueryRow(ctx,
+			`SELECT love_used_week FROM entitlements WHERE user_id=$1 AND love_week=$2::date`,
+			uid, mondayMSK(now)).Scan(&loveUsed)
+	}
 	freeLeft := daily - freeUsed
 	if freeLeft < 0 {
 		freeLeft = 0

@@ -126,6 +126,22 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
+// HandleLogout — POST /v1/admin/logout: отзыв admin-сессии (аудит B: угона без отзыва нет).
+func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(AdminCookie); err == nil {
+		if sub, err := auth.ParseJWT(c.Value); err == nil {
+			uid := strings.TrimPrefix(sub, "admin:")
+			_, _ = s.rd.Del(r.Context(), "sess:admin:"+uid).Result()
+		}
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: AdminCookie, Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
 // RequireAdmin — middleware: taro_admin JWT (sub=admin:<uid>) + живой sess:admin + роль.
 // S10: либо X-Admin-Token == ADMIN_API_TOKEN (cron/server-to-server, ТОЛЬКО с loopback).
 func (s *Service) RequireAdmin(next http.Handler) http.Handler {
@@ -236,6 +252,55 @@ var allowedConfigKeys = map[string]bool{
 	"spreads.seasonal": true, "payments.yookassa": true,
 }
 
+// validateConfigValue — схема значений app_config (аудит B: раньше принималось любое JSON).
+// Ключ проверен allowlist выше; здесь типы, диапазоны, размеры, запрет NUL.
+func validateConfigValue(k string, v json.RawMessage) bool {
+	if len(v) == 0 || len(v) > 8192 || strings.Contains(string(v), "\x00") {
+		return false
+	}
+	switch k {
+	case "ai":
+		var m struct {
+			Model       *string  `json:"model"`
+			Fallback    *string  `json:"fallback"`
+			MaxTokens   *float64 `json:"max_tokens"`
+			Temperature *float64 `json:"temperature"`
+		}
+		if json.Unmarshal(v, &m) != nil {
+			return false
+		}
+		for _, s := range []*string{m.Model, m.Fallback} {
+			if s != nil && (*s == "" || len(*s) > 200 || strings.Contains(*s, "\x00")) {
+				return false
+			}
+		}
+		if m.MaxTokens != nil && (*m.MaxTokens < 1 || *m.MaxTokens > 100000) {
+			return false
+		}
+		if m.Temperature != nil && (*m.Temperature < 0 || *m.Temperature > 2) {
+			return false
+		}
+		return true
+	case "free.daily_limit", "love.free_weekly", "history.free_limit":
+		var m map[string]any
+		if json.Unmarshal(v, &m) != nil {
+			return false
+		}
+		return true
+	case "ab.price_month", "offers.winback", "trial", "referral", "spreads.seasonal", "payments.yookassa":
+		var m map[string]any
+		return json.Unmarshal(v, &m) == nil
+	case "copy.paywall_title", "copy.paywall_desc", "copy.paywall_cta":
+		var s string
+		if json.Unmarshal(v, &s) != nil || s == "" || len(s) > 500 || strings.Contains(s, "\x00") {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 type planDiff struct {
 	Code     string `json:"code"`
 	PriceRub *int   `json:"price_rub"`
@@ -275,6 +340,10 @@ func (s *Service) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	for k, v := range req.AppConfig {
 		if !allowedConfigKeys[k] {
 			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный ключ: "+k)
+			return
+		}
+		if !validateConfigValue(k, v) {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректное значение: "+k)
 			return
 		}
 		if _, err := tx.Exec(ctx, `
@@ -330,6 +399,10 @@ func (s *Service) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		applied["plans"]++
 	}
 	for _, sp := range req.Spreads {
+		if sp.SortOrder != nil && (*sp.SortOrder < -1000 || *sp.SortOrder > 1000) {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный sort_order: "+sp.Code)
+			return
+		}
 		sets := []string{}
 		args := []any{sp.Code}
 		// NB: номер плейсхолдера = len(args) ПОСЛЕ append (см. D1 off-by-one).

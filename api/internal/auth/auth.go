@@ -159,6 +159,39 @@ func writeCookie(w http.ResponseWriter, token string, ttl time.Duration) {
 	})
 }
 
+// FpCookie — httpOnly-флаг fingerprint (аудит B: fp жил в localStorage рядом с uuid,
+// один XSS забирал пару и входил как жертва). Сервер ставит после успешного входа;
+// клиент шлёт из памяти, localStorage — только legacy-источник до первого успеха.
+const FpCookie = "taro_fp"
+
+// writeFpCookie кладет fingerprint в httpOnly cookie (флаги как у сессии — TG iframe).
+func writeFpCookie(w http.ResponseWriter, fp string) {
+	if fp == "" {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     FpCookie,
+		Value:    fp,
+		Path:     "/",
+		MaxAge:   int(UserTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteNoneMode,
+	})
+}
+
+// fpOf достает fingerprint: тело запроса приоритетно (первый вход/migration),
+// иначе httpOnly cookie (штатный путь — JS его не видит).
+func fpOf(r *http.Request, bodyFp string) string {
+	if bodyFp != "" {
+		return bodyFp
+	}
+	if c, err := r.Cookie(FpCookie); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
 // telegramRequest — POST /v1/auth/telegram {initData, fingerprint?}.
 func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -169,7 +202,11 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
-	id, isNew, trialDays, err := s.TelegramLogin(r.Context(), req.InitData, req.Fingerprint)
+	if fp := fpOf(r, req.Fingerprint); len(fp) > 64 || strings.ContainsRune(fp, 0) {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный fingerprint")
+		return
+	}
+	id, isNew, trialDays, err := s.TelegramLogin(r.Context(), req.InitData, fpOf(r, req.Fingerprint))
 	if err != nil {
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeInvalidTg, "Не удалось подтвердить Telegram")
 		return
@@ -184,6 +221,7 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCookie(w, tok, UserTTL)
+	writeFpCookie(w, fpOf(r, req.Fingerprint))
 	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "is_new": isNew, "trial_days": trialDays, "csrf_token": csrf})
@@ -204,11 +242,15 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный uuid")
 		return
 	}
+	if fp := fpOf(r, req.Fingerprint); len(fp) > 64 || strings.ContainsRune(fp, 0) {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный fingerprint")
+		return
+	}
 	ip := r.Header.Get("X-Real-IP")
 	if ip == "" {
 		ip = "unknown"
 	}
-	id, err := s.AnonLogin(r.Context(), req.UUID, req.Fingerprint, ip)
+	id, err := s.AnonLogin(r.Context(), req.UUID, fpOf(r, req.Fingerprint), ip)
 	if err != nil {
 		if err.Error() == "rate_limited" {
 			apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком много регистраций, попробуй позже")
@@ -231,6 +273,7 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCookie(w, tok, UserTTL)
+	writeFpCookie(w, fpOf(r, req.Fingerprint))
 	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "csrf_token": csrf})

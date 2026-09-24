@@ -40,7 +40,31 @@ type Service struct {
 
 // New возвращает сервис.
 func New(pg *pgxpool.Pool) *Service {
-	return &Service{pg: pg, http: &http.Client{Timeout: 10 * time.Second}}
+	return &Service{pg: pg, http: &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			// Аудит B: dial-time блок private/loopback — закрывает rebinding-окно
+			// между ревалидацией endpoint и фактическим соединением.
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil || len(addrs) == 0 {
+					return nil, fmt.Errorf("dns fail")
+				}
+				for _, a := range addrs {
+					if isBlockedIP(a.IP) {
+						continue
+					}
+					d := &net.Dialer{Timeout: 5 * time.Second}
+					return d.DialContext(ctx, network, net.JoinHostPort(a.IP.String(), port))
+				}
+				return nil, fmt.Errorf("blocked resolved ip")
+			},
+		},
+	}}
 }
 
 // HandlePublicKey — GET /v1/push/public: VAPID-публичник (не секрет, см. U21).
@@ -478,6 +502,10 @@ func hkdfExpand(prk, info []byte, n int) ([]byte, error) {
 
 // send собирает и шлет один пуш. Возвращает HTTP-статус.
 func (s *Service) send(ctx context.Context, sub Subscription, payload []byte) (int, error) {
+	// Аудит B: ревалидация перед каждой отправкой (подписка могла перевесить DNS — rebinding).
+	if err := validEndpoint(ctx, sub.Endpoint); err != nil {
+		return 0, err
+	}
 	priv, err := vapidKey()
 	if err != nil {
 		return 0, err
