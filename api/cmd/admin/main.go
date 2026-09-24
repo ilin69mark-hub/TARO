@@ -44,7 +44,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","api":"admin"}`))
 	})
-	r.Post("/v1/admin/login", ad.HandleLogin) // вход по TG + whitelist (см. D1)
+	r.Post("/v1/admin/login", ad.HandleLogin)                         // вход по TG + whitelist (см. D1)
 	r.With(ad.RequireAdmin).Post("/v1/admin/logout", ad.HandleLogout) // отзыв сессии (см. аудит B)
 	r.With(ad.RequireAdmin).Get("/v1/admin/config", ad.HandleGetConfig)
 	r.With(ad.RequireAdmin).Post("/v1/admin/config/publish", ad.HandlePublish)

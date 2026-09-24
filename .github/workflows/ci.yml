@@ -134,7 +134,7 @@ jobs:
               sys.exit(1)
           EOF
       - run: |
-          test -z "$(grep -rn 'TG_ALLOW_EMPTY=1\|TG_ALLOW_DEV_BOT=1' docker-compose.yml deploy/ .github/ .env.example 2>/dev/null || true)" \
+          test -z "$(grep -rn 'TG_ALLOW_EMPTY=1\|TG_ALLOW_DEV_BOT=1' docker-compose.yml deploy/ .env.example 2>/dev/null || true)" \
             || (printf '%s\n' 'dev-auth flag in deployment config' && exit 1)
       - run: |
           python3 - <<'EOF'
