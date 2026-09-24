@@ -340,17 +340,22 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 		g.log(ctx, readingID, cfg.Model, hash, 0, 0, time.Since(start), "failed", "monthly limit")
 		return "", "", false, fmt.Errorf("monthly limit")
 	}
-	// кэш без вопроса (см. 05-cache-redis.md)
-	if cached, err := g.rd.Get(ctx, CacheKey(cfg.Model, spread, cards, question)).Result(); err == nil && cached != "" {
-		for _, w := range strings.Split(cached, " ") {
-			select {
-			case out <- w + " ":
-			case <-ctx.Done():
-				return cached, cfg.Model, true, nil
+	// кэш без вопроса (см. 05-cache-redis.md); значения sealed при заданном REDIS_ENC_KEY
+	if raw, err := g.rd.Get(ctx, CacheKey(cfg.Model, spread, cards, question)).Result(); err == nil && raw != "" {
+		cached, cerr := openCache(raw)
+		if cerr != nil || cached == "" {
+			// битое/sealed-без-ключа — промах, идём к провайдеру (не падаем)
+		} else {
+			for _, w := range strings.Split(cached, " ") {
+				select {
+				case out <- w + " ":
+				case <-ctx.Done():
+					return cached, cfg.Model, true, nil
+				}
 			}
+			g.log(ctx, readingID, cfg.Model, hash, 0, 0, time.Since(start), "ok", "cache_hit")
+			return cached, cfg.Model, true, nil
 		}
-		g.log(ctx, readingID, cfg.Model, hash, 0, 0, time.Since(start), "ok", "cache_hit")
-		return cached, cfg.Model, true, nil
 	}
 	models := []string{cfg.Model, cfg.Fallback}
 	keys := []string{g.apiKey, g.apiKey2}
@@ -407,7 +412,9 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 			g.log(ctx, readingID, model, hash, 0, tokens, time.Since(start), "failed", "empty response")
 			continue
 		}
-		_ = g.rd.Set(ctx, CacheKey(cfg.Model, spread, cards, question), text, CacheTTL).Err()
+		if sealed, serr := sealCache(text); serr == nil {
+			_ = g.rd.Set(ctx, CacheKey(cfg.Model, spread, cards, question), sealed, CacheTTL).Err()
+		}
 		g.log(ctx, readingID, model, hash, 0, tokens, time.Since(start), "ok", "")
 		return text, model, false, nil
 	}
