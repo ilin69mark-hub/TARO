@@ -108,4 +108,5 @@ Seed фиксирует ШУМ, а не стиль — один seed на раз
 ## Файлы
 - `major-00-fool.md` … `major-21-world.md` — сцена + акценты + ловушки брака + ПЕРСОНАЖИ
 - `back.md` — рубашка (реверс-симметрия!) — генерировать ВМЕСТЕ с Магом
-- `suit-wands/cups/swords/pentacles.md` — шаблоны младших (фон масти + мотивы + оверлей номера)
+- `suit-wands/cups/swords/pentacles.md` — шаблоны мастей (фон + мотивы + двор) + 56 поштучных файлов
+- `minor-{wands,cups,swords,pentacles}-{ace,02..10,page,knight,queen,king}.md` — 56 младших поштучно (объект × N + двор по стандарту)

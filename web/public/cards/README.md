@@ -5,8 +5,8 @@
 
 ## Статус
 - [ ] 22 старших аркана (major-00…major-21)
-- [ ] 4 шаблона младших (по мастям, номер оверлеем Cormorant)
-- [ ] Остальные 56 (домасть, нед.6)
+- [x] 56 младших поштучно (minor-{wands,cups,swords,pentacles}-{ace,02..10,page,knight,queen,king} + 4 шаблона мастей, номер оверлеем Cormorant)
+- [ ] Остальные 56 (домасть, нед.6) — images! Промпты готовы в docs/cards/minor-*.md
 
 Пока файлов нет — UI показывает fallback-рубашку (см. components/CardArt.tsx).
 
