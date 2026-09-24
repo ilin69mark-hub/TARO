@@ -189,7 +189,8 @@ func (s *Service) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(e)
 }
 
-// HandleExport — GET /v1/diary/export: все свои записи одним JSON (см. V12).
+// HandleExport — POST /v1/diary/export: все свои записи одним JSON (см. V12).
+// POST+CSRF намеренно: GET-ссылка позволяла cross-site триггер скачивания (см. аудит B).
 func (s *Service) HandleExport(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	rows, err := s.pg.Query(r.Context(), `

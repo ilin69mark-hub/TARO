@@ -22,7 +22,11 @@ services:
   cache:
     image: redis:7-alpine
     restart: unless-stopped
+    # Auth (опционально, включает владелец): раскомментируй requirepass + задай тот же
+    # REDIS_PASSWORD у api-сервисов (см. store.go). Без пароля Redis доступен только
+    # из internal-сети + 127.0.0.1 (см. ports ниже).
     command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    # command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD}"]
     volumes:
       - redisdata:/data
     networks:

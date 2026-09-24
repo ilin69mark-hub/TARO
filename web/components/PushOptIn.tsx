@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import { csrf } from "../lib/api";
+
 // Web-push opt-in (см. U21): подписка через PushManager, VAPID-ключ с /api/push/public.
 // Только opt-in, тихий отказ при отсутствии поддержки.
 export default function PushOptIn() {
@@ -29,7 +31,7 @@ export default function PushOptIn() {
       await fetch("/api/push/subscribe", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF": "1" },
+        headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
         body: JSON.stringify({ endpoint: sub.endpoint, p256dh, auth }),
       });
       setState("done");

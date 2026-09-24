@@ -21,9 +21,11 @@ func ConnectPG(ctx context.Context) (*pgxpool.Pool, error) {
 }
 
 // ConnectRedis открывает клиент Redis. REDIS_ADDR обязателен (например cache:6379).
+// REDIS_PASSWORD опционален: если задан (и в compose у cache requirepass) — auth включен.
 func ConnectRedis() *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr:        os.Getenv("REDIS_ADDR"),
+		Password:    os.Getenv("REDIS_PASSWORD"),
 		DialTimeout: 2 * time.Second,
 	})
 }

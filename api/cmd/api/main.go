@@ -109,7 +109,7 @@ func main() {
 	r.With(au.RequireAuth).Post("/v1/push/prefs", pu.HandleSetPrefs)
 	r.With(au.RequireAuth).Post("/v1/diary", dy.HandleCreate)
 	r.With(au.RequireAuth).Get("/v1/diary", dy.HandleList)
-	r.With(au.RequireAuth).Get("/v1/diary/export", dy.HandleExport) // до {id}! (см. V12)
+	r.With(au.RequireAuth).Post("/v1/diary/export", dy.HandleExport) // POST+CSRF: GET-ссылкой триггерился скачивание (см. аудит B)
 	r.With(au.RequireAuth).Get("/v1/diary/{id}", dy.HandleGet)
 	r.With(au.RequireAuth).Put("/v1/diary/{id}", dy.HandleUpdate)
 	r.With(au.RequireAuth).Delete("/v1/diary/{id}", dy.HandleDelete)

@@ -6,10 +6,13 @@ import CardArt from "@/components/CardArt";
 import ShareButtons from "@/components/ShareButtons";
 
 // Экран результата (см. 02-functional/03, T16). locked — blur старых для free (см. T12).
+// id — UUID чтения: allowlist до фетча (аудит B: без него traversal/query-smuggling в Go).
+const READING_ID_RE = /^[0-9a-fA-F-]{8,64}$/;
 async function load(id: string): Promise<Reading | null> {
+  if (!READING_ID_RE.test(id)) return null;
   const base = process.env.API_INTERNAL_URL || "http://localhost:8080";
   try {
-    const res = await fetch(`${base}/v1/readings/${id}`, {
+    const res = await fetch(`${base}/v1/readings/${encodeURIComponent(id)}`, {
       headers: { Cookie: headers().get("cookie") || "" },
       cache: "no-store",
     });

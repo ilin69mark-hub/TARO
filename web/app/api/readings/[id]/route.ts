@@ -6,7 +6,10 @@ import { GO } from "@/lib/server";
 
 // GET /api/readings/:id → Go (cookie дальше).
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const res = await fetch(`${GO}/v1/readings/${params.id}`, {
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(params.id)) {
+    return NextResponse.json({ error: { message_ru: "Некорректный id" } }, { status: 422 });
+  }
+  const res = await fetch(`${GO}/v1/readings/${encodeURIComponent(params.id)}`, {
     headers: { Cookie: req.headers.get("cookie") || "" },
   });
   const body = await res.arrayBuffer();

@@ -10,6 +10,12 @@ usage() { echo "usage: $0 up|down [steps]" >&2; exit 1; }
 [ $# -ge 1 ] || usage
 
 # migrate контейнер в той же сети, что db (доступ по имени db:5432)
+# NB: DATABASE_URL передаём значением в аргументе — он виден в `ps` на время прогона.
+# Для параноиков: DATABASE_URL_FILE=/run/secrets/db_url (файл 600) вместо env.
+if [ -n "${DATABASE_URL_FILE:-}" ]; then
+  DATABASE_URL="$(cat "$DATABASE_URL_FILE")"
+  export DATABASE_URL
+fi
 if [ $# -ge 2 ]; then
   exec docker run --rm --network "$NET" \
     -v "$DIR:/migrations" \

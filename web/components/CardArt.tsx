@@ -6,6 +6,11 @@ import Image from "next/image";
 // CardArt: арт по image_key из БД (см. T24). Файлов еще нет — graceful fallback:
 // procedural рубашка (CSS), без битой картинки. Когда .webp лягут в public/cards —
 // подхватятся без кода (контракт имен = image_key, см. public/cards/README.md).
+// Allowlist имён артов (см. аудит B): image_key из БД обязан совпадать,
+// иначе fallback-рубашка (путь конкатенируется — без allowlist возможен traversal).
+const IMAGE_KEY_RE =
+  /^(major-[0-9]{2}-[a-z-]+|minor-[a-z]+-[a-z0-9]+|card-back)\.webp$/;
+
 export default function CardArt({
   imageKey,
   name,
@@ -16,7 +21,7 @@ export default function CardArt({
   width?: number;
 }) {
   const [miss, setMiss] = useState(false);
-  if (!imageKey || miss) {
+  if (!imageKey || miss || !IMAGE_KEY_RE.test(imageKey)) {
     return (
       <div
         role="img"

@@ -5,13 +5,16 @@ import { Metadata } from "next";
 export const dynamic = "force-dynamic";
 type Card = { id: number; name_ru: string; upright_ru: string; reversed_ru: string; image_key: string };
 
+// id — числовой id карты 0..77: allowlist до фетча (аудит B).
+const CARD_ID_RE = /^[0-9]{1,3}$/;
 async function load(id: string): Promise<Card | null> {
+  if (!CARD_ID_RE.test(id)) return null;
   const base = process.env.API_INTERNAL_URL || "http://localhost:8080";
   try {
     // публичного GET /v1/cards/:id нет (карты — только SELECT в чтениях);
     // U16 тянет напрямую из PG? Нет — web не ходит в PG (см. 04-architecture/02).
     // Поэтому страница строится через внутренний прокси-роут /api/cards/[id] (см. ниже).
-    const res = await fetch(`${base}/v1/cards/${id}`, { next: { revalidate: 86400 } });
+    const res = await fetch(`${base}/v1/cards/${encodeURIComponent(id)}`, { next: { revalidate: 86400 } });
     if (!res.ok) return null;
     return (await res.json()) as Card;
   } catch {

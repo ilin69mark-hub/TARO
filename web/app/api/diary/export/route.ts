@@ -4,10 +4,16 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
 
-// GET /api/diary/export → Go (cookie дальше, см. V12).
-export async function GET(req: NextRequest) {
+// POST /api/diary/export → Go (cookie + CSRF дальше, см. аудит B: GET-ссылка триггерилась cross-site).
+export async function POST(req: NextRequest) {
   const res = await fetch(`${GO}/v1/diary/export`, {
-    headers: { Cookie: req.headers.get("cookie") || "" },
+    method: "POST",
+    headers: {
+      Cookie: req.headers.get("cookie") || "",
+      "X-CSRF": req.headers.get("x-csrf") || "",
+      "Content-Type": "application/json",
+    },
+    body: "{}",
     cache: "no-store",
   });
   const body = await res.arrayBuffer();

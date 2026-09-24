@@ -75,13 +75,31 @@ function DiaryInner() {
     load();
   }
 
+  async function download() {
+    const { csrf } = await import("@/lib/api");
+    const res = await fetch("/api/diary/export", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
+      body: "{}",
+    });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "diary.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <main className="mx-auto max-w-md px-4 pt-8">
       <h1 className="text-3xl font-display font-semibold text-paper">Дневник</h1>
       <p className="mt-2">
-        <a href="/api/diary/export" className="text-sm text-gold">
+        <button onClick={download} className="text-sm text-gold">
           Скачать все записи (JSON)
-        </a>
+        </button>
       </p>
       {readingId && (
         <p className="mt-2 text-sm text-gold">Запись к раскладу · мысли сохранятся рядом с картами</p>

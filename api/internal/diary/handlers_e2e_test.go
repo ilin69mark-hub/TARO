@@ -22,7 +22,7 @@ func diaryClient(t *testing.T) (func(tok, method, path, body string) *httptest.R
 	r := chi.NewRouter()
 	r.With(au.RequireAuth).Post("/v1/diary", svc.HandleCreate)
 	r.With(au.RequireAuth).Get("/v1/diary", svc.HandleList)
-	r.With(au.RequireAuth).Get("/v1/diary/export", svc.HandleExport)
+	r.With(au.RequireAuth).Post("/v1/diary/export", svc.HandleExport)
 	r.With(au.RequireAuth).Get("/v1/diary/{id}", svc.HandleGet)
 	uid := testutil.NewUser(t, ctx, pg)
 	tok, err := auth.IssueJWT(uid, auth.UserTTL)
@@ -85,7 +85,7 @@ func TestE2EDiaryHandlers(t *testing.T) {
 		t.Fatalf("get: %d", grec.Code)
 	}
 	// export
-	if xrec := do(tok, "GET", "/v1/diary/export", ""); xrec.Code != 200 {
+	if xrec := do(tok, "POST", "/v1/diary/export", ""); xrec.Code != 200 {
 		t.Fatalf("export: %d", xrec.Code)
 	} else {
 		var all []map[string]any
