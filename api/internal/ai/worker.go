@@ -5,6 +5,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -106,6 +107,11 @@ func (g *Gateway) complete(ctx context.Context, spread string, positions []Posit
 	}
 	done := make(chan res, 1)
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				done <- res{"", fmt.Errorf("stream panic: %v", rec)}
+			}
+		}()
 		text, _, _, err := g.Stream(ctx, "", spread, positions, cards, question, ch)
 		done <- res{text, err}
 	}()

@@ -11,8 +11,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -31,6 +33,8 @@ const (
 	BreakerOpen = 5 * time.Minute
 	// CacheTTL — 7 дней для ai:cache (см. 05-cache-redis.md).
 	CacheTTL = 7 * 24 * time.Hour
+	// MaxTokensCeil — потолок max_tokens из админки: компрометация publish не раздует счета.
+	MaxTokensCeil = 2000
 )
 
 // Config — параметры из app_config.ai + дефолты.
@@ -82,9 +86,18 @@ func (g *Gateway) LoadConfig(ctx context.Context) Config {
 	}
 	if v, ok := m["max_tokens"].(float64); ok && v > 0 {
 		cfg.MaxTokens = int(v)
+		if cfg.MaxTokens > MaxTokensCeil {
+			cfg.MaxTokens = MaxTokensCeil
+		}
 	}
 	if v, ok := m["temperature"].(float64); ok {
 		cfg.Temperature = v
+		if cfg.Temperature < 0 {
+			cfg.Temperature = 0
+		}
+		if cfg.Temperature > 1 {
+			cfg.Temperature = 1
+		}
 	}
 	return cfg
 }
@@ -359,6 +372,26 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 	return "", "", false, lastErr
 }
 
+// isServerError — ошибка провайдера считается для breaker: 5xx, 429, таймауты/сеть.
+// 4xx (кроме 429) — клиентская ошибка, breaker не трогаем.
 func isServerError(err error) bool {
-	return strings.Contains(err.Error(), "provider 5")
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "provider 5") || strings.Contains(msg, "provider 429") {
+		return true
+	}
+	// обрыв соединения / reset — тоже деградация провайдера
+	if strings.Contains(msg, "connection reset") || strings.Contains(msg, "EOF") {
+		return true
+	}
+	return false
 }
