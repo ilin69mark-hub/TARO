@@ -8,7 +8,7 @@ import { track, events } from "@/lib/analytics";
 // + visit-событие раз в сессию (см. 08-analytics-spec.md, D4).
 export default function AuthBootstrap() {
   useEffect(() => {
-    ensureAuth();
+    void ensureAuth().catch(() => undefined);
     try {
       if (!sessionStorage.getItem("taro_visit")) {
         sessionStorage.setItem("taro_visit", "1");

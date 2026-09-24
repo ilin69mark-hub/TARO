@@ -1,53 +1,51 @@
-# T02: локальное и VPS-окружение — см. docs/project-book/04-architecture/01.
-# Аудит D: образы прибиты digest'ами (воспроизводимость); обновление — явно новым digest.
-# UFW на VPS (вручную один раз): ufw deny 8081/tcp; ufw allow 80,443/tcp; ufw allow 22/tcp.
-
 services:
   db:
     image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     restart: unless-stopped
     environment:
       POSTGRES_USER: taro
-      # AUDIT-EXCEPTION(E06): dev-дефолт только для локалки; прод-пароль задаёт владелец.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taro_dev_only}
       POSTGRES_DB: taro
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
       - internal
-    # Порт наружу НЕ публикуем даже локально? Для dev удобно — публикуем только на 127.0.0.1.
+      - dev-access
     ports:
-      # Хост-порты через env (по умолчанию 5432/6379). Если заняты другим проектом —
-      # DB_HOST_PORT=5443 CACHE_HOST_PORT=6391 docker compose up (см. T15).
       - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
-    # Аудит D: api не стартует раньше готовности PG.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U taro"]
+      test: ["CMD-SHELL", "pg_isready -U taro -d taro"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 10s
 
   cache:
     image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     restart: unless-stopped
-    # Auth (опционально, включает владелец): раскомментируй requirepass + задай тот же
-    # AUDIT-EXCEPTION(E10): пароль задаёт владелец (опционально).
-    # REDIS_PASSWORD у api-сервисов (см. store.go). Без пароля Redis доступен только
-    # из internal-сети + 127.0.0.1 (см. ports ниже).
-    command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
-    # command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru --requirepass "$$REDIS_PASSWORD"
+        fi
+        exec redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru
     volumes:
       - redisdata:/data
     networks:
       - internal
+      - dev-access
     ports:
       - "127.0.0.1:${CACHE_HOST_PORT:-6379}:6379"
-    # Аудит D: см. выше — готовность Redis перед api.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping; else redis-cli ping; fi"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
 
   api-public:
     build:
@@ -55,21 +53,17 @@ services:
       dockerfile: Dockerfile.public
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://taro:${POSTGRES_PASSWORD:-taro_dev_only}@db:5432/taro?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:-postgres://taro:${POSTGRES_PASSWORD:-taro_dev_only}@db:5432/taro?sslmode=disable}
       REDIS_ADDR: cache:6379
-      # Секреты — только env хоста (на VPS задаются в окружении, никогда в git).
-      # :-dev_only — только для локалки; в проде compose упадет? Нет — Go упадет
-      # с понятной ошибкой "JWT_SECRET обязателен" (см. internal/auth).
-      # AUDIT-EXCEPTION(E01,E02,E03): dev-дефолты ниже — только для локалки.
-      # Прод без реальных env не запускать (см. docs/security-exceptions.yml).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_ENC_KEY: ${REDIS_ENC_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_API_KEY_2: ${OPENROUTER_API_KEY_2:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
       TG_STARS_SECRET_TOKEN: ${TG_STARS_SECRET_TOKEN:-dev-only-stars}
-      # VAPID dev-ключи — ТОЛЬКО через .env (gitignored) или env хоста (см. S09).
-      # В git здесь плейсхолдеры: прод с незаданным env НЕ стартует.
-      # AUDIT-EXCEPTION(E04): ключи задаёт владелец, в git их нет.
-      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:?задай VAPID_PUBLIC_KEY}
-      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:?задай VAPID_PRIVATE_KEY}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
     depends_on:
       db:
         condition: service_healthy
@@ -77,10 +71,20 @@ services:
         condition: service_healthy
     networks:
       - internal
-      - edge # nginx ходит сюда; api-admin остается только internal
+      - edge
     expose:
       - "8080"
-    # Наружу — только через nginx. Прямого ports НЕТ.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
 
   api-admin:
     build:
@@ -88,46 +92,88 @@ services:
       dockerfile: Dockerfile.admin
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://taro:${POSTGRES_PASSWORD:-taro_dev_only}@db:5432/taro?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:-postgres://taro:${POSTGRES_PASSWORD:-taro_dev_only}@db:5432/taro?sslmode=disable}
       REDIS_ADDR: cache:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
-      # TG-ID админов через запятую (см. D1, 02-functional/07). На проде — реальный ID!
-      # AUDIT-EXCEPTION(E07): реальный TG-ID задаёт владелец.
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       ADMIN_TG_IDS: ${ADMIN_TG_IDS:-}
-      # Токен server-to-server для cron (см. S10). Только localhost. На проде — длинный случайный!
-      # AUDIT-EXCEPTION(E05): длинный случайный токен задаёт владелец.
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy
       cache:
         condition: service_healthy
+    ports:
+      - "127.0.0.1:${ADMIN_HOST_PORT:-8081}:8082"
     networks:
       - internal
-    # 8081 слушает 127.0.0.1 ВНУТРИ контейнера (см. cmd/admin/main.go);
-    # ports НЕТ вообще — доступ только: docker exec / ssh -L 8081:127.0.0.1:8081 vps.
-    # replicas всегда 1, за LB не ставить (см. 03-nonfunctional/03).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+
+  admin-access:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    restart: unless-stopped
+    network_mode: service:api-admin
+    volumes:
+      - ./deploy/admin-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api-admin:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
-      # Аудит D: публичные build-time vars — через args (не файлами в образ; секретам тут не место).
       args:
         NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-}
         NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
     restart: unless-stopped
     environment:
       API_INTERNAL_URL: http://api-public:8080
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
     depends_on:
       api-public:
-        condition: service_started
+        condition: service_healthy
     networks:
-      - internal
       - edge
     expose:
       - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
 
   nginx:
     image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
@@ -136,22 +182,108 @@ services:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       web:
-        condition: service_started
+        condition: service_healthy
       api-public:
-        condition: service_started
+        condition: service_healthy
     networks:
       - edge
     ports:
       - "80:80"
-      # AUDIT-EXCEPTION(E08): TLS/HSTS делает человек (certbot).
-      # 443 — на VPS через certbot/TLS-терминацию (T30).
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    cap_drop:
+      - NET_RAW
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  migrate:
+    image: migrate/migrate:v4.18.2@sha256:acded13a336f2b6f35fd9ce14a32834cf1e6b2a7887fe5dfc977b3e563eba39e
+    profiles:
+      - migration
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./api/migrations:/migrations:ro
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taro_dev_only}
+      MIGRATE_COMMAND: ${MIGRATE_COMMAND:-up}
+      MIGRATE_STEPS: ${MIGRATE_STEPS:-}
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -ec
+    command:
+      - |
+        if [ -z "$${DATABASE_URL:-}" ]; then
+          if [ -z "$${POSTGRES_PASSWORD:-}" ]; then
+            printf '%s\n' 'DATABASE_URL or POSTGRES_PASSWORD is required' >&2
+            exit 1
+          fi
+          DATABASE_URL="postgres://taro:$${POSTGRES_PASSWORD}@db:5432/taro?sslmode=disable"
+          export DATABASE_URL
+        fi
+        if [ -n "$${MIGRATE_STEPS:-}" ]; then
+          exec migrate -path /migrations -database "$${DATABASE_URL}" "$${MIGRATE_COMMAND}" "$${MIGRATE_STEPS}"
+        fi
+        exec migrate -path /migrations -database "$${DATABASE_URL}" "$${MIGRATE_COMMAND}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+
+  schema-check:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    profiles:
+      - migration
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taro_dev_only}
+      EXPECTED_MIGRATION_VERSION: ${EXPECTED_MIGRATION_VERSION:-0}
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    volumes:
+      - ./deploy/schema-ready.sh:/check.sh:ro
+    entrypoint:
+      - sh
+      - /check.sh
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
 
 networks:
-  # NB: без internal:true — Docker молча сбрасывает published-порты контейнеров
-  # в internal-сети (поймано в T15: db/cache были недоступны с хоста).
-  # Изоляция держится на: отсутствии ports у api-*, 127.0.0.1-публикациях db/cache,
-  # UFW deny на VPS (см. T30). Прод-доступ к db/cache только с localhost.
   internal:
+  dev-access:
   edge:
 
 volumes:

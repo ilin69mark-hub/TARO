@@ -28,9 +28,10 @@ async function load(token: string): Promise<Shared | null> {
 export async function generateMetadata({
   params,
 }: {
-  params: { token: string };
+  params: Promise<{ token: string }>;
 }): Promise<Metadata> {
-  const s = await load(params.token);
+  const { token } = await params;
+  const s = await load(token);
   const title = s?.question ? s.question.slice(0, 80) : "Расклад Таро";
   return {
     title: `${title} — Онлайн Таро`,
@@ -39,13 +40,14 @@ export async function generateMetadata({
     openGraph: {
       title,
       description: s?.spread || "Таро",
-      images: [`/api/og?t=${encodeURIComponent(params.token)}`],
+      images: [`/api/og?t=${encodeURIComponent(token)}`],
     },
   };
 }
 
-export default async function ShareTokenPage({ params }: { params: { token: string } }) {
-  const s = await load(params.token);
+export default async function ShareTokenPage({ params }: { params: Promise<{ token: string }> }) {
+  const { token } = await params;
+  const s = await load(token);
   if (!s) {
     return (
       <main className="mx-auto max-w-md px-4 pt-8 text-center">

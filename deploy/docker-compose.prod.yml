@@ -1,0 +1,73 @@
+services:
+  db:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports: !reset []
+    mem_limit: 1g
+    pids_limit: 256
+
+  cache:
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    ports: !reset []
+    mem_limit: 384m
+    pids_limit: 128
+
+  api-public:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_ENC_KEY: ${REDIS_ENC_KEY:?REDIS_ENC_KEY is required}
+      AI_REQUIRE_CACHE_ENCRYPTION: "1"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      OPENROUTER_API_KEY_2: ${OPENROUTER_API_KEY_2:?OPENROUTER_API_KEY_2 is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:?TG_BOT_TOKEN is required}
+      TG_STARS_SECRET_TOKEN: ${TG_STARS_SECRET_TOKEN:?TG_STARS_SECRET_TOKEN is required}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:?VAPID_PUBLIC_KEY is required}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?PUBLIC_ORIGIN is required}
+    mem_limit: 768m
+    pids_limit: 256
+
+  api-admin:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:?TG_BOT_TOKEN is required}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:?VAPID_PRIVATE_KEY is required}
+      ADMIN_TG_IDS: ${ADMIN_TG_IDS:?ADMIN_TG_IDS is required}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?ADMIN_API_TOKEN is required}
+    mem_limit: 384m
+    pids_limit: 128
+
+  admin-access:
+    mem_limit: 64m
+    pids_limit: 64
+
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:?NEXT_PUBLIC_BASE_URL is required}
+    mem_limit: 1g
+    pids_limit: 256
+
+  nginx:
+    mem_limit: 128m
+    pids_limit: 128
+
+  migrate:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    pids_limit: 64
+
+  schema-check:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    pids_limit: 64
+
+networks:
+  dev-access:
+    internal: true

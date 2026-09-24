@@ -3,6 +3,7 @@ package apierr
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -44,6 +45,10 @@ const MaxBody = 1 << 20
 // Decode читает JSON-тело с лимитом и строгим режимом (без unknown-полей).
 // Возвращает false + пишет 413/422 при переполнении/битом JSON.
 func Decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(strings.ToLower(ct), "application/json") {
+		Write(w, http.StatusUnsupportedMediaType, CodeValidation, "Ожидается application/json")
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, MaxBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -53,6 +58,11 @@ func Decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 		} else {
 			Write(w, http.StatusUnprocessableEntity, CodeValidation, "Некорректное тело")
 		}
+		return false
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		Write(w, http.StatusUnprocessableEntity, CodeValidation, "Некорректное тело")
 		return false
 	}
 	return true

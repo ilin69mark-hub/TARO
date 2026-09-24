@@ -12,15 +12,15 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run lint
-      # D4: PII-grep — вопрос/толкование никогда не уходят в аналитику
       - run: test -z "$(grep -rn 'track(events\.[a-zA-Z]*, {[^}]*\(question\|interpretation\)' lib app components || true)"
       - run: npm test
       - run: npm run build
@@ -35,7 +35,7 @@ jobs:
         working-directory: api
     services:
       db:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_USER: taro
           POSTGRES_PASSWORD: ci-only
@@ -46,7 +46,7 @@ jobs:
           --health-cmd="pg_isready -U taro"
           --health-interval=5s --health-timeout=5s --health-retries=5
       cache:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
         ports:
           - 6379:6379
         options: >-
@@ -57,52 +57,97 @@ jobs:
       REDIS_ADDR: localhost:6379
       JWT_SECRET: ci-only-secret-0123456789abcdef0123456789
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491
         with:
           go-version: "1.25"
       - run: gofmt -l . && test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go build ./...
-      # D2: схема для e2e-тестов (миграции по порядку, как deploy/migrate.sh)
-      - run: >
-          docker run --rm --network host
-          -v ${{ github.workspace }}/api/migrations:/migrations
-          migrate/migrate:v4.18.2
-          -path /migrations
-          -database "postgres://taro:ci-only@localhost:5432/taro?sslmode=disable" up
-      # D2: тесты гоняются всегда; e2e со Skip получают сервисы выше и НЕ скипаются в CI
+      - run: |
+          set -eu
+          docker run --rm --network host --read-only --tmpfs /tmp \
+            --security-opt no-new-privileges --cap-drop ALL \
+            -e DATABASE_URL \
+            -v "$GITHUB_WORKSPACE/api/migrations:/migrations:ro" \
+            --entrypoint sh \
+            migrate/migrate:v4.18.2@sha256:acded13a336f2b6f35fd9ce14a32834cf1e6b2a7887fe5dfc977b3e563eba39e \
+            -ec 'exec migrate -path /migrations -database "$DATABASE_URL" up'
+      - run: |
+          set -eu
+          expected=0
+          for migration in migrations/[0-9]*_*.up.sql; do
+            [ -f "$migration" ] || continue
+            number="${migration##*/}"
+            number="${number%%_*}"
+            case "$number" in
+              ''|*[!0-9]*) continue ;;
+            esac
+            number=$((10#$number))
+            if [ "$number" -gt "$expected" ]; then
+              expected="$number"
+            fi
+          done
+          test "$expected" -gt 0
+          docker run --rm --network host --read-only --tmpfs /tmp \
+            --security-opt no-new-privileges --cap-drop ALL \
+            -e DATABASE_URL \
+            -e EXPECTED_MIGRATION_VERSION="$expected" \
+            -v "$GITHUB_WORKSPACE/deploy/schema-ready.sh:/check.sh:ro" \
+            --entrypoint sh \
+            postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea \
+            /check.sh
       - run: go test -race -count=1 ./...
 
   security:
-    # S09: секреты и .env никогда не попадают в git
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: test ! -e .env || (echo ".env committed!" && exit 1)
-      - run: test -z "$(grep -rn '11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo' --exclude-dir=.git . || true)"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: test ! -e .env || (printf '%s\n' '.env committed!' && exit 1)
+      - run: |
+          secret='11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71''YYI96e5Oo'
+          matches="$(git grep -n -I -e "$secret" -- ':!api/internal/push/push_test.go' ':!.github/workflows/ci.yml' || true)"
+          test -z "$matches"
       - run: test -z "$(git ls-files | grep -E '(^|/)\.env$' || true)"
-      # Реестр исключений двусторонний (аудит D): код→yml и yml→код.
-      # РЕШЕНО-записи живут только в closed: ниже. Сканим код, не сам реестр.
+      - run: sh -n deploy/*.sh
       - run: |
           for id in $(grep -rh 'AUDIT-EXCEPTION' api web deploy docker-compose.yml .env.example | grep -oE 'E[0-9]+' | sort -u); do
-            grep -q "id: $id" docs/security-exceptions.yml || (echo "exception $id без записи в yml!" && exit 1)
+            grep -q "id: $id" docs/security-exceptions.yml || (printf 'exception %s missing\n' "$id" && exit 1)
           done
           python3 - <<'EOF'
-          import re, sys, subprocess
+          import re
+          import subprocess
+          import sys
           yml = open("docs/security-exceptions.yml").read()
           active = yml.split("closed:")[0] if "closed:" in yml else yml
           ids_yml = set(re.findall(r"id: (E\d+)", active))
-          code = subprocess.run(["grep", "-rh", "AUDIT-EXCEPTION", "api", "web", "deploy", "docker-compose.yml", ".env.example"],
-                                 capture_output=True, text=True).stdout
+          code = subprocess.run(
+              ["grep", "-rh", "AUDIT-EXCEPTION", "api", "web", "deploy", "docker-compose.yml", ".env.example"],
+              capture_output=True,
+              text=True,
+              check=False,
+          ).stdout
           ids_code = set(re.findall(r"E\d+", code))
-          bad = ids_yml - ids_code
-          if bad:
-              print("exceptions без маркера в коде:", sorted(bad))
+          missing = ids_code - ids_yml
+          if missing:
+              print("markers without registry entries:", sorted(missing))
               sys.exit(1)
-          print("exceptions OK bidirectional")
           EOF
-      # Fail-open флаги dev-авторизации — никогда в прод-конфигах (только код default-off + тесты)
       - run: |
           test -z "$(grep -rn 'TG_ALLOW_EMPTY=1\|TG_ALLOW_DEV_BOT=1' docker-compose.yml deploy/ .github/ .env.example 2>/dev/null || true)" \
-            || (echo "dev-auth flag в прод-конфиге!" && exit 1)
+            || (printf '%s\n' 'dev-auth flag in deployment config' && exit 1)
+      - run: |
+          python3 - <<'EOF'
+          import re
+          text = open("deploy/docker-compose.prod.yml").read()
+          required = (
+              "POSTGRES_PASSWORD", "REDIS_PASSWORD", "REDIS_ENC_KEY",
+              "OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2", "JWT_SECRET",
+              "TG_BOT_TOKEN", "TG_STARS_SECRET_TOKEN", "VAPID_PUBLIC_KEY",
+              "VAPID_PRIVATE_KEY", "ADMIN_TG_IDS", "ADMIN_API_TOKEN",
+              "DATABASE_URL",
+          )
+          missing = [key for key in required if not re.search(r"\$\{" + re.escape(key) + r":\?", text)]
+          if missing:
+              raise SystemExit("production secret not fail-closed: " + ", ".join(missing))
+          EOF

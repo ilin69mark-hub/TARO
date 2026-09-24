@@ -7,6 +7,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -90,15 +92,6 @@ func whitelistedTgID(tgID int64) bool {
 	return false
 }
 
-// isAdmin: role=admin в БД ИЛИ tg_id в ADMIN_TG_IDS (первичная выдача).
-func (s *Service) isAdmin(ctx context.Context, userID string, tgID int64) bool {
-	var role string
-	if err := s.pg.QueryRow(ctx, `SELECT role FROM users WHERE id=$1`, userID).Scan(&role); err == nil && role == "admin" {
-		return true
-	}
-	return whitelistedTgID(tgID)
-}
-
 // HandleLogin — POST /v1/admin/login {initData}: TG + admin → taro_admin cookie.
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -114,30 +107,34 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	// Аудит D: whitelist ДО INSERT — иначе любой с валидным initData плодит строки в users.
-	if !whitelistedTgID(tgID) {
-		var role string
-		if err := s.pg.QueryRow(ctx, `SELECT role FROM users WHERE tg_id=$1`, tgID).Scan(&role); err != nil || role != "admin" {
+	var userID, role string
+	created := false
+	err = s.pg.QueryRow(ctx, `SELECT id, role FROM users WHERE tg_id=$1`, tgID).Scan(&userID, &role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if !whitelistedTgID(tgID) {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
 			return
 		}
-	}
-	var userID string
-	err = s.pg.QueryRow(ctx, `SELECT id FROM users WHERE tg_id=$1`, tgID).Scan(&userID)
-	if err != nil {
-		// создаем юзера, роль проверит whitelist
 		if err := s.pg.QueryRow(ctx,
-			`INSERT INTO users (tg_id, role) VALUES ($1,'user') RETURNING id`, tgID).Scan(&userID); err != nil {
+			`INSERT INTO users (tg_id, role) VALUES ($1,'user') RETURNING id, role`, tgID).Scan(&userID, &role); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать")
+			return
+		}
+		created = true
+	} else if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить доступ")
+		return
+	}
+	if role != "admin" {
+		if !created {
+			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+			return
+		}
+		if _, err := s.pg.Exec(ctx, `UPDATE users SET role='admin' WHERE id=$1 AND role != 'admin'`, userID); err != nil {
 			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать")
 			return
 		}
 	}
-	if !s.isAdmin(ctx, userID, tgID) {
-		apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
-		return
-	}
-	// whitelist-вход повышает роль (иначе RequireAdmin отвергнет, см. D1)
-	_, _ = s.pg.Exec(ctx, `UPDATE users SET role='admin' WHERE id=$1 AND role != 'admin'`, userID)
 	tok, err := auth.IssueJWT("admin:"+userID, AdminTTL)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
@@ -252,14 +249,22 @@ func (s *Service) HandleGetConfig(w http.ResponseWriter, r *http.Request) {
 	plans := []plan{}
 	prows, err := s.pg.Query(ctx,
 		`SELECT DISTINCT ON (code) code, price_rub, stars_amount, duration_days, is_active FROM plans ORDER BY code, valid_from DESC`)
-	if err == nil {
-		defer prows.Close()
-		for prows.Next() {
-			var p plan
-			if err := prows.Scan(&p.Code, &p.Price, &p.Stars, &p.Duration, &p.Active); err == nil {
-				plans = append(plans, p)
-			}
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+		return
+	}
+	defer prows.Close()
+	for prows.Next() {
+		var p plan
+		if err := prows.Scan(&p.Code, &p.Price, &p.Stars, &p.Duration, &p.Active); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+			return
 		}
+		plans = append(plans, p)
+	}
+	if err := prows.Err(); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+		return
 	}
 	type spread struct {
 		Code    string `json:"code"`
@@ -270,14 +275,22 @@ func (s *Service) HandleGetConfig(w http.ResponseWriter, r *http.Request) {
 	spreadsList := []spread{}
 	srows, err := s.pg.Query(ctx,
 		`SELECT code, is_active, sort_order, is_premium FROM spreads ORDER BY sort_order`)
-	if err == nil {
-		defer srows.Close()
-		for srows.Next() {
-			var sp spread
-			if err := srows.Scan(&sp.Code, &sp.Active, &sp.Sort, &sp.Premium); err == nil {
-				spreadsList = append(spreadsList, sp)
-			}
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+		return
+	}
+	defer srows.Close()
+	for srows.Next() {
+		var sp spread
+		if err := srows.Scan(&sp.Code, &sp.Active, &sp.Sort, &sp.Premium); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+			return
 		}
+		spreadsList = append(spreadsList, sp)
+	}
+	if err := srows.Err(); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось прочитать конфиг")
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -293,74 +306,191 @@ var allowedConfigKeys = map[string]bool{
 	"spreads.seasonal": true, "payments.yookassa": true,
 }
 
-// validateConfigValue — схема значений app_config (аудит B: раньше принималось любое JSON).
-// Ключ проверен allowlist выше; здесь типы, диапазоны, размеры, запрет NUL.
+func configObject(v json.RawMessage, allowed ...string) (map[string]json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(v, &m) != nil || m == nil {
+		return nil, false
+	}
+	keys := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		keys[key] = struct{}{}
+	}
+	for key := range m {
+		if _, ok := keys[key]; !ok {
+			return nil, false
+		}
+	}
+	return m, true
+}
+
+func configInt(v json.RawMessage, min, max int) bool {
+	if strings.TrimSpace(string(v)) == "null" {
+		return false
+	}
+	var n int
+	if json.Unmarshal(v, &n) == nil {
+		return n >= min && n <= max
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	return err == nil && n >= min && n <= max
+}
+
+func configFloat(v json.RawMessage, min, max float64) bool {
+	if strings.TrimSpace(string(v)) == "null" {
+		return false
+	}
+	var n float64
+	return json.Unmarshal(v, &n) == nil && n >= min && n <= max
+}
+
+func configBool(v json.RawMessage) bool {
+	if strings.TrimSpace(string(v)) == "null" {
+		return false
+	}
+	var b bool
+	return json.Unmarshal(v, &b) == nil
+}
+
+func configString(v json.RawMessage, max int) bool {
+	var s string
+	if json.Unmarshal(v, &s) != nil || s == "" || len(s) > max {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func validateConfigValue(k string, v json.RawMessage) bool {
 	if len(v) == 0 || len(v) > 8192 || strings.Contains(string(v), "\x00") {
 		return false
 	}
 	switch k {
+	case "free.daily_limit":
+		return configInt(v, 0, 100)
+	case "love.free_weekly":
+		return configInt(v, 0, 100)
+	case "history.free_limit":
+		return configInt(v, 1, 500)
 	case "ai":
-		var m struct {
-			Model        *string  `json:"model"`
-			Fallback     *string  `json:"fallback"`
-			MaxTokens    *float64 `json:"max_tokens"`
-			Temperature  *float64 `json:"temperature"`
-			MonthlyCalls *float64 `json:"monthly_calls"`
-		}
-		if json.Unmarshal(v, &m) != nil {
+		m, ok := configObject(v, "model", "fallback", "max_tokens", "temperature", "monthly_calls")
+		if !ok {
 			return false
 		}
-		for _, s := range []*string{m.Model, m.Fallback} {
-			if s != nil && (*s == "" || len(*s) > 200 || strings.Contains(*s, "\x00")) {
+		if value, exists := m["model"]; exists && !configString(value, 200) {
+			return false
+		}
+		if value, exists := m["fallback"]; exists && !configString(value, 200) {
+			return false
+		}
+		if value, exists := m["max_tokens"]; exists && !configInt(value, 1, 100000) {
+			return false
+		}
+		if value, exists := m["temperature"]; exists && !configFloat(value, 0, 2) {
+			return false
+		}
+		if value, exists := m["monthly_calls"]; exists && !configInt(value, 0, 10000000) {
+			return false
+		}
+		return true
+	case "ab.price_month":
+		m, ok := configObject(v, "enabled", "control", "test", "split", "pct")
+		if !ok {
+			return false
+		}
+		if value, exists := m["enabled"]; exists && !configBool(value) {
+			return false
+		}
+		if value, exists := m["control"]; exists && !configInt(value, 1, 100000) {
+			return false
+		}
+		if value, exists := m["test"]; exists && !configInt(value, 1, 100000) {
+			return false
+		}
+		if value, exists := m["split"]; exists && !configFloat(value, 0, 100) {
+			return false
+		}
+		if value, exists := m["pct"]; exists && !configFloat(value, 0, 90) {
+			return false
+		}
+		return true
+	case "offers.winback":
+		m, ok := configObject(v, "enabled", "pct")
+		if !ok {
+			return false
+		}
+		if value, exists := m["enabled"]; exists && !configBool(value) {
+			return false
+		}
+		if value, exists := m["pct"]; exists && !configFloat(value, 0, 90) {
+			return false
+		}
+		return true
+	case "trial":
+		m, ok := configObject(v, "enabled", "days", "require_tg")
+		if !ok {
+			return false
+		}
+		if value, exists := m["enabled"]; exists && !configBool(value) {
+			return false
+		}
+		if value, exists := m["days"]; exists && !configInt(value, 1, 365) {
+			return false
+		}
+		if value, exists := m["require_tg"]; exists && !configBool(value) {
+			return false
+		}
+		return true
+	case "referral":
+		m, ok := configObject(v, "enabled", "bonus_days", "monthly_cap")
+		if !ok {
+			return false
+		}
+		if value, exists := m["enabled"]; exists && !configBool(value) {
+			return false
+		}
+		if value, exists := m["bonus_days"]; exists && !configInt(value, 1, 365) {
+			return false
+		}
+		if value, exists := m["monthly_cap"]; exists && !configInt(value, 1, 10000) {
+			return false
+		}
+		return true
+	case "spreads.seasonal":
+		var windows []struct {
+			Code string `json:"code"`
+			From string `json:"from"`
+			To   string `json:"to"`
+		}
+		if json.Unmarshal(v, &windows) != nil || len(windows) == 0 || len(windows) > 100 {
+			return false
+		}
+		for _, window := range windows {
+			if !configString(json.RawMessage(strconv.Quote(window.Code)), 64) {
+				return false
+			}
+			from, err := time.Parse("2006-01-02", window.From)
+			if err != nil {
+				return false
+			}
+			to, err := time.Parse("2006-01-02", window.To)
+			if err != nil || from.After(to) {
 				return false
 			}
 		}
-		if m.MaxTokens != nil && (*m.MaxTokens < 1 || *m.MaxTokens > 100000) {
-			return false
-		}
-		if m.Temperature != nil && (*m.Temperature < 0 || *m.Temperature > 2) {
-			return false
-		}
-		if m.MonthlyCalls != nil && (*m.MonthlyCalls < 0 || *m.MonthlyCalls > 10000000) {
-			return false
-		}
 		return true
-	case "free.daily_limit", "love.free_weekly", "history.free_limit":
-		var m map[string]any
-		if json.Unmarshal(v, &m) != nil {
-			return false
-		}
-		return true
-	case "ab.price_month", "offers.winback", "trial", "referral", "spreads.seasonal", "payments.yookassa":
-		var m map[string]any
-		if json.Unmarshal(v, &m) != nil {
-			return false
-		}
-		// Аудит D: числовые поля A/B и winback текут в цену инвойса — диапазоны обязательны.
-		num := func(k string) (float64, bool) {
-			f, ok := m[k].(float64)
-			return f, ok
-		}
-		if f, ok := num("control"); ok && (f <= 0 || f > 100000) {
-			return false
-		}
-		if f, ok := num("test"); ok && (f <= 0 || f > 100000) {
-			return false
-		}
-		if f, ok := num("split"); ok && (f < 0 || f > 100) {
-			return false
-		}
-		if f, ok := num("pct"); ok && (f < 0 || f > 90) {
-			return false
-		}
-		return true
+	case "payments.yookassa":
+		m, ok := configObject(v, "enabled")
+		return ok && (len(m) == 0 || configBool(m["enabled"]))
 	case "copy.paywall_title", "copy.paywall_desc", "copy.paywall_cta":
-		var s string
-		if json.Unmarshal(v, &s) != nil || s == "" || len(s) > 500 || strings.Contains(s, "\x00") {
-			return false
-		}
-		return true
+		return configString(v, 500)
 	default:
 		return false
 	}

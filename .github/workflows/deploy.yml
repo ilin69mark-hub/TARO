@@ -1,12 +1,5 @@
 name: deploy
 
-# Деплой на VPS по тегу v* (см. T30, 10-appendices/03, S10).
-# Релиз только до 18:00 МСК (пик 20:00–01:00) — workflow ПРОВЕРЯЕТ время и падает после.
-# Secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY.
-# На VPS один раз: git clone, env с секретами (JWT_SECRET, TG_BOT_TOKEN,
-# TG_STARS_SECRET_TOKEN, OPENROUTER_API_KEY, POSTGRES_PASSWORD, ADMIN_API_TOKEN,
-# ADMIN_TG_IDS), UFW (см. deploy/README.md).
-
 on:
   push:
     tags:
@@ -20,27 +13,83 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: RELEASE_TAG
+          command_timeout: 15m
           script: |
-            set -euo pipefail
-            HOUR=$(TZ=Europe/Moscow date +%H)
-            if [ "$HOUR" -ge 18 ]; then echo "STOP: deploy after 18:00 MSK forbidden"; exit 1; fi
+            set -eu
+            umask 077
+            if ! printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+              printf 'STOP: invalid release tag %s\n' "$RELEASE_TAG" >&2
+              exit 1
+            fi
+            HOUR="$(TZ=Europe/Moscow date +%H)"
+            if [ "$HOUR" -ge 18 ]; then
+              printf '%s\n' 'STOP: deploy after 18:00 MSK forbidden' >&2
+              exit 1
+            fi
             cd /opt/taro
-            git fetch --tags
-            git checkout ${{ github.ref_name }}
-            export $(grep -v '^#' .env 2>/dev/null | xargs) || true
-            ./deploy/migrate.sh up
-            docker compose build
-            docker compose up -d
-            sleep 10
-            curl -f http://localhost/healthz || curl -f http://localhost/
-            curl -f http://localhost/v1/spreads
-            docker compose exec -T db psql -U taro -d taro -c "SELECT COUNT(*) FROM spreads WHERE is_active;"
-            if ss -tlnp | grep -E ':8081.*0\.0\.0\.0'; then echo "FAIL: 8081 public!"; exit 1; fi
-            echo "admin 8081 not public (ok)"
+            test -f .env
+            test "$(stat -c '%a' .env)" = "600"
+            grep -Eq '^BACKUP_GPG_KEY=.+$' .env
+            test -x deploy/migrate.sh
+            test -x deploy/backup.sh
+            test -x deploy/admin-job.sh
+            git diff --quiet
+            git diff --cached --quiet
+            test -z "$(git status --porcelain --untracked-files=all)"
+            git fetch --force --tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            git checkout --detach --force "refs/tags/${RELEASE_TAG}"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
+            compose() {
+              docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml "$@"
+            }
+            compose config --quiet
+            compose up -d --wait --wait-timeout 120 db cache
+            compose build
+            DEPLOY_ENV=prod ./deploy/migrate.sh up
+            DEPLOY_ENV=prod ./deploy/migrate.sh verify
+            compose up -d --remove-orphans --wait --wait-timeout 180
+            public_health="$(curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 2 --max-time 5 http://127.0.0.1/healthz)"
+            case "$public_health" in
+              *'"api":"public"'*) ;;
+              *) exit 1 ;;
+            esac
+            curl --fail --silent --show-error --max-time 10 http://127.0.0.1/v1/spreads >/dev/null
+            admin_id="$(compose ps -q api-admin)"
+            test -n "$admin_id"
+            admin_endpoint="$(compose port api-admin 8082)"
+            case "$admin_endpoint" in
+              127.0.0.1:*) ;;
+              *) printf '%s\n' 'admin port is not loopback' >&2; exit 1 ;;
+            esac
+            admin_port="${admin_endpoint##*:}"
+            case "$admin_port" in
+              ''|*[!0-9]*) printf '%s\n' 'invalid admin loopback binding' >&2; exit 1 ;;
+            esac
+            admin_health="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 --max-time 5 "http://127.0.0.1:${admin_port}/healthz")"
+            case "$admin_health" in
+              *'"api":"admin"'*) ;;
+              *) exit 1 ;;
+            esac
+            bindings="$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$admin_id")"
+            case "$bindings" in
+              *'"HostIp":"127.0.0.1"'*) ;;
+              *) exit 1 ;;
+            esac
+            case "$bindings" in
+              *'"HostIp":"0.0.0.0"'*|*'"HostIp":"::"'*) exit 1 ;;
+            esac
+            printf '%s\n' 'release readiness and loopback admin checks passed'

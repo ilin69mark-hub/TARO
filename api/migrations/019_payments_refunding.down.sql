@@ -1,6 +1,10 @@
--- 019 down: сначала сводим зависшие refunding в succeeded (иначе CHECK-violation + dirty).
--- ВНИМАНИЕ: refunding означает «TG-вызов неизвестного исхода» — сверь с TG перед откатом.
-UPDATE payments SET status = 'succeeded' WHERE status = 'refunding';
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM payments WHERE status IN ('refunding','reconciliation')) THEN
+    RAISE EXCEPTION '019 down refused: reconcile payment states before rollback';
+  END IF;
+END
+$$;
 ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_status_check;
 ALTER TABLE payments ADD CONSTRAINT payments_status_check
   CHECK (status IN ('pending','succeeded','refunded','expired'));

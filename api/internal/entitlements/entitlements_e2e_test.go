@@ -2,6 +2,9 @@
 package entitlements
 
 import (
+	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,5 +108,63 @@ func TestE2EPGConsume(t *testing.T) {
 	// MSK-дата и понедельник sane
 	if mondayMSK(time.Now()) == "" || mskDate(time.Now()) == "" {
 		t.Fatal("empty dates")
+	}
+}
+
+func TestE2ECheckFirstUseRaceUsesPG(t *testing.T) {
+	ctx, pg, rd := testutil.Live(t)
+	s := New(pg, rd)
+	u := testutil.NewUser(t, ctx, pg)
+	var old json.RawMessage
+	if err := pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='free.daily_limit'`).Scan(&old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(ctx, `UPDATE app_config SET value='"1"'::jsonb WHERE key='free.daily_limit'`); err != nil {
+		t.Fatal(err)
+	}
+	redisKey := "ent:" + u + ":" + mskDate(time.Now())
+	if err := rd.Set(ctx, redisKey, 99, time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(context.Background(), `UPDATE app_config SET value=$1 WHERE key='free.daily_limit'`, old)
+		_ = rd.Del(context.Background(), redisKey).Err()
+	})
+	type outcome struct {
+		verdict Verdict
+		err     error
+	}
+	results := make(chan outcome, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			verdict, err := s.Check(ctx, u, "daily")
+			results <- outcome{verdict: verdict, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	allow, deny := 0, 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("check: %v", result.err)
+		}
+		if result.verdict.Allow {
+			allow++
+		} else {
+			deny++
+		}
+	}
+	if allow != 1 || deny != 1 {
+		t.Fatalf("allow=%d deny=%d", allow, deny)
+	}
+	var used int
+	if err := pg.QueryRow(ctx, `SELECT free_used_today FROM entitlements WHERE user_id=$1`, u).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used != 1 {
+		t.Fatalf("pg used=%d", used)
 	}
 }

@@ -177,6 +177,37 @@ func TestE2EPublishAudit(t *testing.T) {
 	_, _ = pg.Exec(context.Background(), `DELETE FROM admin_audit WHERE action='config:publish' AND diff::text LIKE '%E2E%'`)
 }
 
+func TestValidateConfigValue(t *testing.T) {
+	valid := map[string]string{
+		"free.daily_limit":   `"1"`,
+		"ai":                 `{"model":"openai/gpt-4o-mini","max_tokens":900,"temperature":0.7}`,
+		"ab.price_month":     `{"enabled":true,"control":299,"test":349,"split":50}`,
+		"offers.winback":     `{"enabled":true,"pct":20}`,
+		"trial":              `{"enabled":true,"days":3,"require_tg":true}`,
+		"referral":           `{"bonus_days":3,"monthly_cap":30}`,
+		"spreads.seasonal":   `[{"code":"fullmoon","from":"2026-01-01","to":"2026-12-31"}]`,
+		"payments.yookassa":  `{"enabled":true}`,
+		"copy.paywall_title": `"Текст"`,
+	}
+	for key, value := range valid {
+		if !validateConfigValue(key, json.RawMessage(value)) {
+			t.Fatalf("valid config rejected: %s=%s", key, value)
+		}
+	}
+	invalid := map[string]string{
+		"free.daily_limit": `"many"`,
+		"ai":               `{"unknown":true}`,
+		"ab.price_month":   `{"control":0}`,
+		"trial":            `{"days":0}`,
+		"spreads.seasonal": `[{"code":"x","from":"2026-12-31","to":"2026-01-01"}]`,
+	}
+	for key, value := range invalid {
+		if validateConfigValue(key, json.RawMessage(value)) {
+			t.Fatalf("invalid config accepted: %s=%s", key, value)
+		}
+	}
+}
+
 func TestE2ERotateSeasonal(t *testing.T) {
 	r, tok, pg := adminSetup(t)
 	ctx := context.Background()

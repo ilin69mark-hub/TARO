@@ -1,12 +1,11 @@
 // Package entitlements — единый чекер прав (см. docs/project-book/02-functional/05).
 // Порядок: subscription(valid_until) → love_weekly → single → daily.
-// Счетчики daily/love — только атомарный Lua (INCR+EXPIREAT+сравнение), иначе race.
-// PG — источник правды; Redis запрещено дропать для ent:* (см. 05-cache-redis.md).
 package entitlements
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -125,9 +124,10 @@ func atoi(s, def string) int {
 	return n
 }
 
-// consume выполняет Lua-потребление: true если влезли в лимит.
-// Ошибка Redis → (false, err): caller решает — PG-fallback (см. Check) или 503.
 func (s *Service) consume(ctx context.Context, key string, limit int, expireAt int64) (bool, error) {
+	if s.rd == nil {
+		return false, errors.New("redis unavailable")
+	}
 	n, err := s.rd.Eval(ctx, consumeLua, []string{key}, limit, expireAt).Int()
 	if err != nil {
 		return false, err
@@ -135,54 +135,78 @@ func (s *Service) consume(ctx context.Context, key string, limit int, expireAt i
 	return n != -1, nil
 }
 
-// pgConsume — PG-fallback счетчика при недоступном Redis (см. S03).
-// Транзакция SELECT FOR UPDATE: атомарно в пределах PG. kind: "daily"|"love".
-func (s *Service) pgConsume(ctx context.Context, userID, kind string, limit int, period string) (bool, error) {
+func (s *Service) pgConsumeValue(ctx context.Context, userID, kind string, limit int, period string) (bool, int, error) {
+	if limit <= 0 {
+		return false, 0, nil
+	}
+	if s.pg == nil {
+		return false, 0, errors.New("postgres unavailable")
+	}
 	tx, err := s.pg.Begin(ctx)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var used int
-	var curPeriod *string
-	var q string
+	var currentPeriod *string
+	var query string
 	if kind == "daily" {
-		q = `SELECT free_used_today, free_date::text FROM entitlements WHERE user_id=$1 FOR UPDATE`
+		query = `
+			INSERT INTO entitlements (user_id)
+			VALUES ($1)
+			ON CONFLICT (user_id) DO UPDATE SET user_id=EXCLUDED.user_id
+			RETURNING free_used_today, free_date::text`
 	} else {
-		q = `SELECT love_used_week, love_week::text FROM entitlements WHERE user_id=$1 FOR UPDATE`
+		query = `
+			INSERT INTO entitlements (user_id)
+			VALUES ($1)
+			ON CONFLICT (user_id) DO UPDATE SET user_id=EXCLUDED.user_id
+			RETURNING love_used_week, love_week::text`
 	}
-	err = tx.QueryRow(ctx, q, userID).Scan(&used, &curPeriod)
-	if err != nil {
-		// строки нет — создаем с used=0
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO entitlements (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
-			return false, err
-		}
-		used, curPeriod = 0, nil
+	if err := tx.QueryRow(ctx, query, userID).Scan(&used, &currentPeriod); err != nil {
+		return false, 0, err
 	}
-	newVal := used + 1
-	if curPeriod == nil || *curPeriod != period {
-		newVal = 1 // новый период — сброс
+	value := used + 1
+	if currentPeriod == nil || *currentPeriod != period {
+		value = 1
 	}
-	if newVal > limit {
-		return false, nil // rollback через defer, 402 выше
+	if value > limit {
+		return false, used, nil
 	}
 	if kind == "daily" {
-		_, err = tx.Exec(ctx,
-			`UPDATE entitlements SET free_used_today=$2, free_date=$3::date WHERE user_id=$1`,
-			userID, newVal, period)
+		_, err = tx.Exec(ctx, `
+			UPDATE entitlements
+			   SET free_used_today=$2, free_date=$3::date
+			 WHERE user_id=$1`, userID, value, period)
 	} else {
-		_, err = tx.Exec(ctx,
-			`UPDATE entitlements SET love_used_week=$2, love_week=$3::date WHERE user_id=$1`,
-			userID, newVal, period)
+		_, err = tx.Exec(ctx, `
+			UPDATE entitlements
+			   SET love_used_week=$2, love_week=$3::date
+			 WHERE user_id=$1`, userID, value, period)
 	}
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return true, nil
+	return true, value, nil
+}
+
+func (s *Service) pgConsume(ctx context.Context, userID, kind string, limit int, period string) (bool, error) {
+	ok, _, err := s.pgConsumeValue(ctx, userID, kind, limit, period)
+	return ok, err
+}
+
+func (s *Service) cacheQuota(ctx context.Context, key string, value int, expireAt int64) {
+	if s.rd == nil {
+		return
+	}
+	ttl := time.Until(time.Unix(expireAt, 0))
+	if ttl <= 0 {
+		ttl = time.Second
+	}
+	_ = s.rd.Set(ctx, key, value, ttl).Err()
 }
 
 // Check проверяет право на расклад (порядок frozen, см. 02-functional/05).
@@ -205,17 +229,14 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 		return Verdict{}, err
 	}
 	now := time.Now()
-	// 2. love для free — недельный счетчик (Redis, при ошибке — PG, см. S03)
 	if isLove {
 		weekly := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
-		ok, err := s.consume(ctx, "ent:"+userID+":love:"+weekKey(now), weekly, mondayMidnightMSK(now))
-		if err != nil {
-			ok, err = s.pgConsume(ctx, userID, "love", weekly, mondayMSK(now))
-		}
+		ok, used, err := s.pgConsumeValue(ctx, userID, "love", weekly, mondayMSK(now))
 		if err != nil {
 			return Verdict{}, err
 		}
 		if ok {
+			s.cacheQuota(ctx, "ent:"+userID+":love:"+weekKey(now), used, mondayMidnightMSK(now))
 			return Verdict{Allow: true, Reason: "love_weekly"}, nil
 		}
 		return Verdict{Reason: "limit_exceeded"}, nil
@@ -232,17 +253,13 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 		}
 		return Verdict{Reason: "limit_exceeded"}, nil
 	}
-	// 4. обычный free — дневной счетчик (Redis, при ошибке — PG, см. S03).
-	// Ключ от MSK-даты (UTC ехал на 3ч, см. аудит S03).
 	daily := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
-	ok, err := s.consume(ctx, "ent:"+userID+":"+mskDate(now), daily, midnightMSK(now))
-	if err != nil {
-		ok, err = s.pgConsume(ctx, userID, "daily", daily, mskDate(now))
-	}
+	ok, used, err := s.pgConsumeValue(ctx, userID, "daily", daily, mskDate(now))
 	if err != nil {
 		return Verdict{}, err
 	}
 	if ok {
+		s.cacheQuota(ctx, "ent:"+userID+":"+mskDate(now), used, midnightMSK(now))
 		return Verdict{Allow: true, Reason: "daily"}, nil
 	}
 	return Verdict{Reason: "limit_exceeded"}, nil
@@ -254,7 +271,11 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 func (s *Service) GrantBonusDays(ctx context.Context, userID, planCode string, days int) error {
 	var planID string
 	if err := s.pg.QueryRow(ctx,
-		`SELECT id FROM plans WHERE code=$1 AND is_active ORDER BY valid_from DESC LIMIT 1`, planCode).Scan(&planID); err != nil {
+		`SELECT id FROM (
+			SELECT DISTINCT ON (code) id, code, is_active
+			FROM plans WHERE code=$1
+			ORDER BY code, valid_from DESC
+		) latest WHERE latest.is_active`, planCode).Scan(&planID); err != nil {
 		return err
 	}
 	_, err := s.pg.Exec(ctx,
@@ -276,9 +297,13 @@ type Plan struct {
 // HandlePlans — GET /v1/plans: только покупаемые тарифы (без free/trial/bonus).
 func (s *Service) HandlePlans(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pg.Query(r.Context(),
-		`SELECT DISTINCT ON (code) code, price_rub, stars_amount, duration_days FROM plans
-		  WHERE is_active AND code IN ('month_299','year_2490','single_99')
-		  ORDER BY code, valid_from DESC`)
+		`SELECT code, price_rub, stars_amount, duration_days
+		 FROM (
+			SELECT DISTINCT ON (code) code, price_rub, stars_amount, duration_days, is_active
+			FROM plans WHERE code IN ('month_299','year_2490','single_99')
+			ORDER BY code, valid_from DESC
+		 ) latest
+		 WHERE latest.is_active`)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить тарифы")
 		return
@@ -315,20 +340,17 @@ func (s *Service) HandleMe(w http.ResponseWriter, r *http.Request) {
 	daily := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
 	weekly := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
 	now := time.Now()
-	// Аудит B: при мёртвом Redis дисплей падал в 0 (врал полную квоту) — читаем PG.
-	freeUsed, err := s.rd.Get(ctx, "ent:"+uid+":"+mskDate(now)).Int()
-	if err != nil {
-		_ = s.pg.QueryRow(ctx,
-			`SELECT free_used_today FROM entitlements WHERE user_id=$1 AND free_date=$2::date`,
-			uid, mskDate(now)).Scan(&freeUsed)
+	var freeUsed, loveUsed int
+	if err := s.pg.QueryRow(ctx, `
+		SELECT
+			COALESCE((SELECT free_used_today FROM entitlements WHERE user_id=$1 AND free_date=$2::date), 0),
+			COALESCE((SELECT love_used_week FROM entitlements WHERE user_id=$1 AND love_week=$3::date), 0)`,
+		uid, mskDate(now), mondayMSK(now)).Scan(&freeUsed, &loveUsed); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось загрузить лимиты")
+		return
 	}
-	loveUsed, err := s.rd.Get(ctx, "ent:"+uid+":love:"+weekKey(now)).Int()
-	if err != nil {
-		// love_week в PG — date понедельника (mondayMSK), не ISO-ключ Redis
-		_ = s.pg.QueryRow(ctx,
-			`SELECT love_used_week FROM entitlements WHERE user_id=$1 AND love_week=$2::date`,
-			uid, mondayMSK(now)).Scan(&loveUsed)
-	}
+	s.cacheQuota(ctx, "ent:"+uid+":"+mskDate(now), freeUsed, midnightMSK(now))
+	s.cacheQuota(ctx, "ent:"+uid+":love:"+weekKey(now), loveUsed, mondayMidnightMSK(now))
 	freeLeft := daily - freeUsed
 	if freeLeft < 0 {
 		freeLeft = 0

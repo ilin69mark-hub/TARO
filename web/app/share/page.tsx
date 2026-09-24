@@ -5,9 +5,10 @@ import { Metadata } from "next";
 // noindex — шеринги не для поиска (см. 03-nonfunctional/05).
 // Мета — только через generateMetadata ниже (OG + noindex).
 
-export default function SharePage({ searchParams }: { searchParams: { q?: string; s?: string } }) {
-  const q = (searchParams.q || "Мой расклад").slice(0, 80);
-  const s = (searchParams.s || "Таро").slice(0, 40);
+export default async function SharePage({ searchParams }: { searchParams: Promise<{ q?: string; s?: string }> }) {
+  const params = await searchParams;
+  const q = (params.q || "Мой расклад").slice(0, 80);
+  const s = (params.s || "Таро").slice(0, 40);
   const og = `/api/og?q=${encodeURIComponent(q)}&s=${encodeURIComponent(s)}`;
   return (
     <main className="mx-auto max-w-md px-4 pt-8 text-center">
@@ -31,10 +32,11 @@ export default function SharePage({ searchParams }: { searchParams: { q?: string
 export async function generateMetadata({
   searchParams,
 }: {
-  searchParams: { q?: string; s?: string };
+  searchParams: Promise<{ q?: string; s?: string }>;
 }): Promise<Metadata> {
-  const q = (searchParams.q || "Мой расклад").slice(0, 80);
-  const s = (searchParams.s || "Таро").slice(0, 40);
+  const params = await searchParams;
+  const q = (params.q || "Мой расклад").slice(0, 80);
+  const s = (params.s || "Таро").slice(0, 40);
   return {
     title: `${q} — Онлайн Таро`,
     robots: { index: false, follow: false },

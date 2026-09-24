@@ -3,12 +3,15 @@
 package readings
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -144,12 +147,79 @@ func TestE2EStreamLive(t *testing.T) {
 	}))
 	defer srv.Close()
 	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
 	do, _ := testClient(t)
 	rec := do("POST", "/v1/readings", `{"spread_code":"daily"}`,
 		map[string]string{"Idempotency-Key": "live-1", "Accept": "text/event-stream"})
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, "Живой") || !strings.Contains(body, `"done":true`) {
 		t.Fatalf("live SSE: %d %q", rec.Code, body[:min(160, len(body))])
+	}
+}
+
+func TestE2EStreamCancellationPersistsFallback(t *testing.T) {
+	ctx, pg, rd := testutil.Live(t)
+	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProvider := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseProvider()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	en := entitlements.New(pg, rd)
+	gw := ai.New(pg, rd)
+	svc := New(pg, en, gw, nil)
+	uid := testutil.NewUser(t, ctx, pg)
+	question := fmt.Sprintf("cancel-%d", time.Now().UnixNano())
+	cards := draw(101, 1)
+	cardsJSON, _ := json.Marshal(cards)
+	var id string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation)
+		VALUES ($1,'daily','',$2,1,'pending','') RETURNING id`, uid, cardsJSON).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/readings", nil)
+	reqCtx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(reqCtx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		svc.streamLive(rec, req, id, "daily", question, cards)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request did not start")
+	}
+	cancel()
+	releaseProvider()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not finish after cancellation")
+	}
+	var status, interpretation string
+	if err := pg.QueryRow(ctx, `SELECT status, interpretation FROM readings WHERE id=$1`, id).Scan(&status, &interpretation); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending_fallback" || interpretation == "" {
+		t.Fatalf("status=%s interpretation=%q", status, interpretation)
 	}
 }
 

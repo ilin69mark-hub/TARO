@@ -44,6 +44,9 @@ func (StarsProvider) CreateInvoice(ctx context.Context, client *http.Client, pay
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if client == nil {
+		client = http.DefaultClient
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

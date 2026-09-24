@@ -1,15 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
 import Link from "next/link";
 import { postReadingSSE, api, Spread } from "@/lib/api";
+import { ensureAuth } from "@/lib/auth";
 import { track, events } from "@/lib/analytics";
 import { bumpReadingCount } from "@/components/PWA";
 import PaywallSheet, { Plan } from "@/components/PaywallSheet";
 
 // Экран расклада: вопрос → SSE-стрим → результат (см. 02-functional/03, T16).
 // 3D и анимации вытягивания — T21–T28; здесь Lite-флоу ≤3 клика.
-export default function SpreadDetail({ params }: { params: { code: string } }) {
+export default function SpreadDetail() {
+  const params = useParams<{ code: string }>();
+  const code = params.code;
   const [question, setQuestion] = useState("");
   const [text, setText] = useState("");
   const [readingId, setReadingId] = useState("");
@@ -21,14 +25,14 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
   // Аудит C: ключ попытки живёт до успеха — retry после обрыва НЕ жрёт квоту повторно.
   // Новый ключ — только явным сбросом (newAttempt после успеха/провала с paywall).
   const [attemptKey, setAttemptKey] = useState("");
-  const [spreadName, setSpreadName] = useState(params.code);
+  const [spreadName, setSpreadName] = useState(code);
 
   useEffect(() => {
-    track(events.spreadOpen, { spread_code: params.code });
+    track(events.spreadOpen, { spread_code: code });
     api
       .get<Spread[]>("/spreads")
       .then((list) => {
-        const found = list.find((s) => s.code === params.code);
+        const found = list.find((s) => s.code === code);
         if (found) setSpreadName(found.name);
       })
       .catch(() => undefined);
@@ -53,11 +57,12 @@ export default function SpreadDetail({ params }: { params: { code: string } }) {
     setError("");
     setReadingId("");
     try {
+      await ensureAuth();
       // retry тем же ключом (идемпотентность сервера), новая попытка — новым
       const key = isRetry && attemptKey ? attemptKey : crypto.randomUUID();
       setAttemptKey(key);
       const res = await postReadingSSE(
-        { spread_code: params.code, question: question || undefined, idempotency_key: key },
+        { spread_code: code, question: question || undefined, idempotency_key: key },
         (t) => setText((prev) => prev + t)
       );
       setReadingId(res.reading_id);

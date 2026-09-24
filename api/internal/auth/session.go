@@ -8,10 +8,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"taro/api/internal/apierr"
 )
@@ -19,16 +24,96 @@ import (
 // sessKey — единый ключ сессии (см. 05-cache-redis.md). `refresh:` удален.
 func sessKey(userID string) string { return "sess:" + userID }
 
-// newSessHash — случайный маркер сессии для rotation.
 func newSessHash() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	v, _ := newTokenID()
+	return v
 }
 
-// rememberSession пишет sess:<uid> на TTL токена (вызывать при каждом login/link).
-func (s *Service) rememberSession(ctx context.Context, userID string, ttl time.Duration) error {
-	return s.rd.Set(ctx, sessKey(userID), newSessHash(), ttl).Err()
+func (s *Service) rememberSession(ctx context.Context, userID string, ttl time.Duration, sessionID ...string) error {
+	sid := newSessHash()
+	if len(sessionID) > 0 && sessionID[0] != "" {
+		sid = sessionID[0]
+	}
+	return s.rd.Set(ctx, sessKey(userID), sid, ttl).Err()
+}
+
+func (s *Service) issueSession(ctx context.Context, userID string, ttl time.Duration) (string, error) {
+	sid, err := newTokenID()
+	if err != nil {
+		return "", err
+	}
+	tok, err := IssueJWT(userID, ttl, sid)
+	if err != nil {
+		return "", err
+	}
+	if err := s.rememberSession(ctx, userID, ttl, sid); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+const rotateSessionLua = `
+local current = redis.call('GET', KEYS[1])
+if current ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+return 1
+`
+
+var errSessionRotated = fmt.Errorf("session_rotated")
+
+func (s *Service) rotateSession(ctx context.Context, userID, oldSID string, ttl time.Duration) (string, error) {
+	sid, err := newTokenID()
+	if err != nil {
+		return "", err
+	}
+	ok, err := s.rd.Eval(ctx, rotateSessionLua, []string{sessKey(userID)}, oldSID, sid, strconv.FormatInt(ttl.Milliseconds(), 10)).Int()
+	if err != nil {
+		return "", err
+	}
+	if ok != 1 {
+		return "", errSessionRotated
+	}
+	return sid, nil
+}
+
+type sessionClaimsKey struct{}
+
+func sessionClaims(ctx context.Context) (tokenClaims, bool) {
+	claims, ok := ctx.Value(sessionClaimsKey{}).(tokenClaims)
+	return claims, ok
+}
+
+func (s *Service) sessionMarkerOK(ctx context.Context, claims tokenClaims) (bool, error) {
+	marker, err := s.rd.Get(ctx, sessKey(claims.Subject)).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if marker == "" {
+		return false, nil
+	}
+	if claims.Legacy && marker == "x" {
+		return true, nil
+	}
+	if claims.SID == "" {
+		return false, nil
+	}
+	return fingerprintsEqual(marker, claims.SID), nil
+}
+
+func ExpireAuthCookies(w http.ResponseWriter) {
+	for _, name := range []string{CookieName, FpCookie, "taro_csrf"} {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: "", Path: "/", MaxAge: -1,
+			HttpOnly: name != "taro_csrf", Secure: true, SameSite: http.SameSiteNoneMode,
+		})
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "taro_admin", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
 }
 
 // RequireCSRF — middleware (см. S07): per-session токен + Origin-check.
@@ -48,14 +133,26 @@ func (s *Service) RequireCSRF(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if uid := jwtUser(r); uid != "" {
-			want, err := s.csrfFor(r.Context(), uid)
-			if err != nil || r.Header.Get("X-CSRF") == "" || r.Header.Get("X-CSRF") != want {
-				apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный CSRF-токен")
+		if c, cookieErr := r.Cookie(CookieName); cookieErr == nil {
+			if claims, parseErr := parseJWT(c.Value); parseErr == nil {
+				ok, markerErr := s.sessionMarkerOK(r.Context(), claims)
+				if markerErr != nil {
+					apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+					return
+				}
+				if !ok {
+					ExpireAuthCookies(w)
+					apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
+					return
+				}
+				want, csrfErr := s.csrfFor(r.Context(), claims.Subject)
+				if csrfErr != nil || r.Header.Get("X-CSRF") == "" || r.Header.Get("X-CSRF") != want {
+					apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный CSRF-токен")
+					return
+				}
+				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r)
-			return
 		}
 		if !originOK(r) {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный Origin")
@@ -116,31 +213,58 @@ func originOK(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
+	configured := strings.TrimSpace(os.Getenv("PUBLIC_ORIGIN"))
+	if configured == "" {
+		return false
+	}
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" {
 		return false
 	}
-	want := r.Host
-	// за nginx хост приходит в X-Forwarded-Host/Host — сравниваем как есть
-	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-		want = strings.Split(h, ",")[0]
+	want, err := url.Parse(configured)
+	if err != nil || want.Host == "" {
+		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(u.Host), strings.TrimSpace(want))
+	return strings.EqualFold(u.Scheme, want.Scheme) && strings.EqualFold(u.Host, want.Host)
 }
-
-// HandleRefresh — POST /v1/auth/refresh: ротация sess + новый cookie. Нужен валидный JWT.
-// S03: ошибка Redis → 503 (не 500 — сессия жива, хранилище лежит).
 func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	uid := UserID(r.Context())
-	if uid == "" {
+	claims, ok := sessionClaims(r.Context())
+	if uid == "" || !ok {
+		ExpireAuthCookies(w)
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Нужен вход")
 		return
 	}
-	if err := s.rd.Set(r.Context(), sessKey(uid), newSessHash(), UserTTL).Err(); err != nil {
+	var sid string
+	var err error
+	if claims.Legacy {
+		ok, markerErr := s.sessionMarkerOK(r.Context(), claims)
+		if markerErr != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		if !ok {
+			ExpireAuthCookies(w)
+			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
+			return
+		}
+		sid, err = newTokenID()
+		if err == nil {
+			err = s.rd.Set(r.Context(), sessKey(uid), sid, UserTTL).Err()
+		}
+	} else {
+		sid, err = s.rotateSession(r.Context(), uid, claims.SID, UserTTL)
+	}
+	if err != nil {
+		if err == errSessionRotated {
+			ExpireAuthCookies(w)
+			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
+			return
+		}
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	tok, err := IssueJWT(uid, UserTTL)
+	tok, err := IssueJWT(uid, UserTTL, sid)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
 		return
@@ -150,21 +274,12 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-// HandleLogout — POST /v1/auth/logout: DEL sess + гашение cookie.
 func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	uid := UserID(r.Context())
 	if uid != "" {
-		_ = s.rd.Del(r.Context(), sessKey(uid)).Err()
+		_ = s.rd.Del(r.Context(), sessKey(uid), "csrf:"+uid).Err()
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
-	})
+	ExpireAuthCookies(w)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }

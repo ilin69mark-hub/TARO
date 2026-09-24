@@ -2,6 +2,7 @@
 package readings
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,5 +64,20 @@ func TestSameMSKDay(t *testing.T) {
 	}
 	if !sameMSKDay(a, a) {
 		t.Fatal("same day differs")
+	}
+}
+
+func TestCrisisPolicyIsSafeAndConfigurable(t *testing.T) {
+	policy := defaultCrisisPolicy()
+	if !policy.matches("Я не хочу жить") {
+		t.Fatal("default crisis pattern missed")
+	}
+	if strings.Contains(defaultCrisisResourceText, "ВЛАДЕЛЕЦ") || strings.Contains(defaultCrisisResourceText, "///") {
+		t.Fatal("placeholder crisis text remains")
+	}
+	policy.resourceText = "Обратись в местную экстренную службу."
+	policy.patterns = []string{"кодовое слово"}
+	if !policy.matches("у меня кодовое слово") || policy.resourceText == defaultCrisisResourceText {
+		t.Fatal("crisis policy is not configurable")
 	}
 }

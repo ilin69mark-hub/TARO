@@ -91,7 +91,7 @@ func TestE2EPushHandlers(t *testing.T) {
 			t.Fatalf("ssrf %s: want 422 got %d", bad[:40], rec.Code)
 		}
 	}
-	sub := `{"endpoint":"https://example.com/e2e1","p256dh":"AA","auth":"BB"}`
+	sub := `{"endpoint":"https://example.com/e2e1","p256dh":"BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","auth":"AAAAAAAAAAAAAAAAAAAAAA"}`
 	if rec := do(tok, "POST", "/v1/push/subscribe", sub); rec.Code != 200 {
 		t.Fatalf("sub: %d %s", rec.Code, rec.Body.String())
 	}

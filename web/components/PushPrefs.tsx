@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { ensureAuth } from "@/lib/auth";
 
 // Настройки пушей: час + тишина (см. V24). Cron уважает (см. HandleEvening).
 export default function PushPrefs() {
@@ -10,10 +11,13 @@ export default function PushPrefs() {
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    api.get<{ hour: number; quiet: boolean }>("/push/prefs").then((p) => {
-      setHour(p.hour);
-      setQuiet(p.quiet);
-    }).catch(() => undefined);
+    void ensureAuth()
+      .then(() => api.get<{ hour: number; quiet: boolean }>("/push/prefs"))
+      .then((p) => {
+        setHour(p.hour);
+        setQuiet(p.quiet);
+      })
+      .catch(() => undefined);
   }, []);
 
   async function save() {

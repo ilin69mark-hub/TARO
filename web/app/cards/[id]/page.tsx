@@ -26,8 +26,9 @@ export async function generateStaticParams() {
   return [];
 }
 
-export async function generateMetadata({ params }: { params: { id: string } }): Promise<Metadata> {
-  const c = await load(params.id);
+export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
+  const { id } = await params;
+  const c = await load(id);
   if (!c) return { title: "Карта — Онлайн Таро" };
   return {
     title: `${c.name_ru} — значение карты | Онлайн Таро`,
@@ -35,8 +36,9 @@ export async function generateMetadata({ params }: { params: { id: string } }): 
   };
 }
 
-export default async function CardPage({ params }: { params: { id: string } }) {
-  const c = await load(params.id);
+export default async function CardPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const c = await load(id);
   if (!c) {
     return (
       <main className="mx-auto max-w-md px-4 pt-8">

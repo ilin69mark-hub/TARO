@@ -92,6 +92,12 @@ func TestE2EAuthGuards(t *testing.T) {
 	// refresh ok с настоящим токеном
 	if rec := post(tok, "/v1/auth/refresh", `{}`, csrf); rec.Code != 200 {
 		t.Fatalf("refresh: want 200 got %d: %s", rec.Code, rec.Body.String())
+	} else {
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == CookieName {
+				tok = c.Value
+			}
+		}
 	}
 	// logout ok
 	if rec := post(tok, "/v1/auth/logout", `{}`, csrf); rec.Code != 200 {

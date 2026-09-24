@@ -23,9 +23,10 @@ function badId() {
 }
 
 // GET /api/diary/:id → Go.
-export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  if (!ID_RE.test(params.id)) return badId();
-  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  if (!ID_RE.test(id)) return badId();
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(id)}`, {
     headers: { Cookie: req.headers.get("cookie") || "" },
     cache: "no-store",
   });
@@ -33,11 +34,12 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
 }
 
 // PUT /api/diary/:id → Go.
-export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
-  if (!ID_RE.test(params.id)) return badId();
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  if (!ID_RE.test(id)) return badId();
   if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
-  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: headers(req),
     body,
@@ -46,9 +48,10 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
 }
 
 // DELETE /api/diary/:id → Go.
-export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
-  if (!ID_RE.test(params.id)) return badId();
-  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  if (!ID_RE.test(id)) return badId();
+  const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: headers(req),
   });

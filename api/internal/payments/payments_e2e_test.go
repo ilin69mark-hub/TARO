@@ -83,6 +83,9 @@ func TestE2EWebhookDuplicate(t *testing.T) {
 	r, pg, newUser := testSetup(t)
 	tok, uid := newUser()
 	_ = tok
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=1 WHERE id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
 	var payID string
 	if err := pg.QueryRow(context.Background(), `
 		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status)

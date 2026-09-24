@@ -4,6 +4,7 @@ import { useEffect, useState, Suspense } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
+import { ensureAuth } from "@/lib/auth";
 
 // Дневник: список + новая запись (см. V07). Черновик — автосейв локально.
 export type DiaryEntry = {
@@ -47,7 +48,7 @@ function DiaryInner() {
     } catch {
       /* ignore */
     }
-    load();
+    void ensureAuth().then(() => load()).catch(() => undefined);
   }, []);
 
   function draft(v: string) {

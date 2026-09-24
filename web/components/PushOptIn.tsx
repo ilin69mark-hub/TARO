@@ -21,6 +21,8 @@ export default function PushOptIn() {
         return;
       }
       const reg = await navigator.serviceWorker.ready;
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) await existing.unsubscribe();
       const { key } = await fetch("/api/push/public").then((r) => r.json());
       const sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,

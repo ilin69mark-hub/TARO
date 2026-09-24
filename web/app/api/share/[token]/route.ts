@@ -7,11 +7,12 @@ import { GO } from "@/lib/server";
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 
 // GET /api/share/:token → Go (публичное превью, токен-allowlist).
-export async function GET(req: NextRequest, { params }: { params: { token: string } }) {
-  if (!TOKEN_RE.test(params.token)) {
+export async function GET(req: NextRequest, { params }: { params: Promise<{ token: string }> }) {
+  const { token } = await params;
+  if (!TOKEN_RE.test(token)) {
     return NextResponse.json({ error: { message_ru: "Некорректная ссылка" } }, { status: 422 });
   }
-  const res = await fetch(`${GO}/v1/share/${encodeURIComponent(params.token)}`, {
+  const res = await fetch(`${GO}/v1/share/${encodeURIComponent(token)}`, {
     cache: "no-store",
   });
   const body = await res.arrayBuffer();

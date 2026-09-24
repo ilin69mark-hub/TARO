@@ -1,27 +1,35 @@
-// Worker дописывания pending_fallback (см. 04-architecture/06-ai-pipeline.md, T12/T13).
-// Тик 30с: берет до 5 зависших, копит стрим без клиента, пишет done (или оставляет pending).
 package ai
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// StartWorker запускает горутину-воркер до отмены ctx.
-// S06: recover на каждой итерации — паника drain не роняет процесс.
+type workerJob struct {
+	id        string
+	spread    string
+	question  string
+	cards     []CardValue
+	cardsRaw  json.RawMessage
+	positions []Position
+	token     string
+}
+
 func (g *Gateway) StartWorker(ctx context.Context, pg *pgxpool.Pool, tick time.Duration) {
+	if tick <= 0 {
+		return
+	}
 	go func() {
-		t := time.NewTicker(tick)
-		defer t.Stop()
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
+			case <-ticker.C:
 				func() {
 					defer func() { _ = recover() }()
 					g.drainOnce(ctx, pg)
@@ -31,95 +39,128 @@ func (g *Gateway) StartWorker(ctx context.Context, pg *pgxpool.Pool, tick time.D
 	}()
 }
 
-// drainOnce — одна итерация: до 5 pending_fallback.
 func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) {
+	defer func() { _ = recover() }()
+	if pg == nil {
+		return
+	}
 	rows, err := pg.Query(ctx, `
-		SELECT id, spread_code, COALESCE(question,''), cards FROM readings
-		 WHERE status='pending_fallback' ORDER BY created_at LIMIT 5`)
+		WITH candidates AS (
+			SELECT id
+			  FROM readings
+			 WHERE status IN ('pending', 'pending_fallback')
+			   AND (worker_lease_until IS NULL OR worker_lease_until <= now())
+			 ORDER BY updated_at, created_at
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT 5
+		)
+		UPDATE readings r
+		   SET worker_claim_token=gen_random_uuid(),
+		       worker_lease_until=now()+interval '2 minutes',
+		       worker_attempts=worker_attempts+1,
+		       updated_at=now()
+		  FROM candidates
+		 WHERE r.id=candidates.id
+		RETURNING r.id::text, r.spread_code, COALESCE(r.question,''), r.cards, r.worker_claim_token::text`)
 	if err != nil {
 		return
 	}
-	defer rows.Close()
-	type job struct {
-		id, spread, question string
-		cards                []CardValue
-		positions            []Position
-	}
-	var jobs []job
+	jobs := make([]workerJob, 0, 5)
 	for rows.Next() {
-		var j job
-		var cardsRaw, posRaw json.RawMessage
-		var spreadName string
-		if err := rows.Scan(&j.id, &j.spread, &j.question, &cardsRaw); err != nil {
-			continue
+		var job workerJob
+		if err := rows.Scan(&job.id, &job.spread, &job.question, &job.cardsRaw, &job.token); err == nil {
+			jobs = append(jobs, job)
 		}
+	}
+	rows.Close()
+	for i := range jobs {
+		job := &jobs[i]
 		var draws []struct {
 			CardID   int  `json:"card_id"`
 			Reversed bool `json:"reversed"`
 			Position int  `json:"position"`
 		}
-		if json.Unmarshal(cardsRaw, &draws) != nil {
+		if json.Unmarshal(job.cardsRaw, &draws) != nil {
+			g.releaseClaim(pg, job.id, job.token, time.Minute)
 			continue
 		}
-		for _, d := range draws {
-			var name, up, rev string
+		for _, draw := range draws {
+			var name, upright, reversed string
 			if err := pg.QueryRow(ctx,
-				`SELECT name_ru, upright_ru, reversed_ru FROM cards WHERE id=$1`, d.CardID).Scan(&name, &up, &rev); err != nil {
-				continue
+				`SELECT name_ru, upright_ru, reversed_ru FROM cards WHERE id=$1`, draw.CardID).Scan(&name, &upright, &reversed); err != nil {
+				job.cards = nil
+				break
 			}
-			j.cards = append(j.cards, CardValue{Name: name, Upright: up, ReversedText: rev, Reversed: d.Reversed, Position: d.Position, CardID: d.CardID})
+			job.cards = append(job.cards, CardValue{
+				Name: name, Upright: upright, ReversedText: reversed,
+				Reversed: draw.Reversed, Position: draw.Position, CardID: draw.CardID,
+			})
 		}
-		if err := pg.QueryRow(ctx, `SELECT name_ru, positions FROM spreads WHERE code=$1`, j.spread).Scan(&spreadName, &posRaw); err != nil {
+		var spreadName string
+		var positionsRaw json.RawMessage
+		if err := pg.QueryRow(ctx, `SELECT name_ru, positions FROM spreads WHERE code=$1`, job.spread).Scan(&spreadName, &positionsRaw); err != nil {
+			job.spread = ""
+		} else {
+			_ = json.Unmarshal(positionsRaw, &job.positions)
+			job.spread = spreadName
+		}
+		if len(job.cards) == 0 || job.spread == "" {
+			g.releaseClaim(pg, job.id, job.token, time.Minute)
 			continue
 		}
-		_ = json.Unmarshal(posRaw, &j.positions)
-		j.spread = spreadName
-		jobs = append(jobs, j)
-	}
-	rows.Close()
-	for _, j := range jobs {
-		// S06: дедлайн 30с на джобу, иначе висячие горутины при деградации провайдера
-		jctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		text := g.complete(jctx, j.spread, j.positions, j.cards, j.question)
+		jobCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		text := g.completeReading(jobCtx, job.id, job.spread, job.positions, job.cards, job.question)
 		cancel()
 		if text == "" {
-			continue // AI все еще лежит — оставляем pending_fallback
-		}
-		if ContainsStopWords(text) {
-			_, _ = pg.Exec(ctx,
-				`UPDATE readings SET interpretation=$1, status='filtered' WHERE id=$2 AND status='pending_fallback'`,
-				SafeReplacement, j.id)
-			g.log(ctx, j.id, "filter", "", 0, 0, 0, "filtered", "stop-words")
+			g.releaseClaim(pg, job.id, job.token, 30*time.Second)
 			continue
 		}
-		_, _ = pg.Exec(ctx,
-			`UPDATE readings SET interpretation=$1, status='done' WHERE id=$2 AND status='pending_fallback'`, text, j.id)
+		status := "done"
+		if ContainsStopWords(text) || text == SafeReplacement {
+			text = SafeReplacement
+			status = "filtered"
+		}
+		persistCtx, persistCancel := persistenceContext()
+		_, _ = pg.Exec(persistCtx, `
+			UPDATE readings
+			   SET interpretation=$1, status=$2, worker_claim_token=NULL,
+			       worker_lease_until=NULL, updated_at=now()
+			 WHERE id=$3 AND worker_claim_token=$4 AND status IN ('pending', 'pending_fallback')`,
+			text, status, job.id, job.token)
+		persistCancel()
 	}
 }
 
-// complete копит стрим без клиента (worker). Пусто при недоступности AI.
-// Дренаж concurrent — иначе дедлок на текстах длиннее буфера.
-func (g *Gateway) complete(ctx context.Context, spread string, positions []Position, cards []CardValue, question string) string {
-	ch := make(chan string, 256)
-	type res struct {
-		text string
-		err  error
+func (g *Gateway) releaseClaim(pg *pgxpool.Pool, id, token string, delay time.Duration) {
+	if pg == nil || id == "" || token == "" {
+		return
 	}
-	done := make(chan res, 1)
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				done <- res{"", fmt.Errorf("stream panic: %v", rec)}
-			}
-		}()
-		text, _, _, err := g.Stream(ctx, "", spread, positions, cards, question, ch)
-		done <- res{text, err}
+	seconds := int(delay / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	ctx, cancel := persistenceContext()
+	defer cancel()
+	_, _ = pg.Exec(ctx, `
+		UPDATE readings
+		   SET worker_claim_token=NULL, worker_lease_until=now()+make_interval(secs => $3), updated_at=now()
+		 WHERE id=$1 AND worker_claim_token=$2 AND status IN ('pending', 'pending_fallback')`,
+		id, token, seconds)
+}
+
+func (g *Gateway) complete(ctx context.Context, spread string, positions []Position, cards []CardValue, question string) string {
+	return g.completeReading(ctx, "", spread, positions, cards, question)
+}
+
+func (g *Gateway) completeReading(ctx context.Context, readingID, spread string, positions []Position, cards []CardValue, question string) (result string) {
+	ch := make(chan string, MaxOutputBytes/512+16)
+	defer func() {
+		if recover() != nil {
+			result = ""
+		}
 	}()
+	text, _, _, _ := g.Stream(ctx, readingID, spread, positions, cards, question, ch)
 	for range ch {
 	}
-	r := <-done
-	if r.err != nil {
-		return ""
-	}
-	return r.text
+	return text
 }

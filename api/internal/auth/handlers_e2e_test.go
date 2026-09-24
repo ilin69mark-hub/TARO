@@ -85,7 +85,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 
 	// anon (uuid уникален на прогон — иначе link-состояние перетекает, формат 8-4-4-4-12!)
 	anonUUID := "aaaaaaaa-" + hex4(base) + "-0000-0000-000000000000"
-	rec := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"`+anonUUID+`"}`, "")
+	rec := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"`+anonUUID+`","fingerprint":"anon-fp"}`, "")
 	if rec.Code != 200 {
 		t.Fatalf("anon: %d %s", rec.Code, rec.Body.String())
 	}
@@ -125,7 +125,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 
 	// link: anon → tg 424244 (свободен) → attach + trial
 	init2 := craft(t, "test-bot", base+3)
-	rec = doAuth(r, cookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init2)+`}`, csrfOf(t, svc, anon["user_id"].(string)))
+	rec = doAuth(r, cookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init2)+`,"fingerprint":"anon-fp"}`, csrfOf(t, svc, anon["user_id"].(string)))
 	if rec.Code != 200 {
 		t.Fatalf("link: %d %s", rec.Code, rec.Body.String())
 	}
@@ -143,13 +143,13 @@ func TestE2EAuthHandlers(t *testing.T) {
 			newCookie = c.Value
 		}
 	}
-	rec = doAuth(r, newCookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init3)+`}`, csrfOf(t, svc, linked["user_id"].(string)))
+	rec = doAuth(r, newCookie, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(init3)+`,"fingerprint":"anon-fp"}`, csrfOf(t, svc, linked["user_id"].(string)))
 	if rec.Code != 409 {
 		t.Fatalf("relink: want 409 got %d", rec.Code)
 	}
 
 	// merge: anon B → занятый tg (base+2): B удаляется, survivor — TG-юзер
-	recB := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"bbbbbbbb-`+hex4(base+1)+`-0000-0000-000000000000"}`, "")
+	recB := doAuth(r, "", "POST", "/v1/auth/anon", `{"uuid":"bbbbbbbb-`+hex4(base+1)+`-0000-0000-000000000000","fingerprint":"anon-b-fp"}`, "")
 	if recB.Code != 200 {
 		t.Fatalf("anonB: %d %s", recB.Code, recB.Body.String())
 	}
@@ -163,7 +163,7 @@ func TestE2EAuthHandlers(t *testing.T) {
 	}
 	uidB, _ := anonB["user_id"].(string)
 	initTaken := craft(t, "test-bot", base+2)
-	rec = doAuth(r, cookieB, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(initTaken)+`}`, csrfOf(t, svc, anonB["user_id"].(string)))
+	rec = doAuth(r, cookieB, "POST", "/v1/auth/link", `{"initData":`+strconv.Quote(initTaken)+`,"fingerprint":"anon-b-fp"}`, csrfOf(t, svc, anonB["user_id"].(string)))
 	if rec.Code != 200 {
 		t.Fatalf("merge: %d %s", rec.Code, rec.Body.String())
 	}

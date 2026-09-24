@@ -221,7 +221,12 @@ func (s *Service) HandleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
-	out := []Entry{}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="taro-diary.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("["))
+	first := true
+	encoder := json.NewEncoder(w)
 	for rows.Next() {
 		var e Entry
 		var c, u time.Time
@@ -230,11 +235,16 @@ func (s *Service) HandleExport(w http.ResponseWriter, r *http.Request) {
 		}
 		e.CreatedAt = c.Format(time.RFC3339)
 		e.UpdatedAt = u.Format(time.RFC3339)
-		out = append(out, e)
+		if !first {
+			_, _ = w.Write([]byte(","))
+		}
+		first = false
+		_ = encoder.Encode(e)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", `attachment; filename="taro-diary.json"`)
-	_ = json.NewEncoder(w).Encode(out)
+	if rows.Err() != nil {
+		return
+	}
+	_, _ = w.Write([]byte("]\n"))
 }
 
 // HandleDelete — DELETE /v1/diary/{id} (только своя).

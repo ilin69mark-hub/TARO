@@ -25,7 +25,11 @@ import (
 func grantBonusDaysTx(ctx context.Context, tx pgx.Tx, userID, planCode string, days int) error {
 	var planID string
 	if err := tx.QueryRow(ctx,
-		`SELECT id FROM plans WHERE code=$1 AND is_active ORDER BY valid_from DESC LIMIT 1`, planCode).Scan(&planID); err != nil {
+		`SELECT id FROM (
+			SELECT DISTINCT ON (code) id, code, is_active
+			FROM plans WHERE code=$1
+			ORDER BY code, valid_from DESC
+		) latest WHERE latest.is_active`, planCode).Scan(&planID); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx,

@@ -1,8 +1,3 @@
-// Package payments — Telegram Stars (см. docs/project-book/04-architecture/07, T29).
-// Идемпотентность: INSERT ... ON CONFLICT(provider_payment_id) DO NOTHING → начисление
-// только при inserted=true (ретраи TG безопасны).
-// Age-gate: invoice без age_confirmed_at → 403 (см. 08-risks/02).
-// Webhook проверяет Secret-Token (не путать с HMAC initData), CSRF не требует.
 package payments
 
 import (
@@ -10,13 +5,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taro/api/internal/apierr"
@@ -24,54 +25,234 @@ import (
 	"taro/api/internal/me"
 )
 
-// Service — платежи.
 type Service struct {
 	pg   *pgxpool.Pool
 	mv   *me.Service
 	http *http.Client
 }
 
-// New возвращает сервис.
 func New(pg *pgxpool.Pool, mv *me.Service) *Service {
 	return &Service{pg: pg, mv: mv, http: &http.Client{Timeout: 10 * time.Second}}
 }
 
-// tgCall вызывает Bot API метод.
+type tgCallError struct {
+	message   string
+	ambiguous bool
+}
+
+func (e *tgCallError) Error() string { return e.message }
+
 func (s *Service) tgCall(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	token := os.Getenv("TG_BOT_TOKEN")
 	if token == "" || token == "dev-only-bot" {
-		return nil, fmt.Errorf("no bot token")
+		return nil, &tgCallError{message: "no bot token"}
 	}
-	body, _ := json.Marshal(params)
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, &tgCallError{message: "invalid telegram request", ambiguous: true}
+	}
 	req, err := http.NewRequestWithContext(ctx,
 		"POST", "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, &tgCallError{message: "invalid telegram request", ambiguous: true}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.http.Do(req)
+	client := s.http
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &tgCallError{message: "telegram request failed", ambiguous: true}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, &tgCallError{message: "telegram request failed", ambiguous: true}
+	}
 	var out struct {
 		OK     bool            `json:"ok"`
 		Result json.RawMessage `json:"result"`
 		Desc   string          `json:"description"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return nil, &tgCallError{message: "invalid telegram response", ambiguous: true}
 	}
 	if !out.OK {
-		return nil, fmt.Errorf("tg api: %s", out.Desc)
+		return nil, &tgCallError{message: "tg api: " + out.Desc}
 	}
 	return out.Result, nil
 }
 
-// HandleInvoice — POST /v1/payments/stars/invoice {plan_code, idempotency_key[, provider]}.
-// Идемпотентность (см. D3): ключ ОБЯЗАТЕЛЕН (422 без него); повтор с тем же ключом <15мин
-// возвращает тот же payment_id (новый invoice_link, строка одна — дублей pending нет).
-// provider: tg_stars (дефолт) | yookassa (501 без KYC, см. V15). Провайдеры — см. providers.go (V13).
+func tgTokenReady() bool {
+	token := os.Getenv("TG_BOT_TOKEN")
+	return token != "" && token != "dev-only-bot"
+}
+
+type planSnapshot struct {
+	id       string
+	price    int
+	stars    int
+	duration *int
+}
+
+type storedPayment struct {
+	ID                   string
+	UserID               string
+	PlanID               string
+	PlanCode             string
+	Provider             string
+	ProviderPaymentID    string
+	Price                int
+	Amount               int
+	Stars                int
+	Status               string
+	PurchaseFingerprint  string
+	Duration             *int
+	TelegramCharge       *string
+	ProviderCharge       *string
+	RefundState          string
+	ReconciliationReason *string
+}
+
+type webhookPayment struct {
+	storedPayment
+	ownerTG *int64
+}
+
+type refundPayment struct {
+	storedPayment
+	refundTableState string
+	ownerTG          *int64
+}
+
+type queryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+const storedPaymentColumns = `p.id::text, p.user_id::text, p.plan_id::text, p.plan_code,
+	p.price_rub_snapshot, p.provider, p.provider_payment_id, p.amount_rub, p.stars,
+	p.status, COALESCE(p.purchase_fingerprint, ''), COALESCE(p.duration_days_snapshot, pl.duration_days),
+	p.telegram_payment_charge_id, p.provider_payment_charge_id, COALESCE(p.refund_state, 'none'),
+	p.reconciliation_reason`
+
+func paymentScanDest(p *storedPayment) []any {
+	return []any{
+		&p.ID, &p.UserID, &p.PlanID, &p.PlanCode, &p.Price, &p.Provider,
+		&p.ProviderPaymentID, &p.Amount, &p.Stars, &p.Status, &p.PurchaseFingerprint,
+		&p.Duration, &p.TelegramCharge, &p.ProviderCharge, &p.RefundState, &p.ReconciliationReason,
+	}
+}
+
+func (s *Service) loadPaymentByKey(ctx context.Context, userID, key string) (storedPayment, error) {
+	var p storedPayment
+	err := s.pg.QueryRow(ctx, `SELECT `+storedPaymentColumns+`
+		FROM payments p LEFT JOIN plans pl ON pl.id=p.plan_id
+		WHERE p.user_id=$1 AND p.idempotency_key=$2`, userID, key).Scan(paymentScanDest(&p)...)
+	return p, err
+}
+
+func (s *Service) loadWebhookPayment(ctx context.Context, q queryRower, id string) (webhookPayment, error) {
+	var p webhookPayment
+	dest := paymentScanDest(&p.storedPayment)
+	dest = append(dest, &p.ownerTG)
+	err := q.QueryRow(ctx, `SELECT `+storedPaymentColumns+`, u.tg_id
+		FROM payments p
+		LEFT JOIN plans pl ON pl.id=p.plan_id
+		LEFT JOIN users u ON u.id=p.user_id
+		WHERE p.id=$1 FOR UPDATE OF p`, id).Scan(dest...)
+	return p, err
+}
+
+func (s *Service) loadRefundPayment(ctx context.Context, q queryRower, id string, lock bool) (refundPayment, error) {
+	var p refundPayment
+	dest := paymentScanDest(&p.storedPayment)
+	dest = append(dest, &p.refundTableState, &p.ownerTG)
+	query := `SELECT ` + storedPaymentColumns + `, COALESCE(pr.state, ''), u.tg_id
+		FROM payments p
+		LEFT JOIN plans pl ON pl.id=p.plan_id
+		LEFT JOIN payment_refunds pr ON pr.payment_id=p.id
+		LEFT JOIN users u ON u.id=p.user_id
+		WHERE p.id=$1`
+	if lock {
+		query += ` FOR UPDATE OF p`
+	}
+	err := q.QueryRow(ctx, query, id).Scan(dest...)
+	return p, err
+}
+
+func purchaseFingerprint(planCode string, price, stars int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", planCode, price, stars)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Service) planFor(ctx context.Context, code string) (planSnapshot, error) {
+	var p planSnapshot
+	err := s.pg.QueryRow(ctx, `SELECT id::text, price_rub, stars_amount, duration_days
+		FROM (
+			SELECT DISTINCT ON (code) id, code, price_rub, stars_amount, duration_days, is_active
+			FROM plans WHERE code=$1
+			ORDER BY code, valid_from DESC
+		) latest
+		WHERE latest.is_active AND latest.code IN ('month_299','year_2490','single_99')`, code).Scan(&p.id, &p.price, &p.stars, &p.duration)
+	return p, err
+}
+
+func (s *Service) effectivePrice(ctx context.Context, userID, code string, base int) (int, string) {
+	if code != "month_299" {
+		return base, ""
+	}
+	price := base
+	if _, abPrice := s.VariantFor(ctx, userID); abPrice > 0 {
+		price = abPrice
+	}
+	if discount, pct := s.winbackPrice(ctx, userID, price); discount > 0 {
+		return discount, "winback-" + itoa(pct)
+	}
+	return price, ""
+}
+
+func writeStoredPayment(w http.ResponseWriter, p storedPayment, link string) {
+	out := map[string]any{"payment_id": p.ID, "status": p.Status}
+	if link != "" {
+		out["invoice_link"] = link
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func writeIdempotencyConflict(w http.ResponseWriter) {
+	apierr.Write(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Ключ уже привязан к другому тарифу или сумме")
+}
+
+func (s *Service) useExistingInvoice(w http.ResponseWriter, r *http.Request, uid string, p storedPayment, requestedPlan string) {
+	if p.PlanCode != requestedPlan {
+		writeIdempotencyConflict(w)
+		return
+	}
+	if p.Status != "pending" {
+		writeStoredPayment(w, p, "")
+		return
+	}
+	plan, err := s.planFor(r.Context(), requestedPlan)
+	if err == nil {
+		price, _ := s.effectivePrice(r.Context(), uid, requestedPlan, plan.price)
+		fingerprint := purchaseFingerprint(requestedPlan, price, plan.stars)
+		if p.PurchaseFingerprint != "" && p.PurchaseFingerprint != fingerprint {
+			writeIdempotencyConflict(w)
+			return
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
+	link, err := StarsProvider{}.CreateInvoice(r.Context(), s.http, p.ID, p.PlanCode, p.Stars, p.Price)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
+	writeStoredPayment(w, p, link)
+}
+
 func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	if !s.mv.AgeConfirmed(r.Context(), uid) {
@@ -87,7 +268,7 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен plan_code")
 		return
 	}
-	if req.IdempotencyKey == "" || len(req.IdempotencyKey) > 64 {
+	if req.IdempotencyKey == "" || len(req.IdempotencyKey) > 64 || strings.TrimSpace(req.IdempotencyKey) == "" || !validOpaqueID(req.IdempotencyKey) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен idempotency_key (1..64)")
 		return
 	}
@@ -96,77 +277,76 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		prov = "tg_stars"
 	}
 	if prov == "yookassa" {
-		apierr.Write(w, http.StatusNotImplemented, "YOOKASSA_DISABLED", "Оплата картой скоро: проходим KYC (см. V15)")
+		apierr.Write(w, http.StatusNotImplemented, "YOOKASSA_DISABLED", "Оплата картой скоро: проходим KYC")
 		return
 	}
 	if prov != "tg_stars" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный провайдер")
 		return
 	}
+
 	ctx := r.Context()
-	var planID string
-	var price, stars int
-	var duration *int
-	err := s.pg.QueryRow(ctx,
-		`SELECT id, price_rub, stars_amount, duration_days FROM plans
-		  WHERE code=$1 AND is_active AND code IN ('month_299','year_2490','single_99')`,
-		req.PlanCode).Scan(&planID, &price, &stars, &duration)
-	if err != nil {
+	existing, err := s.loadPaymentByKey(ctx, uid, req.IdempotencyKey)
+	if err == nil {
+		s.useExistingInvoice(w, r, uid, existing, req.PlanCode)
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
+
+	plan, err := s.planFor(ctx, req.PlanCode)
+	if errors.Is(err, pgx.ErrNoRows) {
 		apierr.Write(w, http.StatusUnprocessableEntity, "UNKNOWN_PLAN", "Неизвестный тариф")
 		return
 	}
-	// A/B: month_299 может стоить иначе (снапшот фиксирует факт, см. U22)
-	if req.PlanCode == "month_299" {
-		if _, abPrice := s.VariantFor(ctx, uid); abPrice > 0 {
-			price = abPrice
-		}
-	}
-	// Winback V16: eligible + offers.winback.enabled → скидка pct, след в note (см. V17)
-	note := ""
-	if req.PlanCode == "month_299" {
-		if StockholderDiscount, pct := s.winbackPrice(ctx, uid, price); StockholderDiscount > 0 {
-			price = StockholderDiscount
-			note = "winback-" + itoa(pct)
-		}
-	}
-	// Аудит D: цена/звёзды из конфигов обязаны быть положительными (иначе инвойс за копейки).
-	if price <= 0 || stars <= 0 || price > 1000000 || stars > 1000000 {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
-		return
-	}
-	var paymentID string
-	_ = s.pg.QueryRow(ctx, `
-		SELECT id FROM payments WHERE user_id=$1 AND idempotency_key=$2
-		 AND status='pending' AND created_at > now() - interval '15 minutes'`,
-		uid, req.IdempotencyKey).Scan(&paymentID)
-	if paymentID == "" {
-		err = s.pg.QueryRow(ctx, `
-			INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, note, idempotency_key)
-			VALUES ($1,$2,$3,$4,'tg_stars','pending:'||gen_random_uuid(),$4,$5,'pending',NULLIF($6,''),$7)
-			ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-			RETURNING id`, uid, planID, req.PlanCode, price, stars, note, req.IdempotencyKey).Scan(&paymentID)
-		if err != nil {
-			// race: параллельный запрос создал первым — забираем его
-			_ = s.pg.QueryRow(ctx,
-				`SELECT id FROM payments WHERE user_id=$1 AND idempotency_key=$2 AND status='pending'`,
-				uid, req.IdempotencyKey).Scan(&paymentID)
-		}
-	}
-	if paymentID == "" {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать платеж")
-		return
-	}
-	link, err := StarsProvider{}.CreateInvoice(ctx, s.http, paymentID, req.PlanCode, stars, price)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"invoice_link": link, "payment_id": paymentID})
+	price, note := s.effectivePrice(ctx, uid, req.PlanCode, plan.price)
+	if price <= 0 || plan.stars <= 0 || price > 1000000 || plan.stars > 1000000 {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
+	fingerprint := purchaseFingerprint(req.PlanCode, price, plan.stars)
+	var paymentID string
+	err = s.pg.QueryRow(ctx, `
+		INSERT INTO payments
+		(user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id,
+		 amount_rub, stars, status, note, idempotency_key, purchase_fingerprint, duration_days_snapshot)
+		VALUES ($1,$2,$3,$4,'tg_stars','pending:'||gen_random_uuid(),$4,$5,'pending',NULLIF($6,''),$7,$8,$9)
+		ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+		RETURNING id::text`, uid, plan.id, req.PlanCode, price, plan.stars, note, req.IdempotencyKey, fingerprint, plan.duration).Scan(&paymentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, findErr := s.loadPaymentByKey(ctx, uid, req.IdempotencyKey)
+		if findErr != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать платеж")
+			return
+		}
+		s.useExistingInvoice(w, r, uid, existing, req.PlanCode)
+		return
+	}
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать платеж")
+		return
+	}
+	link, err := StarsProvider{}.CreateInvoice(ctx, s.http, paymentID, req.PlanCode, plan.stars, price)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
+	writeStoredPayment(w, storedPayment{
+		ID:                  paymentID,
+		PlanCode:            req.PlanCode,
+		Price:               price,
+		Stars:               plan.stars,
+		Status:              "pending",
+		PurchaseFingerprint: fingerprint,
+	}, link)
 }
 
-// VariantFor — A/B цены (см. U22): app_config ab.price_month {enabled, control, test, split}.
-// Бакет детерминирован хешем user_id (стабилен между заходами).
 func (s *Service) VariantFor(ctx context.Context, userID string) (variant string, price int) {
 	var raw json.RawMessage
 	if err := s.pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='ab.price_month'`).Scan(&raw); err != nil {
@@ -188,15 +368,12 @@ func (s *Service) VariantFor(ctx context.Context, userID string) (variant string
 	return "control", cfg.Control
 }
 
-// HandleVariant — GET /v1/ab/me: {variant, price_rub} для month_299 (0 = выкл, цена из plans).
 func (s *Service) HandleVariant(w http.ResponseWriter, r *http.Request) {
 	variant, price := s.VariantFor(r.Context(), auth.UserID(r.Context()))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"variant": variant, "price_rub": price})
 }
 
-// winbackPrice — скидка вернувшимся (см. V16): offers.winback {enabled, pct} +
-// winback_eligible (expired ≥14д, нет active). Возвращает (цена, pct) или (0, 0).
 func (s *Service) winbackPrice(ctx context.Context, userID string, base int) (int, int) {
 	var raw json.RawMessage
 	if err := s.pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='offers.winback'`).Scan(&raw); err != nil {
@@ -210,8 +387,6 @@ func (s *Service) winbackPrice(ctx context.Context, userID string, base int) (in
 		return 0, 0
 	}
 	var eligible bool
-	// NB: pgx считает УНИКАЛЬНЫЕ плейсхолдеры — повторы $1 + 2 аргумента = ошибка.
-	// Поэтому $1/$2 явно (см. V16 debug).
 	_ = s.pg.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id=$1 AND status IN ('active','expired')
 		  AND valid_until < now() - interval '14 days')
@@ -245,7 +420,6 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// tgUpdate — минимальный Update Stars-платежа.
 type tgUpdate struct {
 	Message *struct {
 		SuccessfulPayment *struct {
@@ -261,11 +435,86 @@ type tgUpdate struct {
 	} `json:"message"`
 }
 
-// HandleWebhook — POST /v1/payments/stars/webhook (Secret-Token, без CSRF).
+func validUUID(s string) bool {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return false
+	}
+	for i, r := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validOpaqueID(s string) bool {
+	if s == "" || len(s) > 128 || strings.TrimSpace(s) != s {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func writeWebhookIgnored(w http.ResponseWriter, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": reason})
+}
+
+func writeWebhookDuplicate(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "duplicate": true})
+}
+
+func writeWebhookReconciliation(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "reconciliation_required": true})
+}
+
+func (s *Service) markLateReconciliation(ctx context.Context, tx pgx.Tx, p webhookPayment, sp *struct {
+	Currency              string `json:"currency"`
+	TotalAmount           int    `json:"total_amount"`
+	InvoicePayload        string `json:"invoice_payload"`
+	TelegramPaymentCharge string `json:"telegram_payment_charge_id"`
+	ProviderPaymentCharge string `json:"provider_payment_charge_id"`
+}, reason string) error {
+	_, err := tx.Exec(ctx, `UPDATE payments
+		SET status='reconciliation', reconciliation_reason=$2,
+			provider_payment_id='tg:'||$3, telegram_payment_charge_id=$3,
+			provider_payment_charge_id=$4,
+			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $5 ELSE note || ' ' || $5 END
+		WHERE id=$1 AND status IN ('pending','expired','reconciliation')`, p.ID, reason, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, "payment-reconciliation:"+reason)
+	return err
+}
+
+func (s *Service) grantPaymentEntitlements(ctx context.Context, tx pgx.Tx, p storedPayment) error {
+	if p.PlanCode == "single_99" {
+		_, err := tx.Exec(ctx, `INSERT INTO single_entitlements (user_id, spread_code, payment_id)
+			VALUES ($1,'any',$2) ON CONFLICT (payment_id) DO NOTHING`, p.UserID, p.ID)
+		return err
+	}
+	days := 30
+	if p.Duration != nil && *p.Duration > 0 {
+		days = *p.Duration
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO subscriptions
+		(user_id, plan_id, plan_code, price_rub_snapshot, valid_until, payment_id, source_type)
+		SELECT $1,$2,$3,$4,
+			GREATEST(COALESCE(MAX(valid_until), now()), now()) + make_interval(days => $6), $5, 'payment'
+		FROM subscriptions WHERE user_id=$1 AND status='active'`,
+		p.UserID, p.PlanID, p.PlanCode, p.Price, p.ID, days)
+	return err
+}
+
 func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	secret := os.Getenv("TG_STARS_SECRET_TOKEN")
 	got := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
-	// Аудит C: сравнение за константное время (timing side-channel на !=).
 	if secret == "" || secret == "dev-only-stars" || len(got) != len(secret) ||
 		subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeBadSign, "Bad secret token")
@@ -273,91 +522,164 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	var upd tgUpdate
 	r.Body = http.MaxBytesReader(w, r.Body, apierr.MaxBody)
-	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil || upd.Message == nil || upd.Message.SuccessfulPayment == nil {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": true})
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&upd); err != nil || upd.Message == nil || upd.Message.SuccessfulPayment == nil {
+		writeWebhookIgnored(w, "malformed")
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeWebhookIgnored(w, "malformed")
 		return
 	}
 	sp := upd.Message.SuccessfulPayment
+	if sp.Currency != "XTR" || sp.TotalAmount <= 0 || sp.TotalAmount > 1000000 ||
+		!validUUID(sp.InvoicePayload) || !validOpaqueID(sp.TelegramPaymentCharge) ||
+		!validOpaqueID(sp.ProviderPaymentCharge) || upd.Message.From == nil || upd.Message.From.ID <= 0 {
+		writeWebhookIgnored(w, "validation")
+		return
+	}
 	ctx := r.Context()
-	// Аудит B: сверяем сумму/валюту/отправителя ДО начислений (раньше начисляли вслепую).
-	if sp.Currency != "XTR" {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": "currency"})
-		return
-	}
-	// ищем pending по payload=payment_id
-	var paymentID, userID, planCode, planID string
-	var duration *int
-	var expStars int
-	var ownerTg *int64
-	err := s.pg.QueryRow(ctx, `
-		SELECT p.id, p.user_id, p.plan_code, p.plan_id, pl.duration_days, p.stars, u.tg_id
-		  FROM payments p JOIN plans pl ON pl.id=p.plan_id JOIN users u ON u.id=p.user_id
-		 WHERE p.id=$1 AND p.status='pending'`, sp.InvoicePayload).Scan(&paymentID, &userID, &planCode, &planID, &duration, &expStars, &ownerTg)
-	if err != nil {
-		// уже обработан или чужой — идемпотентный ok (ретраи TG)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "duplicate": true})
-		return
-	}
-	if sp.TotalAmount != expStars || (upd.Message.From != nil && ownerTg != nil && upd.Message.From.ID != *ownerTg) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ignored": "amount_mismatch"})
-		return
-	}
 	tx, err := s.pg.Begin(ctx)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var updated bool
-	err = tx.QueryRow(ctx, `
-		UPDATE payments SET status='succeeded', provider_payment_id=$1, stars=$2
-		 WHERE id=$3 AND status='pending' RETURNING true`,
-		"tg:"+sp.TelegramPaymentCharge, sp.TotalAmount, paymentID).Scan(&updated)
-	if err != nil || !updated {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "duplicate": true})
+	p, err := s.loadWebhookPayment(ctx, tx, sp.InvoicePayload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeWebhookDuplicate(w)
 		return
 	}
-	if planCode == "single_99" {
-		// single_99 = 1 чтение ЛЮБОГО premium (spread_code='any'),
-		// гасится первым premium-чтением (см. readings T29-патч).
-		// S05: ошибка вставки → Rollback + 500 (ретрай TG даст duplicate, денег без услуги нет).
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO single_entitlements (user_id, spread_code, payment_id) VALUES ($1,'any',$2)`,
-			userID, paymentID); err != nil {
-			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка начисления")
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+		return
+	}
+	if p.Status == "succeeded" || p.Status == "refunded" {
+		if p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge {
+			_, _ = tx.Exec(ctx, `
+				UPDATE payments
+				   SET reconciliation_reason='duplicate_charge',
+				       note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN 'duplicate-charge' ELSE note || ' duplicate-charge' END
+				 WHERE id=$1`, p.ID)
+		}
+		writeWebhookDuplicate(w)
+		return
+	}
+	if p.Status == "refunding" || (p.Status == "reconciliation" && (p.ReconciliationReason == nil || *p.ReconciliationReason != "owner_unverified")) {
+		writeWebhookReconciliation(w)
+		return
+	}
+	if p.Status != "pending" && p.Status != "expired" && p.Status != "reconciliation" {
+		writeWebhookDuplicate(w)
+		return
+	}
+	if p.ownerTG == nil {
+		if err := s.markLateReconciliation(ctx, tx, p, sp, "owner_unverified"); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 			return
 		}
-	} else {
-		days := 30
-		if duration != nil && *duration > 0 {
-			days = *duration
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)
-			SELECT $1,$2,$3,(SELECT price_rub FROM plans WHERE id=$2),
-			       GREATEST(COALESCE(MAX(valid_until), now()), now()) + make_interval(days => $4)
-			  FROM subscriptions WHERE user_id=$1 AND status='active'`,
-			userID, planID, planCode, days); err != nil {
-			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка начисления")
+		if err := tx.Commit(ctx); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 			return
 		}
+		writeWebhookReconciliation(w)
+		return
+	}
+	if p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge {
+		writeWebhookIgnored(w, "charge_mismatch")
+		return
+	}
+	if p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge {
+		writeWebhookIgnored(w, "charge_mismatch")
+		return
+	}
+	if upd.Message.From.ID != *p.ownerTG {
+		if p.Status == "expired" {
+			if err := s.markLateReconciliation(ctx, tx, p, sp, "owner_mismatch"); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			if err := tx.Commit(ctx); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			writeWebhookReconciliation(w)
+			return
+		}
+		writeWebhookIgnored(w, "owner_mismatch")
+		return
+	}
+	if sp.TotalAmount != p.Stars {
+		if p.Status == "expired" {
+			if err := s.markLateReconciliation(ctx, tx, p, sp, "amount_mismatch"); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			if err := tx.Commit(ctx); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			writeWebhookReconciliation(w)
+			return
+		}
+		writeWebhookIgnored(w, "amount_mismatch")
+		return
+	}
+	var reused bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM payments WHERE provider='tg_stars' AND id<>$1
+		  AND (telegram_payment_charge_id=$2 OR provider_payment_charge_id=$3 OR provider_payment_id='tg:'||$2))`,
+		p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge).Scan(&reused); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+		return
+	}
+	if reused {
+		writeWebhookIgnored(w, "charge_reused")
+		return
+	}
+	late := p.Status == "expired" || p.Status == "reconciliation"
+	note := ""
+	if late {
+		note = "late-payment"
+	}
+	var updated bool
+	err = tx.QueryRow(ctx, `UPDATE payments
+		SET status='succeeded', provider_payment_id='tg:'||$2,
+			telegram_payment_charge_id=$2, provider_payment_charge_id=$3,
+			stars=$4, provider_verified_at=now(), paid_at=COALESCE(paid_at, now()),
+			reconciliation_reason=NULL,
+			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN NULLIF($5,'')
+				WHEN $5='' THEN note ELSE note || ' ' || $5 END
+		WHERE id=$1 AND status IN ('pending','expired','reconciliation')
+		  AND (reconciliation_reason IS NULL OR reconciliation_reason='owner_unverified')
+		  AND (telegram_payment_charge_id IS NULL OR telegram_payment_charge_id=$2)
+		  AND (provider_payment_charge_id IS NULL OR provider_payment_charge_id=$3)
+		RETURNING true`, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, sp.TotalAmount, note).Scan(&updated)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+		return
+	}
+	if !updated {
+		writeWebhookDuplicate(w)
+		return
+	}
+	if err := s.grantPaymentEntitlements(ctx, tx, p.storedPayment); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка начисления")
+		return
 	}
 	if err := tx.Commit(ctx); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if late {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "late": true})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-// HandleVerify — POST /v1/payments/stars/verify {payment_id} | {provider_payment_id} (см. D3).
-// Спека требует provider_payment_id — поддерживаем оба поля.
-// Webhook — источник правды; verify лишь отдает статус строки (кнопка «Я оплатил»).
 func (s *Service) HandleVerify(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PaymentID         string `json:"payment_id"`
@@ -368,38 +690,35 @@ func (s *Service) HandleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	uid := auth.UserID(r.Context())
 	var status string
+	var err error
 	if req.PaymentID != "" {
-		err := s.pg.QueryRow(r.Context(),
+		err = s.pg.QueryRow(r.Context(),
 			`SELECT status FROM payments WHERE id=$1 AND user_id=$2`, req.PaymentID, uid).Scan(&status)
-		if err != nil {
-			apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
-			return
-		}
 	} else if req.ProviderPaymentID != "" {
-		err := s.pg.QueryRow(r.Context(),
-			`SELECT status FROM payments WHERE provider_payment_id=$1 AND user_id=$2`,
-			req.ProviderPaymentID, uid).Scan(&status)
-		if err != nil {
-			apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
-			return
-		}
+		err = s.pg.QueryRow(r.Context(),
+			`SELECT status FROM payments WHERE user_id=$2
+			 AND (provider_payment_id=$1 OR provider_payment_charge_id=$1)`, req.ProviderPaymentID, uid).Scan(&status)
 	} else {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен payment_id")
+		return
+	}
+	if err != nil {
+		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": status})
 }
 
-// HandleAdminList — GET /v1/admin/payments?limit (только :8081, см. V19).
 func (s *Service) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 200 {
 		limit = n
 	}
 	rows, err := s.pg.Query(r.Context(), `
-		SELECT id, user_id, plan_code, price_rub_snapshot, provider, status, amount_rub, stars, note, created_at
-		  FROM payments ORDER BY created_at DESC LIMIT $1`, limit)
+		SELECT id, user_id, plan_code, price_rub_snapshot, provider, status, amount_rub, stars, note, created_at,
+		       COALESCE(refund_state, 'none'), reconciliation_reason
+		FROM payments ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить")
 		return
@@ -408,17 +727,22 @@ func (s *Service) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	type row struct {
 		ID, UserID, Plan, Provider, Status, Note, Created string
 		Price, Amount, Stars                              int
+		RefundState, ReconciliationReason                 string
 	}
 	out := []row{}
 	for rows.Next() {
 		var x row
 		var note *string
+		var reason *string
 		var ts time.Time
-		if err := rows.Scan(&x.ID, &x.UserID, &x.Plan, &x.Price, &x.Provider, &x.Status, &x.Amount, &x.Stars, &note, &ts); err != nil {
+		if err := rows.Scan(&x.ID, &x.UserID, &x.Plan, &x.Price, &x.Provider, &x.Status, &x.Amount, &x.Stars, &note, &ts, &x.RefundState, &reason); err != nil {
 			continue
 		}
 		if note != nil {
 			x.Note = *note
+		}
+		if reason != nil {
+			x.ReconciliationReason = *reason
 		}
 		x.Created = ts.Format(time.RFC3339)
 		out = append(out, x)
@@ -427,7 +751,6 @@ func (s *Service) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// ExpirePending — job: pending старше 15 мин → expired (вызывать тиком, см. T30/cron).
 func (s *Service) ExpirePending(ctx context.Context) (int64, error) {
 	res, err := s.pg.Exec(ctx,
 		`UPDATE payments SET status='expired' WHERE status='pending' AND created_at < now() - interval '15 minutes'`)
@@ -437,10 +760,209 @@ func (s *Service) ExpirePending(ctx context.Context) (int64, error) {
 	return res.RowsAffected(), nil
 }
 
-// HandleRefund — POST /v1/admin/refund {payment_id} (только :8081, см. T29).
-// refundStarPayment в TG + payments=refunded + subscriptions.valid_until -= duration.
-// Аудит C: двухфазно (succeeded→refunding→refunded) — внешний TG-вызов НЕ держит
-// строковый лок; повтор/рестарт упирается в guard и получает 409, не двойной возврат.
+func splitCharge(s string) []string {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		return []string{s[:i], s[i+1:]}
+	}
+	return []string{s}
+}
+
+func telegramCharge(p storedPayment) string {
+	if p.TelegramCharge != nil {
+		if !validOpaqueID(*p.TelegramCharge) {
+			return ""
+		}
+		return *p.TelegramCharge
+	}
+	parts := splitCharge(p.ProviderPaymentID)
+	if len(parts) == 2 && parts[0] == "tg" && validOpaqueID(parts[1]) {
+		return parts[1]
+	}
+	return ""
+}
+
+func (s *Service) startRefund(ctx context.Context, id string) (refundPayment, bool, error) {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return refundPayment{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	p, err := s.loadRefundPayment(ctx, tx, id, true)
+	if err != nil {
+		return refundPayment{}, false, err
+	}
+	if p.Status != "succeeded" {
+		if err := tx.Commit(ctx); err != nil {
+			return refundPayment{}, false, err
+		}
+		return p, false, nil
+	}
+	charge := telegramCharge(p.storedPayment)
+	tag, err := tx.Exec(ctx, `UPDATE payments
+		SET status='refunding', refund_state='requested', refund_requested_at=now(),
+			refund_attempted_at=NULL, refund_confirmed_at=NULL, refund_last_error=NULL,
+			reconciliation_reason=NULL
+		WHERE id=$1 AND status='succeeded'`, id)
+	if err != nil {
+		return refundPayment{}, false, err
+	}
+	if tag.RowsAffected() != 1 {
+		if err := tx.Commit(ctx); err != nil {
+			return refundPayment{}, false, err
+		}
+		return p, false, nil
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO payment_refunds
+		(payment_id, state, charge_id, requested_at, updated_at)
+		VALUES ($1,'requested',NULLIF($2,''),now(),now())
+		ON CONFLICT (payment_id) DO UPDATE SET state='requested', charge_id=EXCLUDED.charge_id,
+			requested_at=now(), submitted_at=NULL, confirmed_at=NULL, last_error=NULL, updated_at=now()`,
+		id, charge)
+	if err != nil {
+		return refundPayment{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return refundPayment{}, false, err
+	}
+	p.Status = "refunding"
+	p.RefundState = "requested"
+	p.refundTableState = "requested"
+	return p, true, nil
+}
+
+func (s *Service) updateRefundState(ctx context.Context, id, state, lastError string) error {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `UPDATE payment_refunds
+		SET state=$2, last_error=NULLIF($3,''), updated_at=now(),
+			confirmed_at=CASE WHEN $2='confirmed' THEN COALESCE(confirmed_at,now()) ELSE confirmed_at END
+		WHERE payment_id=$1`, id, state, lastError)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("refund attempt not found")
+	}
+	tag, err = tx.Exec(ctx, `UPDATE payments
+		SET refund_state=$2, refund_last_error=NULLIF($3,''),
+			reconciliation_reason=CASE WHEN $2='unknown' THEN 'refund_unknown' ELSE NULL END,
+			refund_confirmed_at=CASE WHEN $2='confirmed' THEN COALESCE(refund_confirmed_at,now()) ELSE refund_confirmed_at END
+		WHERE id=$1 AND status='refunding'`, id, state, lastError)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("refund payment state changed")
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) markRefundSubmitted(ctx context.Context, id string) error {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `UPDATE payment_refunds
+		SET state='submitted', submitted_at=now(), updated_at=now()
+		WHERE payment_id=$1 AND state='requested'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("refund attempt is not requestable")
+	}
+	tag, err = tx.Exec(ctx, `UPDATE payments
+		SET refund_state='submitted', refund_attempted_at=now()
+		WHERE id=$1 AND status='refunding' AND refund_state='requested'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("refund payment state changed")
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) finalizeRefund(ctx context.Context, id string) error {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var state string
+	var note *string
+	var duration *int
+	err = tx.QueryRow(ctx, `SELECT refund_state, note, duration_days_snapshot FROM payments WHERE id=$1 FOR UPDATE`, id).Scan(&state, &note, &duration)
+	if err != nil {
+		return err
+	}
+	if state != "confirmed" && state != "manual" {
+		return fmt.Errorf("refund is not ready")
+	}
+	suffix := ""
+	if state == "manual" {
+		suffix = "manual-no-tg-data"
+	}
+	tag, err := tx.Exec(ctx, `UPDATE payments
+		SET status='refunded',
+			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN NULLIF($2,'')
+				WHEN $2='' THEN note ELSE note || ' ' || $2 END
+		WHERE id=$1 AND status='refunding' AND refund_state IN ('confirmed','manual')`, id, suffix)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("refund state changed")
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM single_entitlements WHERE payment_id=$1`, id); err != nil {
+		return err
+	}
+	days := 30
+	if duration != nil && *duration > 0 {
+		days = *duration
+	}
+	if _, err := tx.Exec(ctx, `UPDATE subscriptions
+		SET valid_until=GREATEST(valid_until - make_interval(days => $2), now()),
+			status=CASE WHEN valid_until - make_interval(days => $2) <= now() THEN 'revoked' ELSE status END
+		WHERE payment_id=$1 AND status='active'`, id, days); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE payment_refunds SET updated_at=now() WHERE payment_id=$1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) respondExistingRefund(w http.ResponseWriter, r *http.Request, p refundPayment) {
+	switch p.Status {
+	case "refunded":
+		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
+	case "refunding":
+		state := p.refundTableState
+		if state == "" {
+			state = p.RefundState
+		}
+		if state == "confirmed" || state == "manual" {
+			if err := s.finalizeRefund(r.Context(), p.ID); err != nil {
+				apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "reconciled": true})
+			return
+		}
+		apierr.Write(w, http.StatusConflict, "REFUND_RECONCILIATION_REQUIRED", "Исход возврата не подтвержден; нужен ручной reconcile")
+	case "reconciliation":
+		apierr.Write(w, http.StatusConflict, "REFUND_RECONCILIATION_REQUIRED", "Платёж ожидает reconcile")
+	default:
+		apierr.Write(w, http.StatusConflict, "REFUND_NOT_SUCCEEDED", "Возврат доступен только после успешной оплаты")
+	}
+}
+
 func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PaymentID string `json:"payment_id"`
@@ -450,92 +972,78 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	var userID, planCode string
-	var duration *int
-	var tgCharge *string
-	err := s.pg.QueryRow(ctx, `
-		SELECT p.user_id, p.plan_code, pl.duration_days, NULLIF(p.provider_payment_id,'')
-		  FROM payments p JOIN plans pl ON pl.id=p.plan_id
-		 WHERE p.id=$1 AND p.status IN ('succeeded','refunding')`, req.PaymentID).Scan(&userID, &planCode, &duration, &tgCharge)
-	if err != nil {
+	current, err := s.loadRefundPayment(ctx, s.pg, req.PaymentID, false)
+	if errors.Is(err, pgx.ErrNoRows) {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
 		return
 	}
-	// Фаза 1: быстрая пометка refunding с guard — повтор упирается сюда, лока нет.
-	tag, err := s.pg.Exec(ctx,
-		`UPDATE payments SET status='refunding' WHERE id=$1 AND status IN ('succeeded','refunding')`, req.PaymentID)
-	if err != nil || tag.RowsAffected() == 0 {
-		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платеж не найден")
 		return
 	}
-	// TODO: user_id для refundStarPayment — tg_id юзера
-	var tgID *int64
-	_ = s.pg.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, userID).Scan(&tgID)
-	tgAttempted := false
-	if tgID != nil && tgCharge != nil {
-		charge := ""
-		if parts := splitCharge(*tgCharge); len(parts) == 2 {
-			charge = parts[1]
-		}
-		if charge != "" {
-		// D3: ошибка TG — 502 БЕЗ пометки refunded (раньше молча резали подписку!).
-		// Аудит C: откатываем и фазу 1 (refunding→succeeded) — повторная попытка чистая.
-		tgAttempted = true
-		if _, err := s.tgCall(ctx, "refundStarPayment", map[string]any{
-			"user_id": *tgID, "telegram_payment_charge_id": charge,
-		}); err != nil {
-			_, _ = s.pg.Exec(ctx,
-				`UPDATE payments SET status='succeeded' WHERE id=$1 AND status='refunding'`, req.PaymentID)
-			apierr.Write(w, http.StatusBadGateway, "TG_REFUND_FAILED", "Telegram не вернул Stars, подписка не тронута")
-			return
-		}
-		}
+	charge := telegramCharge(current.storedPayment)
+	hasOwner := current.ownerTG != nil && *current.ownerTG > 0
+	if current.Status == "succeeded" && charge != "" && hasOwner && !tgTokenReady() {
+		apierr.Write(w, http.StatusBadGateway, "TG_REFUND_FAILED", "Telegram не настроен, подписка не тронута")
+		return
 	}
-	days := 30
-	if duration != nil && *duration > 0 {
-		days = *duration
+	p, transitioned, err := s.startRefund(ctx, req.PaymentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Платеж не найден")
+		return
 	}
-	note := ""
-	if !tgAttempted {
-		// без TG-данных (старые/anon-платежи): только ручная пометка, след в note (см. D3)
-		note = "manual-no-tg-data"
-	}
-	// Фаза 2: финал короткой транзакцией с guard (строка уже refunding — наша).
-	tx, err := s.pg.Begin(ctx)
 	if err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	defer tx.Rollback(ctx)
-	tag, err = tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1 AND status='refunding'`,
-		req.PaymentID, note)
-	if err != nil || tag.RowsAffected() == 0 {
-		apierr.Write(w, http.StatusConflict, "ALREADY_REFUNDED", "Возврат уже оформлен")
+	if !transitioned {
+		s.respondExistingRefund(w, r, p)
 		return
 	}
-	// valid_until -= duration (min now); истекшие помечаем revoked (см. 02-functional/05)
-	if _, err := tx.Exec(ctx, `
-		UPDATE subscriptions
-		   SET valid_until = GREATEST(valid_until - make_interval(days => $3), now()),
-		       status = CASE WHEN valid_until - make_interval(days => $3) <= now() THEN 'revoked' ELSE status END
-		 WHERE user_id=$1 AND plan_code=$2 AND status='active'`,
-		userID, planCode, days); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось оформить возврат")
+	charge = telegramCharge(p.storedPayment)
+	chargeKnown := p.TelegramCharge != nil || strings.HasPrefix(p.ProviderPaymentID, "tg:")
+	if chargeKnown && charge == "" {
+		_ = s.updateRefundState(ctx, p.ID, "unknown", "invalid_telegram_charge")
+		apierr.Write(w, http.StatusConflict, "REFUND_RECONCILIATION_REQUIRED", "Данные возврата требуют reconcile")
 		return
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if charge == "" {
+		if err := s.updateRefundState(ctx, p.ID, "manual", ""); err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		if err := s.finalizeRefund(ctx, p.ID); err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		return
+	}
+	if p.ownerTG == nil || *p.ownerTG <= 0 {
+		_ = s.updateRefundState(ctx, p.ID, "unknown", "missing_telegram_owner")
+		apierr.Write(w, http.StatusConflict, "REFUND_RECONCILIATION_REQUIRED", "Владелец Telegram недоступен, нужен reconcile")
+		return
+	}
+	if err := s.markRefundSubmitted(ctx, p.ID); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	if _, err := s.tgCall(ctx, "refundStarPayment", map[string]any{
+		"user_id": *p.ownerTG, "telegram_payment_charge_id": charge,
+	}); err != nil {
+		_ = s.updateRefundState(ctx, p.ID, "unknown", "telegram_refund_unknown")
+		apierr.Write(w, http.StatusBadGateway, "REFUND_RECONCILIATION_REQUIRED", "Исход возврата не подтвержден, нужен reconcile")
+		return
+	}
+	if err := s.updateRefundState(ctx, p.ID, "confirmed", ""); err != nil {
+		apierr.Write(w, http.StatusBadGateway, "REFUND_RECONCILIATION_REQUIRED", "Возврат подтверждён провайдером, но finalize не завершён")
+		return
+	}
+	if err := s.finalizeRefund(ctx, p.ID); err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-}
-
-func splitCharge(s string) []string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ':' {
-			return []string{s[:i], s[i+1:]}
-		}
-	}
-	return []string{s}
 }

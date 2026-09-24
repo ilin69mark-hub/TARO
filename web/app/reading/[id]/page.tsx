@@ -12,8 +12,9 @@ async function load(id: string): Promise<Reading | null> {
   if (!READING_ID_RE.test(id)) return null;
   const base = process.env.API_INTERNAL_URL || "http://localhost:8080";
   try {
+    const requestHeaders = await headers();
     const res = await fetch(`${base}/v1/readings/${encodeURIComponent(id)}`, {
-      headers: { Cookie: headers().get("cookie") || "" },
+      headers: { Cookie: requestHeaders.get("cookie") || "" },
       cache: "no-store",
     });
     if (!res.ok) return null;
@@ -23,8 +24,9 @@ async function load(id: string): Promise<Reading | null> {
   }
 }
 
-export default async function ReadingPage({ params }: { params: { id: string } }) {
-  const r = await load(params.id);
+export default async function ReadingPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const r = await load(id);
   if (!r) {
     return (
       <main className="mx-auto max-w-md px-4 pt-8">

@@ -35,6 +35,7 @@ func TestE2EShareToken(t *testing.T) {
 	r := chi.NewRouter()
 	r.With(au.RequireAuth).Post("/v1/readings", svc.HandleCreate)
 	r.With(au.RequireAuth).Post("/v1/share", svc.HandleCreateShare)
+	r.With(au.RequireAuth).Post("/v1/share/revoke", svc.HandleRevokeShare)
 	r.Get("/v1/share/{token}", svc.HandleGetShare)
 	do := func(tok, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -106,5 +107,26 @@ func TestE2EShareToken(t *testing.T) {
 	_ = rd.Set(ctx, "sess:"+uid2, "x", auth.UserTTL).Err()
 	if rec := do(tok2, "POST", "/v1/share", `{"reading_id":"`+id+`"}`, nil); rec.Code != 404 {
 		t.Fatalf("foreign share: want 404 got %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(tok, "POST", "/v1/share/revoke", `{"reading_id":"`+id+`"}`, nil); rec.Code != 200 {
+		t.Fatalf("revoke: want 200 got %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do("", "GET", "/v1/share/"+tk["token"], "", nil); rec.Code != 404 {
+		t.Fatalf("revoked share: want 404 got %d", rec.Code)
+	}
+	rec = do(tok, "POST", "/v1/share", `{"reading_id":"`+id+`"}`, nil)
+	if rec.Code != 200 {
+		t.Fatalf("recreate share: %d %s", rec.Code, rec.Body.String())
+	}
+	var tk3 map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &tk3)
+	if tk3["token"] == "" || tk3["token"] == tk["token"] {
+		t.Fatalf("token was not rotated after revoke")
+	}
+	if _, err := pg.Exec(ctx, `UPDATE share_tokens SET expires_at=now()-interval '1 second' WHERE reading_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do("", "GET", "/v1/share/"+tk3["token"], "", nil); rec.Code != 404 {
+		t.Fatalf("expired share: want 404 got %d", rec.Code)
 	}
 }

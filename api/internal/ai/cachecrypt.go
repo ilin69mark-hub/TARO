@@ -33,6 +33,9 @@ func encKey() []byte {
 func sealCache(plain string) (string, error) {
 	key := encKey()
 	if key == nil {
+		if os.Getenv("AI_REQUIRE_CACHE_ENCRYPTION") == "1" {
+			return "", fmt.Errorf("cache encryption key is required")
+		}
 		return plain, nil
 	}
 	block, err := aes.NewCipher(key)
@@ -57,7 +60,10 @@ func openCache(stored string) (string, error) {
 		return "", nil
 	}
 	if !strings.HasPrefix(stored, encPrefix) {
-		return stored, nil // legacy plaintext
+		if os.Getenv("AI_REQUIRE_CACHE_ENCRYPTION") == "1" {
+			return "", fmt.Errorf("plaintext cache is disabled")
+		}
+		return stored, nil
 	}
 	key := encKey()
 	if key == nil {

@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+*.log
+*.md
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+coverage.out
+docs/
+deploy/
+backups/
+migrations/
+**/*_test.go

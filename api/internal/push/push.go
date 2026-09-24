@@ -70,7 +70,7 @@ func New(pg *pgxpool.Pool) *Service {
 // HandlePublicKey — GET /v1/push/public: VAPID-публичник (не секрет, см. U21).
 func (s *Service) HandlePublicKey(w http.ResponseWriter, _ *http.Request) {
 	key := os.Getenv("VAPID_PUBLIC_KEY")
-	if key == "" {
+	if !validVAPIDPublicKey(key) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Push не настроен")
 		return
 	}
@@ -120,6 +120,25 @@ func validEndpoint(ctx context.Context, raw string) error {
 	return nil
 }
 
+func validPushKey(value string, size int, prefix byte) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		raw, err = base64.URLEncoding.DecodeString(value)
+	}
+	if err != nil || len(raw) != size {
+		return false
+	}
+	return prefix == 0 || raw[0] == prefix
+}
+
+func validVAPIDPublicKey(value string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		raw, err = base64.URLEncoding.DecodeString(value)
+	}
+	return err == nil && len(raw) == 65 && raw[0] == 4
+}
+
 // isBlockedIP — private, loopback, link-local, multicast, unspecified.
 func isBlockedIP(ip net.IP) bool {
 	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
@@ -135,7 +154,8 @@ func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Endpoint) > 512 || len(req.P256DH) > 256 || len(req.Auth) > 128 ||
-		strings.ContainsRune(req.Endpoint, 0) || strings.ContainsRune(req.P256DH, 0) || strings.ContainsRune(req.Auth, 0) {
+		strings.ContainsRune(req.Endpoint, 0) || strings.ContainsRune(req.P256DH, 0) || strings.ContainsRune(req.Auth, 0) ||
+		!validPushKey(req.P256DH, 65, 4) || !validPushKey(req.Auth, 16, 0) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимые данные подписки")
 		return
 	}
@@ -143,12 +163,17 @@ func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимый endpoint")
 		return
 	}
-	_, err := s.pg.Exec(r.Context(), `
+	tag, err := s.pg.Exec(r.Context(), `
 		INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES ($1,$2,$3,$4)
-		ON CONFLICT (endpoint) DO UPDATE SET user_id=$1, p256dh=$3, auth=$4`,
+		ON CONFLICT (endpoint) DO UPDATE SET p256dh=$3, auth=$4
+		WHERE push_subscriptions.user_id=$1`,
 		uid, req.Endpoint, req.P256DH, req.Auth)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось подписать")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		apierr.Write(w, http.StatusConflict, "PUSH_ENDPOINT_OWNED", "Endpoint уже привязан к другому пользователю")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -446,7 +471,7 @@ func (s *Service) SendToUser(ctx context.Context, userID, title, body string) (s
 		if serr != nil {
 			continue
 		}
-		if st == http.StatusNotFound || st == http.StatusGone {
+		if st == http.StatusNotFound || st == http.StatusGone || st == http.StatusUnauthorized || st == http.StatusForbidden {
 			_, _ = s.pg.Exec(ctx, `DELETE FROM push_subscriptions WHERE endpoint=$1`, sub.Endpoint)
 			continue
 		}
@@ -467,9 +492,13 @@ func vapidKey() (*ecdsa.PrivateKey, error) {
 	if err != nil || len(b) != 32 {
 		return nil, fmt.Errorf("bad vapid key")
 	}
+	d := new(big.Int).SetBytes(b)
+	if d.Sign() <= 0 || d.Cmp(elliptic.P256().Params().N) >= 0 {
+		return nil, fmt.Errorf("bad vapid key")
+	}
 	priv := new(ecdsa.PrivateKey)
 	priv.PublicKey.Curve = elliptic.P256()
-	priv.D = new(big.Int).SetBytes(b)
+	priv.D = d
 	priv.PublicKey.X, priv.PublicKey.Y = priv.PublicKey.Curve.ScalarBaseMult(b)
 	return priv, nil
 }

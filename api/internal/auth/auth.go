@@ -6,6 +6,7 @@ package auth
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -33,6 +34,8 @@ const (
 	UserTTL = 30 * 24 * time.Hour
 	// AnonRegPerIPPerHour — антиферма: 20 reg/час/IP + капча с 21-й (см. 02-auth.md).
 	AnonRegPerIPPerHour = 20
+	TelegramAuthMaxAge  = 10 * time.Minute
+	maxFingerprintLen   = 64
 )
 
 // Service — auth-операции.
@@ -47,7 +50,7 @@ func New(pg *pgxpool.Pool, rd *redis.Client) *Service {
 }
 
 // VerifyInitData проверяет подпись Telegram WebApp initData (HMAC-SHA256, ключ WebAppData).
-// Возвращает tg_id. Протухший auth_date (>24ч) — ошибка.
+// Возвращает tg_id. auth_date проверяется на будущее и короткое окно свежести.
 // S01 fail-closed: пустой botToken отвергается, кроме явного TG_ALLOW_EMPTY=1 (dev/тесты).
 func VerifyInitData(initData, botToken string) (int64, error) {
 	if botToken == "" && os.Getenv("TG_ALLOW_EMPTY") != "1" {
@@ -70,7 +73,12 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 	if err != nil || ts == "" {
 		return 0, fmt.Errorf("missing auth_date")
 	}
-	if time.Since(time.Unix(unix, 0)) > 24*time.Hour {
+	authAt := time.Unix(unix, 0)
+	now := time.Now()
+	if authAt.After(now) {
+		return 0, fmt.Errorf("future auth_date")
+	}
+	if now.Sub(authAt) > TelegramAuthMaxAge {
 		return 0, fmt.Errorf("stale auth_date")
 	}
 	pairs := []string{}
@@ -86,7 +94,8 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 	macKey.Write([]byte(botToken))
 	mac := hmac.New(sha256.New, macKey.Sum(nil))
 	mac.Write([]byte(check))
-	if hex.EncodeToString(mac.Sum(nil)) != gotHash {
+	wantHash, err := hex.DecodeString(gotHash)
+	if err != nil || !hmac.Equal(wantHash, mac.Sum(nil)) {
 		return 0, fmt.Errorf("bad hash")
 	}
 	var user struct {
@@ -105,43 +114,97 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 	return user.ID, nil
 }
 
-// IssueJWT выпускает токен с sub=user_id.
-// S-fail-closed: пустой, dev-only и короткие секреты отвергаются.
-// AUDIT-EXCEPTION(E01): реальный JWT_SECRET задаёт владелец (см. docs/security-exceptions.yml).
-func IssueJWT(userID string, ttl time.Duration) (string, error) {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" || secret == "dev-only-secret" || len(secret) < 32 {
-		return "", fmt.Errorf("JWT_SECRET обязателен (длина >=32, без dev-значений)")
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": userID,
-		"exp": time.Now().Add(ttl).Unix(),
-		"iat": time.Now().Unix(),
-	})
-	return tok.SignedString([]byte(secret))
+type tokenClaims struct {
+	Subject string
+	SID     string
+	JTI     string
+	Legacy  bool
 }
 
-// ParseJWT проверяет токен, возвращает user_id.
-// Тот же fail-closed, что в IssueJWT.
-func ParseJWT(token string) (string, error) {
+func newTokenID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func jwtSecret() ([]byte, error) {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" || secret == "dev-only-secret" || len(secret) < 32 {
-		return "", fmt.Errorf("JWT_SECRET обязателен (длина >=32, без dev-значений)")
+		return nil, fmt.Errorf("JWT_SECRET обязателен (длина >=32, без dev-значений)")
+	}
+	return []byte(secret), nil
+}
+
+func IssueJWT(userID string, ttl time.Duration, sessionID ...string) (string, error) {
+	secret, err := jwtSecret()
+	if err != nil {
+		return "", err
+	}
+	if userID == "" || ttl <= 0 {
+		return "", fmt.Errorf("invalid token parameters")
+	}
+	jti, err := newTokenID()
+	if err != nil {
+		return "", err
+	}
+	sid := ""
+	legacy := len(sessionID) == 0
+	if legacy {
+		sid, err = newTokenID()
+		if err != nil {
+			return "", err
+		}
+	} else {
+		sid = sessionID[0]
+	}
+	now := time.Now()
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub":    userID,
+		"exp":    now.Add(ttl).Unix(),
+		"iat":    now.Unix(),
+		"jti":    jti,
+		"sid":    sid,
+		"legacy": legacy,
+	})
+	return tok.SignedString(secret)
+}
+
+func parseJWT(token string) (tokenClaims, error) {
+	secret, err := jwtSecret()
+	if err != nil {
+		return tokenClaims{}, err
 	}
 	tok, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
-		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+		if t.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("bad alg")
 		}
-		return []byte(secret), nil
+		return secret, nil
 	})
 	if err != nil || !tok.Valid {
-		return "", fmt.Errorf("bad token")
+		return tokenClaims{}, fmt.Errorf("bad token")
 	}
-	sub, _ := tok.Claims.(jwt.MapClaims)["sub"].(string)
+	claims, ok := tok.Claims.(jwt.MapClaims)
+	if !ok {
+		return tokenClaims{}, fmt.Errorf("bad claims")
+	}
+	sub, _ := claims["sub"].(string)
 	if sub == "" {
-		return "", fmt.Errorf("no sub")
+		return tokenClaims{}, fmt.Errorf("no sub")
 	}
-	return sub, nil
+	sid, _ := claims["sid"].(string)
+	jti, _ := claims["jti"].(string)
+	legacy, _ := claims["legacy"].(bool)
+	return tokenClaims{Subject: sub, SID: sid, JTI: jti, Legacy: legacy}, nil
+}
+
+func ParseJWT(token string) (string, error) {
+	claims, err := parseJWT(token)
+	if err != nil {
+		return "", err
+	}
+	return claims.Subject, nil
 }
 
 // writeCookie кладет JWT в cookie: HttpOnly; Secure; SameSite=None; Path=/.
@@ -180,16 +243,32 @@ func writeFpCookie(w http.ResponseWriter, fp string) {
 	})
 }
 
-// fpOf достает fingerprint: тело запроса приоритетно (первый вход/migration),
-// иначе httpOnly cookie (штатный путь — JS его не видит).
 func fpOf(r *http.Request, bodyFp string) string {
-	if bodyFp != "" {
-		return bodyFp
-	}
-	if c, err := r.Cookie(FpCookie); err == nil {
+	if c, err := r.Cookie(FpCookie); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return ""
+	return bodyFp
+}
+
+func validFingerprint(fp string, required bool) bool {
+	if fp == "" {
+		return !required
+	}
+	if len(fp) > maxFingerprintLen || strings.TrimSpace(fp) == "" {
+		return false
+	}
+	for i := 0; i < len(fp); i++ {
+		if fp[i] < 0x21 || fp[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func fingerprintsEqual(a, b string) bool {
+	ah := sha256.Sum256([]byte(a))
+	bh := sha256.Sum256([]byte(b))
+	return hmac.Equal(ah[:], bh[:])
 }
 
 // telegramRequest — POST /v1/auth/telegram {initData, fingerprint?}.
@@ -202,21 +281,18 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
-	if fp := fpOf(r, req.Fingerprint); len(fp) > 64 || strings.ContainsRune(fp, 0) {
+	fp := fpOf(r, req.Fingerprint)
+	if !validFingerprint(fp, false) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный fingerprint")
 		return
 	}
-	id, isNew, trialDays, err := s.TelegramLogin(r.Context(), req.InitData, fpOf(r, req.Fingerprint))
+	id, isNew, trialDays, err := s.TelegramLogin(r.Context(), req.InitData, fp)
 	if err != nil {
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeInvalidTg, "Не удалось подтвердить Telegram")
 		return
 	}
-	tok, err := IssueJWT(id, UserTTL)
+	tok, err := s.issueSession(r.Context(), id, UserTTL)
 	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
-		return
-	}
-	if err := s.rememberSession(r.Context(), id, UserTTL); err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
@@ -242,7 +318,8 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный uuid")
 		return
 	}
-	if fp := fpOf(r, req.Fingerprint); len(fp) > 64 || strings.ContainsRune(fp, 0) {
+	fp := fpOf(r, req.Fingerprint)
+	if !validFingerprint(fp, false) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный fingerprint")
 		return
 	}
@@ -250,7 +327,7 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 	if ip == "" {
 		ip = "unknown"
 	}
-	id, err := s.AnonLogin(r.Context(), req.UUID, fpOf(r, req.Fingerprint), ip)
+	id, err := s.AnonLogin(r.Context(), req.UUID, fp, ip)
 	if err != nil {
 		if err.Error() == "rate_limited" {
 			apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком много регистраций, попробуй позже")
@@ -260,15 +337,15 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 			apierr.Write(w, http.StatusForbidden, "FP_MISMATCH", "Устройство не узнано, войди через Telegram")
 			return
 		}
+		if err.Error() == "fingerprint_required" {
+			apierr.Write(w, http.StatusForbidden, "FP_REQUIRED", "Нужен fingerprint устройства")
+			return
+		}
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
 		return
 	}
-	tok, err := IssueJWT(id, UserTTL)
+	tok, err := s.issueSession(r.Context(), id, UserTTL)
 	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
-		return
-	}
-	if err := s.rememberSession(r.Context(), id, UserTTL); err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
@@ -279,34 +356,64 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "csrf_token": csrf})
 }
 
-// TelegramLogin: вход/регистрация по initData. Новому TG-юзерам — trial 3д (1 раз).
-// Возвращает user_id, is_new, trial_days(0|3).
 func (s *Service) TelegramLogin(ctx context.Context, initData, fingerprint string) (string, bool, int, error) {
+	if !validFingerprint(fingerprint, false) {
+		return "", false, 0, fmt.Errorf("invalid fingerprint")
+	}
 	tgID, err := VerifyInitData(initData, os.Getenv("TG_BOT_TOKEN"))
 	if err != nil {
 		return "", false, 0, err
 	}
-	var id string
-	var isNew bool
-	err = s.pg.QueryRow(ctx, `SELECT id FROM users WHERE tg_id=$1`, tgID).Scan(&id)
-	if err == pgx.ErrNoRows {
-		isNew = true
-		if err := s.pg.QueryRow(ctx,
-			`INSERT INTO users (tg_id, fingerprint) VALUES ($1,$2) RETURNING id`, tgID, fingerprint).Scan(&id); err != nil {
-			return "", false, 0, err
-		}
-	} else if err != nil {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
 		return "", false, 0, err
 	}
-	trialDays := 0
-	if isNew {
-		if granted, err := GrantTrial(ctx, s.pg, id, tgID, fingerprint); err != nil {
-			return "", false, 0, err
-		} else if granted {
-			trialDays = 3
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, tgID); err != nil {
+		return "", false, 0, err
+	}
+	var id, storedFP, status string
+	created := false
+	err = tx.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,''), status FROM users WHERE tg_id=$1 FOR UPDATE`, tgID).Scan(&id, &storedFP, &status)
+	if err == pgx.ErrNoRows {
+		err = tx.QueryRow(ctx,
+			`INSERT INTO users (tg_id, fingerprint) VALUES ($1,$2) ON CONFLICT (tg_id) WHERE tg_id IS NOT NULL DO NOTHING RETURNING id`, tgID, fingerprint).Scan(&id)
+		if err == nil {
+			created = true
+			storedFP = fingerprint
+			status = "active"
+		} else if err == pgx.ErrNoRows {
+			err = tx.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,''), status FROM users WHERE tg_id=$1 FOR UPDATE`, tgID).Scan(&id, &storedFP, &status)
 		}
 	}
-	return id, isNew, trialDays, nil
+	if err != nil {
+		return "", false, 0, err
+	}
+	if status != "active" {
+		return "", false, 0, fmt.Errorf("user inactive")
+	}
+	if !created {
+		if storedFP == "" && fingerprint != "" {
+			if _, err := tx.Exec(ctx, `UPDATE users SET fingerprint=$1 WHERE id=$2`, fingerprint, id); err != nil {
+				return "", false, 0, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", false, 0, err
+		}
+		return id, false, 0, nil
+	}
+	granted, days, err := grantTrialTx(ctx, tx, id, tgID, fingerprint)
+	if err != nil {
+		return "", false, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, 0, err
+	}
+	if !granted {
+		return id, true, 0, nil
+	}
+	return id, true, days, nil
 }
 
 // isUUID проверяет формат 8-4-4-4-12 hex без внешних зависимостей (см. S08).
@@ -329,18 +436,37 @@ func isUUID(s string) bool {
 	return true
 }
 
-// AnonLogin: вход/создание по uuid из localStorage. Лимит 20 reg/час/IP.
-// S08: uuid обязан быть валидным UUID (иначе 422 выше); при входе сверяем fingerprint:
-// чужой fingerprint на знакомом uuid → 403 (угон через XSS/расширение, см. аудит).
 func (s *Service) AnonLogin(ctx context.Context, uuid, fingerprint, ip string) (string, error) {
-	var id, storedFp string
-	err := s.pg.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,'') FROM users WHERE anon_uuid=$1`, uuid).Scan(&id, &storedFp)
+	if fingerprint == "" {
+		return "", fmt.Errorf("fingerprint_required")
+	}
+	if !validFingerprint(fingerprint, true) {
+		return "", fmt.Errorf("invalid fingerprint")
+	}
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var id, storedFP, status string
+	err = tx.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,''), status FROM users WHERE anon_uuid=$1 FOR UPDATE`, uuid).Scan(&id, &storedFP, &status)
 	if err == nil {
-		if storedFp != "" && fingerprint != "" && storedFp != fingerprint {
+		if status != "active" {
+			return "", fmt.Errorf("user inactive")
+		}
+		if fingerprint == "" {
+			return "", fmt.Errorf("fingerprint_required")
+		}
+		if storedFP != "" && !fingerprintsEqual(storedFP, fingerprint) {
 			return "", fmt.Errorf("fp_mismatch")
 		}
-		if storedFp == "" && fingerprint != "" {
-			_, _ = s.pg.Exec(ctx, `UPDATE users SET fingerprint=$1 WHERE id=$2`, fingerprint, id)
+		if storedFP == "" {
+			if _, err := tx.Exec(ctx, `UPDATE users SET fingerprint=$1 WHERE id=$2`, fingerprint, id); err != nil {
+				return "", err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", err
 		}
 		return id, nil
 	}
@@ -357,49 +483,119 @@ func (s *Service) AnonLogin(ctx context.Context, uuid, fingerprint, ip string) (
 	if n > AnonRegPerIPPerHour {
 		return "", fmt.Errorf("rate_limited")
 	}
-	if err := s.pg.QueryRow(ctx,
-		`INSERT INTO users (anon_uuid, fingerprint) VALUES ($1,$2) RETURNING id`, uuid, fingerprint).Scan(&id); err != nil {
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (anon_uuid, fingerprint) VALUES ($1,$2) ON CONFLICT (anon_uuid) WHERE anon_uuid IS NOT NULL DO NOTHING RETURNING id`, uuid, fingerprint).Scan(&id)
+	if err == pgx.ErrNoRows {
+		err = tx.QueryRow(ctx, `SELECT id, COALESCE(fingerprint,''), status FROM users WHERE anon_uuid=$1 FOR UPDATE`, uuid).Scan(&id, &storedFP, &status)
+		if err != nil {
+			return "", err
+		}
+		if status != "active" {
+			return "", fmt.Errorf("user inactive")
+		}
+		if fingerprint == "" {
+			return "", fmt.Errorf("fingerprint_required")
+		}
+		if storedFP != "" && !fingerprintsEqual(storedFP, fingerprint) {
+			return "", fmt.Errorf("fp_mismatch")
+		}
+		if storedFP == "" {
+			if _, err := tx.Exec(ctx, `UPDATE users SET fingerprint=$1 WHERE id=$2`, fingerprint, id); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
-// GrantTrial выдает trial_3d 1 раз на tg_id (несгораемый реестр trial_grants,
-// переживает DELETE юзера — раньше COUNT по subscriptions давал вечный trial, см. аудит B).
-// Возвращает granted. Идемпотентен: повторный вызов — false без дубля.
-func GrantTrial(ctx context.Context, pg *pgxpool.Pool, userID string, tgID int64, fingerprint string) (bool, error) {
-	// trial уже был на этот tg_id (включая удалённых юзеров)?
-	var n int
-	if err := pg.QueryRow(ctx,
-		`SELECT COUNT(*) FROM trial_grants WHERE tg_id=$1`, tgID).Scan(&n); err != nil {
-		return false, err
+type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func parseTrialConfig(raw json.RawMessage) (bool, int) {
+	var cfg struct {
+		Enabled *bool `json:"enabled"`
+		Days    *int  `json:"days"`
 	}
-	if n > 0 {
-		return false, nil
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return true, 3
+	}
+	enabled := true
+	if cfg.Enabled != nil {
+		enabled = *cfg.Enabled
+	}
+	days := 3
+	if cfg.Days != nil {
+		days = *cfg.Days
+	}
+	if days < 1 || days > 365 {
+		days = 3
+	}
+	return enabled, days
+}
+
+func trialSettings(ctx context.Context, q rowQuerier) (bool, int, error) {
+	var raw json.RawMessage
+	err := q.QueryRow(ctx, `SELECT value FROM app_config WHERE key='trial'`).Scan(&raw)
+	if err == pgx.ErrNoRows {
+		return true, 3, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	enabled, days := parseTrialConfig(raw)
+	return enabled, days, nil
+}
+
+func grantTrialTx(ctx context.Context, tx pgx.Tx, userID string, tgID int64, fingerprint string) (bool, int, error) {
+	enabled, days, err := trialSettings(ctx, tx)
+	if err != nil || !enabled {
+		return false, 0, err
+	}
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO trial_grants (tg_id, fingerprint, user_id) VALUES ($1,$2,$3)
+		 ON CONFLICT (tg_id) DO NOTHING`, tgID, fingerprint, userID)
+	if err != nil {
+		return false, 0, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, 0, nil
 	}
 	var planID string
-	if err := pg.QueryRow(ctx,
-		`SELECT id FROM plans WHERE code='trial_3d' AND is_active ORDER BY valid_from DESC LIMIT 1`).Scan(&planID); err != nil {
-		return false, err
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM (
+			SELECT DISTINCT ON (code) id, code, is_active
+			FROM plans WHERE code='trial_3d'
+			ORDER BY code, valid_from DESC
+		) latest WHERE latest.is_active`).Scan(&planID); err != nil {
+		return false, 0, err
 	}
-	if _, err := pg.Exec(ctx,
-		`INSERT INTO trial_grants (tg_id, fingerprint, user_id) VALUES ($1,$2,$3)
-		 ON CONFLICT (tg_id) DO NOTHING`, tgID, fingerprint, userID); err != nil {
-		return false, err
-	}
-	var inserted bool
-	if err := pg.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM trial_grants WHERE tg_id=$1 AND user_id=$2)`, tgID, userID).Scan(&inserted); err != nil {
-		return false, err
-	}
-	if !inserted {
-		return false, nil // race: другой запрос успел первым
-	}
-	_, err := pg.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)
-		 VALUES ($1,$2,'trial_3d',0, now() + interval '3 days')`, userID, planID)
+		 VALUES ($1,$2,'trial_3d',0, now() + make_interval(days => $3))`, userID, planID, days); err != nil {
+		return false, 0, err
+	}
+	return true, days, nil
+}
+
+func GrantTrial(ctx context.Context, pg *pgxpool.Pool, userID string, tgID int64, fingerprint string) (bool, error) {
+	tx, err := pg.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+	granted, _, err := grantTrialTx(ctx, tx, userID, tgID, fingerprint)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return granted, nil
 }

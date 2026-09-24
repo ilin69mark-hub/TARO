@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { ensureAuth } from "@/lib/auth";
 
 // История: последние 20, locked blur для старых free, поиск только premium (см. T12/T17).
 type Item = { id: string; spread: string; question: string; preview: string; created_at: string };
@@ -23,7 +24,7 @@ export default function HistoryPage() {
   }
 
   useEffect(() => {
-    load("");
+    void ensureAuth().then(() => load("")).catch(() => undefined);
   }, []);
 
   return (

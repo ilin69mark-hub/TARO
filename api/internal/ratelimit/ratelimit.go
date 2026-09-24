@@ -9,6 +9,7 @@
 package ratelimit
 
 import (
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -58,8 +59,12 @@ func New(rd *redis.Client) *Limiter {
 		{"/v1/readings", true, true, Rule{60, 10}},
 		{"/v1/spreads", false, false, Rule{60, 60}},
 		{"/v1/admin/", true, true, Rule{60, 30}},
-		{"/v1/share", false, false, Rule{60, 30}}, // публичное превью: доступность важнее строгости
-		{"/v1/referral/", true, true, Rule{60, 10}}, // перебор кодов (аудит D)
+		{"/v1/share", false, false, Rule{60, 30}},
+		{"/v1/referral/", true, true, Rule{60, 10}},
+		{"/v1/payments/", true, true, Rule{60, 10}},
+		{"/v1/diary", true, true, Rule{60, 30}},
+		{"/v1/push/", true, true, Rule{60, 20}},
+		{"/v1/me", true, true, Rule{60, 10}},
 	}
 	return l
 }
@@ -75,9 +80,19 @@ func keyPart(r *http.Request, byUser bool) string {
 			}
 		}
 	}
-	ip := r.Header.Get("X-Real-IP")
+	ip := strings.TrimSpace(r.Header.Get("X-Real-IP"))
 	if ip == "" {
-		ip = strings.Split(r.RemoteAddr, ":")[0]
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			ip = host
+		} else if parsed := net.ParseIP(strings.Trim(r.RemoteAddr, "[]")); parsed != nil {
+			ip = parsed.String()
+		}
+	}
+	if parsed := net.ParseIP(ip); parsed == nil {
+		ip = "unknown"
+	} else {
+		ip = parsed.String()
 	}
 	return "ip:" + ip
 }

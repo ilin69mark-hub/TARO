@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, csrf } from "@/lib/api";
+import { ensureAuth } from "@/lib/auth";
 import { applyCalm, isCalm } from "@/components/Legal";
 import PushOptIn from "@/components/PushOptIn";
 import PushPrefs from "@/components/PushPrefs";
@@ -23,10 +24,14 @@ export default function ProfilePage() {
   const [deleted, setDeleted] = useState(false);
 
   useEffect(() => {
-    api.get<Ent>("/entitlements/me").then(setEnt).catch(() => undefined);
-    api.get<Plan[]>("/plans").then(setPlans).catch(() => undefined);
-    api.get<Ref>("/referral/me").then(setRef).catch(() => undefined);
-    setCalm(isCalm());
+    void ensureAuth()
+      .then(() => {
+        void api.get<Ent>("/entitlements/me").then(setEnt).catch(() => undefined);
+        void api.get<Plan[]>("/plans").then(setPlans).catch(() => undefined);
+        void api.get<Ref>("/referral/me").then(setRef).catch(() => undefined);
+        setCalm(isCalm());
+      })
+      .catch(() => undefined);
   }, []);
 
   async function apply() {
