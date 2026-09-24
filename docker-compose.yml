@@ -91,6 +91,10 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      # Аудит D: публичные build-time vars — через args (не файлами в образ; секретам тут не место).
+      args:
+        NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-}
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
     restart: unless-stopped
     environment:
       API_INTERNAL_URL: http://api-public:8080

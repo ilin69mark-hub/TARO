@@ -78,7 +78,7 @@ func (g *Gateway) Enabled() bool {
 
 // LoadConfig читает app_config.ai (дефолты из сида T04).
 func (g *Gateway) LoadConfig(ctx context.Context) Config {
-	cfg := Config{Model: "openai/gpt-4o-mini", Fallback: "anthropic/claude-3-haiku", MaxTokens: 900, Temperature: 0.7}
+	cfg := Config{Model: "openai/gpt-4o-mini", Fallback: "anthropic/claude-3-haiku", MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 5000}
 	var raw json.RawMessage
 	if err := g.pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='ai'`).Scan(&raw); err != nil {
 		return cfg

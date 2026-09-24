@@ -515,11 +515,21 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	if offset < 0 {
+	offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+	if err != nil || offset < 0 || offset > 10000 {
+		if r.URL.Query().Get("offset") != "" {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный offset")
+			return
+		}
 		offset = 0
 	}
-	q := r.URL.Query().Get("q")
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if utf8.RuneCountInString(q) > 100 {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Слишком длинный поиск")
+		return
+	}
+	// Аудит D: экранируем wildcards (q=% матчил всё) — ESCAPE '\'.
+	q = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 	if q != "" {
 		var premium bool
 		_ = s.pg.QueryRow(ctx,
@@ -532,7 +542,7 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.pg.Query(ctx, `
 		SELECT id, spread_code, question, left(interpretation, 160), created_at
-		  FROM readings WHERE user_id=$1 AND status NOT IN ('cancelled','failed') AND ($3='' OR question ILIKE '%'||$3||'%')
+		  FROM readings WHERE user_id=$1 AND status NOT IN ('cancelled','failed') AND ($3='' OR question ILIKE '%'||$3||'%' ESCAPE '\')
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, q, offset)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить историю")

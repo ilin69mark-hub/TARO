@@ -8,6 +8,10 @@ FROM node:20-alpine AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Аудит D: NEXT_PUBLIC_* только через build-args (.env в образ не едет, см. .dockerignore).
+ARG NEXT_PUBLIC_BASE_URL=""
+ARG NEXT_PUBLIC_POSTHOG_KEY=""
+ENV NEXT_PUBLIC_BASE_URL=$NEXT_PUBLIC_BASE_URL NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
 RUN npm run build
 
 FROM node:20-alpine AS run

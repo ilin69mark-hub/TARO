@@ -293,7 +293,27 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 		return true
 	case "ab.price_month", "offers.winback", "trial", "referral", "spreads.seasonal", "payments.yookassa":
 		var m map[string]any
-		return json.Unmarshal(v, &m) == nil
+		if json.Unmarshal(v, &m) != nil {
+			return false
+		}
+		// Аудит D: числовые поля A/B и winback текут в цену инвойса — диапазоны обязательны.
+		num := func(k string) (float64, bool) {
+			f, ok := m[k].(float64)
+			return f, ok
+		}
+		if f, ok := num("control"); ok && (f <= 0 || f > 100000) {
+			return false
+		}
+		if f, ok := num("test"); ok && (f <= 0 || f > 100000) {
+			return false
+		}
+		if f, ok := num("split"); ok && (f < 0 || f > 100) {
+			return false
+		}
+		if f, ok := num("pct"); ok && (f < 0 || f > 90) {
+			return false
+		}
+		return true
 	case "copy.paywall_title", "copy.paywall_desc", "copy.paywall_cta":
 		var s string
 		if json.Unmarshal(v, &s) != nil || s == "" || len(s) > 500 || strings.Contains(s, "\x00") {

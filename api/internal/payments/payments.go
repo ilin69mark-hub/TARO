@@ -129,6 +129,11 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 			note = "winback-" + itoa(pct)
 		}
 	}
+	// Аудит D: цена/звёзды из конфигов обязаны быть положительными (иначе инвойс за копейки).
+	if price <= 0 || stars <= 0 || price > 1000000 || stars > 1000000 {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Платежи временно недоступны")
+		return
+	}
 	var paymentID string
 	_ = s.pg.QueryRow(ctx, `
 		SELECT id FROM payments WHERE user_id=$1 AND idempotency_key=$2

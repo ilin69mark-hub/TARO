@@ -97,15 +97,24 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 // HandleList — GET /v1/diary?limit&offset&mood.
 func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 || limit > 50 {
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 || limit > 50 {
 		limit = 20
 	}
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	if offset < 0 {
+	// Аудит D: offset без потолка — deep pagination грузит PG.
+	offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+	if err != nil || offset < 0 || offset > 10000 {
+		if r.URL.Query().Get("offset") != "" {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный offset")
+			return
+		}
 		offset = 0
 	}
 	mood := r.URL.Query().Get("mood")
+	if mood != "" && !moods[mood] {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный mood")
+		return
+	}
 	rows, err := s.pg.Query(r.Context(), `
 		SELECT id, reading_id, body, mood, created_at, updated_at FROM diary_entries
 		 WHERE user_id=$1 AND ($3='' OR mood=$3)
@@ -189,10 +198,21 @@ func (s *Service) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(e)
 }
 
-// HandleExport — POST /v1/diary/export: все свои записи одним JSON (см. V12).
+// HandleExport — POST /v1/diary/export: свои записи одним JSON (см. V12).
 // POST+CSRF намеренно: GET-ссылка позволяла cross-site триггер скачивания (см. аудит B).
+// Аудит D: cap 5000 строк — полный дамп без лимита клал воркер в OOM.
 func (s *Service) HandleExport(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
+	var n int
+	if err := s.pg.QueryRow(r.Context(),
+		`SELECT COUNT(*) FROM diary_entries WHERE user_id=$1`, uid).Scan(&n); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось выгрузить")
+		return
+	}
+	if n > 5000 {
+		apierr.Write(w, http.StatusRequestEntityTooLarge, apierr.CodeValidation, "Слишком много записей для выгрузки")
+		return
+	}
 	rows, err := s.pg.Query(r.Context(), `
 		SELECT id, reading_id, body, mood, created_at, updated_at FROM diary_entries
 		 WHERE user_id=$1 ORDER BY created_at`, uid)

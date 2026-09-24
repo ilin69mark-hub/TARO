@@ -1,0 +1,11 @@
+# Build-контекст: только код. Секреты (.env), git, доки и бэкапы в образ НЕ едут.
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+*.md
+docs/
+backups/
+*.log
+.DS_Store
