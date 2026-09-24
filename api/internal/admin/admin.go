@@ -1,5 +1,5 @@
 // Package admin — кабинет настроек на :8081 (см. docs/project-book/02-functional/07, D1).
-// Auth: taro_admin JWT 12ч (HttpOnly/Secure/SameSite=None) + role=admin в БД.
+// Auth: taro_admin JWT 12ч (HttpOnly/Secure/SameSite=Strict) + role=admin в БД.
 // Login: POST /v1/admin/login {initData} — TG-подпись + (role admin ИЛИ tg_id в ADMIN_TG_IDS).
 // Publish применяет diff + пишет admin_audit (см. D1).
 package admin
@@ -7,6 +7,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,6 +21,19 @@ import (
 	"taro/api/internal/auth"
 	"taro/api/internal/spreads"
 )
+
+// isLoopback — RemoteAddr с loopback (cron-токен только локально, см. S10).
+func isLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // PlansCacheKey — см. 04-architecture/05-cache-redis.md.
 const PlansCacheKey = "plans:active:v1"
@@ -106,17 +120,21 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: AdminCookie, Value: tok, Path: "/", MaxAge: int(AdminTTL.Seconds()),
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteNoneMode,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 // RequireAdmin — middleware: taro_admin JWT (sub=admin:<uid>) + живой sess:admin + роль.
-// S10: либо X-Admin-Token == ADMIN_API_TOKEN (cron/server-to-server, только с localhost).
+// S10: либо X-Admin-Token == ADMIN_API_TOKEN (cron/server-to-server, ТОЛЬКО с loopback).
 func (s *Service) RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if tok := os.Getenv("ADMIN_API_TOKEN"); tok != "" && r.Header.Get("X-Admin-Token") == tok {
+			if !isLoopback(r.RemoteAddr) {
+				apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+				return
+			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminCtxKey{}, "cron")))
 			return
 		}

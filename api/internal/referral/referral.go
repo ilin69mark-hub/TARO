@@ -12,12 +12,28 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taro/api/internal/apierr"
 	"taro/api/internal/auth"
 	"taro/api/internal/entitlements"
 )
+
+// grantBonusDaysTx — то же, что entitlements.GrantBonusDays, но внутри tx (атомарно с completed).
+func grantBonusDaysTx(ctx context.Context, tx pgx.Tx, userID, planCode string, days int) error {
+	var planID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM plans WHERE code=$1 AND is_active ORDER BY valid_from DESC LIMIT 1`, planCode).Scan(&planID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO subscriptions (user_id, plan_id, plan_code, price_rub_snapshot, valid_until)
+		 SELECT $1,$2,$3,0, GREATEST(COALESCE(MAX(valid_until), now()), now()) + make_interval(days => $4)
+		   FROM subscriptions WHERE user_id=$1 AND status='active'`,
+		userID, planID, planCode, days)
+	return err
+}
 
 const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // без похожих символов
 
@@ -128,42 +144,54 @@ func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 // CompleteOnFirstReading — хук после 1-го done-чтения (вызывать горутиной, не блокирует).
 // completed только при referee.tg_id NOT NULL + кап referrer 30д/мес.
 func (s *Service) CompleteOnFirstReading(ctx context.Context, refereeID string) {
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx)
 	var refID, referrer string
 	var bonus int
-	err := s.pg.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT id, referrer_id, bonus_days FROM referrals
-		  WHERE referee_id=$1 AND status='pending'`, refereeID).Scan(&refID, &referrer, &bonus)
+		  WHERE referee_id=$1 AND status='pending' FOR UPDATE`, refereeID).Scan(&refID, &referrer, &bonus)
 	if err != nil {
 		return // apply не было — нечего завершать
 	}
 	var tg *int64
-	_ = s.pg.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, refereeID).Scan(&tg)
+	_ = tx.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, refereeID).Scan(&tg)
 	if tg == nil {
-		_, _ = s.pg.Exec(ctx, `UPDATE referrals SET status='rejected' WHERE id=$1`, refID)
+		_, _ = tx.Exec(ctx, `UPDATE referrals SET status='rejected' WHERE id=$1 AND status='pending'`, refID)
+		_ = tx.Commit(ctx)
 		return // anon-ферма отрезана (см. 02-functional/06)
 	}
 	// кап referrer: 30д/календарный месяц
 	monthKey := time.Now().Format("2006-01")
 	var monthUsed int
-	_ = s.pg.QueryRow(ctx,
+	_ = tx.QueryRow(ctx,
 		`SELECT referral_bonus_month FROM entitlements WHERE user_id=$1 AND referral_bonus_month_key=$2`,
 		referrer, monthKey).Scan(&monthUsed)
 	if monthUsed+bonus > 30 {
-		_, _ = s.pg.Exec(ctx, `UPDATE referrals SET status='rejected' WHERE id=$1`, refID)
+		_, _ = tx.Exec(ctx, `UPDATE referrals SET status='rejected' WHERE id=$1 AND status='pending'`, refID)
+		_ = tx.Commit(ctx)
 		return
 	}
-	if err := s.en.GrantBonusDays(ctx, referrer, "referral_bonus", bonus); err != nil {
+	if err := grantBonusDaysTx(ctx, tx, referrer, "referral_bonus", bonus); err != nil {
 		return
 	}
-	if err := s.en.GrantBonusDays(ctx, refereeID, "referral_bonus", bonus); err != nil {
+	if err := grantBonusDaysTx(ctx, tx, refereeID, "referral_bonus", bonus); err != nil {
 		return
 	}
-	_, _ = s.pg.Exec(ctx, `UPDATE referrals SET status='completed' WHERE id=$1`, refID)
-	_, _ = s.pg.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `UPDATE referrals SET status='completed' WHERE id=$1 AND status='pending'`, refID); err != nil {
+		return
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO entitlements (user_id, referral_bonus_month, referral_bonus_month_key, referral_bonus_lifetime)
 		VALUES ($1,$2,$3,$2) ON CONFLICT (user_id) DO UPDATE SET
 		  referral_bonus_month = CASE WHEN entitlements.referral_bonus_month_key=$3
 		    THEN entitlements.referral_bonus_month + $2 ELSE $2 END,
 		  referral_bonus_month_key = $3,
-		  referral_bonus_lifetime = entitlements.referral_bonus_lifetime + $2`, referrer, bonus, monthKey)
+		  referral_bonus_lifetime = entitlements.referral_bonus_lifetime + $2`, referrer, bonus, monthKey); err != nil {
+		return
+	}
+	_ = tx.Commit(ctx)
 }

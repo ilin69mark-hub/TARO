@@ -176,10 +176,9 @@ func (g *Gateway) breakerOpen(ctx context.Context, model string) bool {
 // breakerFail фиксирует ошибку; при пороге — open на 5 мин. Возвращает open ли сейчас.
 func (g *Gateway) breakerFail(ctx context.Context, model string) {
 	key := breakerKey(model) + ":fails"
-	n, _ := g.rd.Incr(ctx, key).Result()
-	if n == 1 {
-		_ = g.rd.Expire(ctx, key, time.Minute).Err()
-	}
+	n, _ := g.rd.Eval(ctx,
+		`local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return n`,
+		[]string{key}, 60).Int()
 	if n >= BreakerThreshold {
 		_ = g.rd.Set(ctx, breakerKey(model), "open", BreakerOpen).Err()
 		_ = g.rd.Del(ctx, key).Err()

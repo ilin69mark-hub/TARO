@@ -16,6 +16,7 @@ import (
 	"taro/api/internal/me"
 	"taro/api/internal/payments"
 	"taro/api/internal/push"
+	"taro/api/internal/ratelimit"
 	"taro/api/internal/store"
 )
 
@@ -37,6 +38,8 @@ func main() {
 	pu := push.New(pg)
 
 	r := chi.NewRouter()
+	// Лимиты и Origin-гейт — как на public (см. S10): login без троттлинга брутфорсится.
+	r.Use(ratelimit.New(rd).Middleware)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","api":"admin"}`))

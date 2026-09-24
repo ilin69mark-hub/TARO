@@ -38,7 +38,9 @@ type Limiter struct {
 	rules []struct {
 		prefix string
 		byUser bool
-		rule   Rule
+		// failClosed: при ошибке Redis — 503 (auth/readings/admin), иначе пропуск (spreads).
+		failClosed bool
+		rule       Rule
 	}
 }
 
@@ -48,12 +50,14 @@ func New(rd *redis.Client) *Limiter {
 	l.rules = []struct {
 		prefix string
 		byUser bool
-		rule   Rule
+		// failClosed: при ошибке Redis — 503 (auth/readings/admin), иначе пропуск (spreads).
+		failClosed bool
+		rule       Rule
 	}{
-		{"/v1/auth/", false, Rule{60, 20}},
-		{"/v1/readings", true, Rule{60, 10}},
-		{"/v1/spreads", false, Rule{60, 60}},
-		{"/v1/admin/", true, Rule{60, 30}},
+		{"/v1/auth/", false, true, Rule{60, 20}},
+		{"/v1/readings", true, true, Rule{60, 10}},
+		{"/v1/spreads", false, false, Rule{60, 60}},
+		{"/v1/admin/", true, true, Rule{60, 30}},
 	}
 	return l
 }
@@ -77,8 +81,7 @@ func keyPart(r *http.Request, byUser bool) string {
 }
 
 // Middleware проверяет лимит по первому совпавшему префиксу.
-// S03: ошибка Redis → fail-open (пропустить + залогировать): иначе лежащий Redis
-// превращается в DoS-усилитель (429 всем).
+// Ошибка Redis: failClosed-правила (auth/readings/admin) — 503, spreads — пропуск.
 func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, rl := range l.rules {
@@ -89,6 +92,10 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			ok, err := l.rd.Eval(r.Context(), windowLua,
 				[]string{key}, rl.rule.Max, rl.rule.Window).Int()
 			if err != nil {
+				if rl.failClosed {
+					apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}

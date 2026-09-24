@@ -67,9 +67,9 @@ func (s *Service) tgCall(ctx context.Context, method string, params map[string]a
 	return out.Result, nil
 }
 
-// HandleInvoice — POST /v1/payments/stars/invoice {plan_code[, provider][, idempotency_key]}.
-// Идемпотентность (см. D3): повтор с тем же ключом <15мин возвращает тот же payment_id
-// (новый invoice_link, строка одна — дублей pending нет).
+// HandleInvoice — POST /v1/payments/stars/invoice {plan_code, idempotency_key[, provider]}.
+// Идемпотентность (см. D3): ключ ОБЯЗАТЕЛЕН (422 без него); повтор с тем же ключом <15мин
+// возвращает тот же payment_id (новый invoice_link, строка одна — дублей pending нет).
 // provider: tg_stars (дефолт) | yookassa (501 без KYC, см. V15). Провайдеры — см. providers.go (V13).
 func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
@@ -84,6 +84,10 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	if !apierr.Decode(w, r, &req) || req.PlanCode == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен plan_code")
+		return
+	}
+	if req.IdempotencyKey == "" || len(req.IdempotencyKey) > 64 {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен idempotency_key (1..64)")
 		return
 	}
 	prov := req.Provider
@@ -125,16 +129,14 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var paymentID string
-	if req.IdempotencyKey != "" {
-		_ = s.pg.QueryRow(ctx, `
-			SELECT id FROM payments WHERE user_id=$1 AND idempotency_key=$2
-			 AND status='pending' AND created_at > now() - interval '15 minutes'`,
-			uid, req.IdempotencyKey).Scan(&paymentID)
-	}
+	_ = s.pg.QueryRow(ctx, `
+		SELECT id FROM payments WHERE user_id=$1 AND idempotency_key=$2
+		 AND status='pending' AND created_at > now() - interval '15 minutes'`,
+		uid, req.IdempotencyKey).Scan(&paymentID)
 	if paymentID == "" {
 		err = s.pg.QueryRow(ctx, `
 			INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, note, idempotency_key)
-			VALUES ($1,$2,$3,$4,'tg_stars','pending:'||gen_random_uuid(),$4,$5,'pending',NULLIF($6,''),NULLIF($7,''))
+			VALUES ($1,$2,$3,$4,'tg_stars','pending:'||gen_random_uuid(),$4,$5,'pending',NULLIF($6,''),$7)
 			ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 			RETURNING id`, uid, planID, req.PlanCode, price, stars, note, req.IdempotencyKey).Scan(&paymentID)
 		if err != nil {
@@ -464,15 +466,31 @@ func (s *Service) HandleRefund(w http.ResponseWriter, r *http.Request) {
 		// без TG-данных (старые/anon-платежи): только ручная пометка, след в note (см. D3)
 		note = "manual-no-tg-data"
 	}
-	_, _ = s.pg.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1`,
-		req.PaymentID, note)
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE payments SET status='refunded', note=COALESCE(note || ' ', '') || $2 WHERE id=$1`,
+		req.PaymentID, note); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось оформить возврат")
+		return
+	}
 	// valid_until -= duration (min now); истекшие помечаем revoked (см. 02-functional/05)
-	_, _ = s.pg.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		UPDATE subscriptions
 		   SET valid_until = GREATEST(valid_until - make_interval(days => $3), now()),
 		       status = CASE WHEN valid_until - make_interval(days => $3) <= now() THEN 'revoked' ELSE status END
 		 WHERE user_id=$1 AND plan_code=$2 AND status='active'`,
-		userID, planCode, days)
+		userID, planCode, days); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось оформить возврат")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }

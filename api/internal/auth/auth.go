@@ -305,12 +305,11 @@ func (s *Service) AnonLogin(ctx context.Context, uuid, fingerprint, ip string) (
 		return "", err
 	}
 	key := "rl:reg:" + ip
-	n, err := s.rd.Incr(ctx, key).Result()
+	n, err := s.rd.Eval(ctx,
+		`local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return n`,
+		[]string{key}, 3600).Int()
 	if err != nil {
 		return "", err
-	}
-	if n == 1 {
-		_ = s.rd.Expire(ctx, key, time.Hour).Err()
 	}
 	if n > AnonRegPerIPPerHour {
 		return "", fmt.Errorf("rate_limited")

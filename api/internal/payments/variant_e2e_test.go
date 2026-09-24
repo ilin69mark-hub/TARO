@@ -90,7 +90,7 @@ func TestE2EVariantWinback(t *testing.T) {
 	}
 	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='offers.winback'`)
 	// invoice без bot-ключа → 500, но строка с winback-ценой создана
-	if rec := do("POST", "/v1/payments/stars/invoice", `{"plan_code":"month_299"}`); rec.Code != 500 {
+	if rec := do("POST", "/v1/payments/stars/invoice", `{"plan_code":"month_299","idempotency_key":"winback-e2e-1"}`); rec.Code != 500 {
 		t.Fatalf("invoice dev: want 500 got %d", rec.Code)
 	}
 	var price int

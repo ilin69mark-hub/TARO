@@ -191,8 +191,14 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if v.Reason == "single" {
-		_, _ = s.pg.Exec(ctx,
+		tag, err := s.pg.Exec(ctx,
 			`UPDATE single_entitlements SET consumed_reading_id=$1 WHERE id=$2 AND consumed_reading_id IS NULL`, id, v.SingleID)
+		if err != nil || tag.RowsAffected() == 0 {
+			// race: второй запрос потребил single первым — откатываем pending и просим оплатить
+			_, _ = s.pg.Exec(ctx, `UPDATE readings SET status='cancelled' WHERE id=$1`, id)
+			s.writePaywall(w, r)
+			return
+		}
 	}
 	// SSE + живой AI: стримим токены по мере генерации (tee в HTTP и в аккумулятор).
 	// Иначе: догенерируем синхронно и отдаем JSON {reading_id}.
