@@ -41,6 +41,8 @@ services:
       # Секреты — только env хоста (на VPS задаются в окружении, никогда в git).
       # :-dev_only — только для локалки; в проде compose упадет? Нет — Go упадет
       # с понятной ошибкой "JWT_SECRET обязателен" (см. internal/auth).
+      # AUDIT-EXCEPTION(E01,E02,E03): dev-дефолты ниже — только для локалки.
+      # Прод без реальных env не запускать (см. docs/security-exceptions.yml).
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
       TG_STARS_SECRET_TOKEN: ${TG_STARS_SECRET_TOKEN:-dev-only-stars}

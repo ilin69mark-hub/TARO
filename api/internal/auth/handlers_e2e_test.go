@@ -69,7 +69,7 @@ func doAuth(r *chi.Mux, tok, method, path, body, csrf string) *httptest.Response
 
 func TestE2EAuthHandlers(t *testing.T) {
 	t.Setenv("TG_BOT_TOKEN", "test-bot")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", "test-secret-0123456789abcdef0123456789")
 	r, svc := authRouter(t)
 	// dev-Redis общий: чистим rate-ключи (иначе 20 reg/час бьет по своим же прогонам)
 	{

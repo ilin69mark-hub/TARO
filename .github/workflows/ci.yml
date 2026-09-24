@@ -52,7 +52,7 @@ jobs:
     env:
       DATABASE_URL: postgres://taro:ci-only@localhost:5432/taro?sslmode=disable
       REDIS_ADDR: localhost:6379
-      JWT_SECRET: ci-only-secret
+      JWT_SECRET: ci-only-secret-0123456789abcdef0123456789
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -79,3 +79,9 @@ jobs:
       - run: test ! -e .env || (echo ".env committed!" && exit 1)
       - run: test -z "$(grep -rn '11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo' --exclude-dir=.git . || true)"
       - run: test -z "$(git ls-files | grep -E '(^|/)\.env$' || true)"
+      # Реестр исключений: каждый AUDIT-EXCEPTION(E0x) в коде обязан иметь парный id в yml
+      - run: |
+          for id in $(grep -rhoE 'AUDIT-EXCEPTION\(E[0-9]+\)' --exclude-dir=.git . | grep -oE 'E[0-9]+' | sort -u); do
+            grep -q "id: $id" docs/security-exceptions.yml || (echo "exception $id без записи в yml!" && exit 1)
+          done
+          echo "exceptions OK"

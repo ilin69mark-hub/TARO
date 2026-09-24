@@ -53,6 +53,9 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 	if botToken == "" && os.Getenv("TG_ALLOW_EMPTY") != "1" {
 		return 0, fmt.Errorf("no bot token")
 	}
+	if botToken == "dev-only-bot" && os.Getenv("TG_ALLOW_DEV_BOT") != "1" {
+		return 0, fmt.Errorf("dev bot token запрещён в проде")
+	}
 	q, err := url.ParseQuery(initData)
 	if err != nil {
 		return 0, fmt.Errorf("bad initData: %w", err)
@@ -103,10 +106,12 @@ func VerifyInitData(initData, botToken string) (int64, error) {
 }
 
 // IssueJWT выпускает токен с sub=user_id.
+// S-fail-closed: пустой, dev-only и короткие секреты отвергаются.
+// AUDIT-EXCEPTION(E01): реальный JWT_SECRET задаёт владелец (см. docs/security-exceptions.yml).
 func IssueJWT(userID string, ttl time.Duration) (string, error) {
 	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		return "", fmt.Errorf("JWT_SECRET обязателен")
+	if secret == "" || secret == "dev-only-secret" || len(secret) < 32 {
+		return "", fmt.Errorf("JWT_SECRET обязателен (длина >=32, без dev-значений)")
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": userID,
@@ -117,10 +122,11 @@ func IssueJWT(userID string, ttl time.Duration) (string, error) {
 }
 
 // ParseJWT проверяет токен, возвращает user_id.
+// Тот же fail-closed, что в IssueJWT.
 func ParseJWT(token string) (string, error) {
 	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		return "", fmt.Errorf("JWT_SECRET обязателен")
+	if secret == "" || secret == "dev-only-secret" || len(secret) < 32 {
+		return "", fmt.Errorf("JWT_SECRET обязателен (длина >=32, без dev-значений)")
 	}
 	tok, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
 		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
