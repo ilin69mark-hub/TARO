@@ -14,7 +14,7 @@ function fwd(res: Response) {
   );
 }
 
-import { fwdHeaders } from "@/lib/proxy";
+import { fwdHeaders, bodyTooLarge, tooLarge } from "@/lib/proxy";
 
 const headers = (req: NextRequest) => fwdHeaders(req);
 
@@ -30,6 +30,7 @@ export async function GET(req: NextRequest) {
 
 // POST /api/diary → Go.
 export async function POST(req: NextRequest) {
+  if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
   const res = await fetch(`${GO}/v1/diary`, { method: "POST", headers: headers(req), body });
   return fwd(res);

@@ -25,3 +25,16 @@ export async function passThrough(res: Response) {
   });
   return out;
 }
+
+// bodyTooLarge — 413 до чтения тела (аудит D: 10MB initData буферились Нодой целиком).
+// Без content-length пропускаем (Go отрежет своим 1MB) — ложных 413 не будет.
+export function bodyTooLarge(req: NextRequest, limit = 1_048_576): boolean {
+  const len = req.headers.get("content-length");
+  if (len === null) return false;
+  const n = Number(len);
+  return !Number.isFinite(n) || n < 0 || n > limit;
+}
+
+export function tooLarge() {
+  return NextResponse.json({ error: { message_ru: "Слишком большое тело" } }, { status: 413 });
+}

@@ -29,12 +29,22 @@ func New(pg *pgxpool.Pool, rd *redis.Client) *Service {
 	return &Service{pg: pg, rd: rd}
 }
 
-// HandleDelete — DELETE /v1/me: стирает все + гасит cookie. Ответ 200.
+// HandleDelete — DELETE /v1/me {"confirm": user_id}: стирает все + гасит cookie.
+// Аудит D: confirm обязателен (один CSRF-запрос больше не удаляет необратимо).
 func (s *Service) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	// Аудит D: confirm="DELETE" обязателен (защита от случайного/повторного вызова;
+	// от CSRF защищает X-CSRF-токен, здесь — от необратимости по ошибке).
+	if !apierr.Decode(w, r, &req) || req.Confirm != "DELETE" {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужно подтверждение удаления")
+		return
+	}
 	ctx := r.Context()
-	// Redis: sess + все ent/love ключи юзера (SCAN, не KEYS — см. 05-cache-redis.md)
-	_ = s.rd.Del(ctx, "sess:"+uid).Err()
+	// Redis: sess + csrf + admin-sess + все ent/love ключи юзера (SCAN, не KEYS)
+	_ = s.rd.Del(ctx, "sess:"+uid, "csrf:"+uid, "sess:admin:"+uid).Err()
 	var cursor uint64
 	for {
 		keys, next, err := s.rd.Scan(ctx, cursor, "ent:"+uid+":*", 100).Result()

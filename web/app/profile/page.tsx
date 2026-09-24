@@ -112,11 +112,14 @@ export default function ProfilePage() {
         <button
           onClick={async () => {
             if (!confirm("Удалить все мои данные? Это необратимо.")) return;
-            await fetch("/api/me", {
+            if (prompt("Введи СЛОВО DELETE для подтверждения:") !== "DELETE") return;
+            const res = await fetch("/api/me", {
               method: "DELETE",
               credentials: "include",
-              headers: { "X-CSRF": csrf() },
+              headers: { "Content-Type": "application/json", "X-CSRF": csrf() },
+              body: JSON.stringify({ confirm: "DELETE" }),
             }).catch(() => undefined);
+            if (!res?.ok) return;
             try {
               localStorage.clear();
             } catch {

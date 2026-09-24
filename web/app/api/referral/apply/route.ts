@@ -3,10 +3,11 @@ import { NextRequest } from "next/server";
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
-import { fwdHeaders } from "@/lib/proxy";
+import { fwdHeaders, bodyTooLarge, tooLarge } from "@/lib/proxy";
 
 // POST /api/referral/apply → Go.
 export async function POST(req: NextRequest) {
+  if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
   const res = await fetch(`${GO}/v1/referral/apply`, {
     method: "POST",

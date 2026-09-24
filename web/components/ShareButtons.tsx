@@ -4,11 +4,11 @@ import { useEffect, useState } from "react";
 import { track, events } from "@/lib/analytics";
 
 // Кнопки шеринга результата (см. U13): TG-поделиться + копировать ссылку.
-// Приватная ссылка /share/:token (без PII в URL); пока токен грузится — legacy ?q=.
+// Только приватная ссылка /share/:token (аудит D: legacy ?q= тёк PII — удалён).
+// Без readingId/токена кнопки не рендерим вообще (нечем делиться без утечки).
 import { csrf } from "@/lib/api";
 
 export default function ShareButtons({
-  question,
   spread,
   readingId,
 }: {
@@ -21,6 +21,7 @@ export default function ShareButtons({
 
   // Токен стабилен на расклад (сервер), StrictMode double-effect безопасен.
   useEffect(() => {
+    if (!readingId) return;
     let live = true;
     fetch("/api/share", {
       method: "POST",
@@ -39,11 +40,7 @@ export default function ShareButtons({
   }, [readingId]);
 
   function link(): string {
-    if (token) return new URL(`/share/${token}`, window.location.origin).toString();
-    const url = new URL("/share", window.location.origin);
-    if (question) url.searchParams.set("q", question.slice(0, 80));
-    url.searchParams.set("s", spread.slice(0, 40));
-    return url.toString();
+    return new URL(`/share/${token}`, window.location.origin).toString();
   }
 
   function done() {
@@ -66,7 +63,10 @@ export default function ShareButtons({
     }
   }
 
-  const tg = `https://t.me/share/url?url=${encodeURIComponent(typeof window !== "undefined" ? link() : "")}`;
+  const tg = `https://t.me/share/url?url=${encodeURIComponent(typeof window !== "undefined" && token ? link() : "")}`;
+
+  // Нет токена — нечем делиться без утечки PII: ничего не рендерим.
+  if (!token) return null;
 
   return (
     <div className="mt-4 flex gap-2">

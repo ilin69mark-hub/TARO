@@ -76,8 +76,12 @@ func TestE2EDeleteMe(t *testing.T) {
 		`INSERT INTO readings (user_id, spread_code, question, cards, seed, status) VALUES ($1,'daily','q','[]',1,'done')`, uid); err != nil {
 		t.Fatal(err)
 	}
+	// delete без confirm → 422
+	if rec := call("DELETE", "/v1/me", ``, tok); rec.Code != 422 {
+		t.Fatalf("delete noconfirm: want 422 got %d", rec.Code)
+	}
 	// delete
-	if rec := call("DELETE", "/v1/me", ``, tok); rec.Code != 200 {
+	if rec := call("DELETE", "/v1/me", `{"confirm":"DELETE"}`, tok); rec.Code != 200 {
 		t.Fatalf("delete: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
 	var users, readings int

@@ -152,7 +152,12 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if err := mergeCountersTx(ctx, tx, other, current); err != nil {
 		return "", false, err
 	}
-	// Аудит C: перенос мог продублировать trial_3d (у обоих был) — оставляем max valid_until.
+	// Аудит D: перенос мог создать self-referral (other реферрил current) — режем,
+	// иначе CompleteOnFirstReading платит двойной бонус на один кошелёк.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM referrals WHERE referrer_id=$1 AND referee_id=$1`, other); err != nil {
+		return "", false, err
+	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM subscriptions s USING subscriptions keep
 		 WHERE s.user_id=$1 AND s.plan_code='trial_3d'

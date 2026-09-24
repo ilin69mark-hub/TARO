@@ -24,7 +24,7 @@ if ! gzip -t "$FILE"; then
   exit 1
 fi
 chmod 600 "$FILE"
-# Шифрование (E09): если задан BACKUP_GPG_KEY — шифруем и удаляем plaintext.
+# Шифрование (E09 + AUDIT-EXCEPTION(E09)): если задан BACKUP_GPG_KEY — шифруем и удаляем plaintext.
 if [ -n "${BACKUP_GPG_KEY:-}" ]; then
   gpg --batch --yes --trust-model always -r "$BACKUP_GPG_KEY" -e -o "$FILE.gpg" "$FILE" \
     && rm -f "$FILE" && FILE="$FILE.gpg"

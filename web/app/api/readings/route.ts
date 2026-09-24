@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
-import { fwdHeaders } from "@/lib/proxy";
+import { fwdHeaders, bodyTooLarge, tooLarge } from "@/lib/proxy";
 
 // GET /api/readings?limit&offset&q → Go (cookie дальше, q только premium — 403 иначе).
 export async function GET(req: NextRequest) {
@@ -21,6 +21,7 @@ export async function GET(req: NextRequest) {
 // POST /api/readings → Go. SSE проксируется потоком (no-store),
 // JSON — как есть. Idempotency-Key уходит дальше (см. T12).
 export async function POST(req: NextRequest) {
+  if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
   const headers: Record<string, string> = fwdHeaders(req);
   const accept = req.headers.get("accept") || "";

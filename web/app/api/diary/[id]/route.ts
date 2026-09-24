@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
 
-import { fwdHeaders } from "@/lib/proxy";
+import { fwdHeaders, bodyTooLarge, tooLarge } from "@/lib/proxy";
 
 const headers = (req: NextRequest) => fwdHeaders(req);
 
@@ -35,6 +35,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
 // PUT /api/diary/:id → Go.
 export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
   if (!ID_RE.test(params.id)) return badId();
+  if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
   const res = await fetch(`${GO}/v1/diary/${encodeURIComponent(params.id)}`, {
     method: "PUT",

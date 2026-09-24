@@ -251,6 +251,19 @@ func (s *Service) eveningTargets(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// logOnce пишет строку лога один раз на (user, kind, сутки MSK).
+// Возвращает true если это первая отправка (можно слать), false — дубль.
+func (s *Service) logOnce(ctx context.Context, userID, kind, status string) bool {
+	tag, err := s.pg.Exec(ctx,
+		`INSERT INTO push_logs (user_id, kind, status) VALUES ($1,$2,$3)
+		 ON CONFLICT (user_id, kind, ((created_at AT TIME ZONE 'Europe/Moscow')::date)) DO NOTHING`,
+		userID, kind, status)
+	if err != nil {
+		return true // индекс отсутствует (миграция не применена) — не блокируем рассылку
+	}
+	return tag.RowsAffected() > 0
+}
+
 // HandleEvening — POST /v1/admin/push-evening: вечерняя рассылка по hour/quite (см. V23/V24).
 func (s *Service) HandleEvening(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -261,10 +274,20 @@ func (s *Service) HandleEvening(w http.ResponseWriter, r *http.Request) {
 	}
 	sent := 0
 	for _, u := range users {
+		// Аудит D: дедуп (повторный запуск крона не спамит) + честный статус.
+		if !s.logOnce(ctx, u, "evening", "sending") {
+			continue
+		}
 		n, _ := s.SendToUser(ctx, u, "Онлайн Таро", eveningFor(time.Now()))
 		sent += n
+		st := "failed"
+		if n > 0 {
+			st = "sent"
+		}
 		_, _ = s.pg.Exec(ctx,
-			`INSERT INTO push_logs (user_id, kind, status) VALUES ($1,'evening','sent')`, u)
+			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='evening'
+			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
+			st, u)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "users": len(users), "sent": sent})
@@ -280,7 +303,7 @@ func (s *Service) HandleStreakRisk(w http.ResponseWriter, r *http.Request) {
 		    FROM (SELECT user_id, created_at FROM readings WHERE status='done'
 		          UNION ALL SELECT user_id, created_at FROM diary_entries) t
 		   GROUP BY user_id
-		) s WHERE last_day = (now() AT TIME ZONE 'Europe/Moscow')::date - 1 AND days >= 1`)
+		) s WHERE last_day = (now() AT TIME ZONE 'Europe/Moscow')::date - 1 AND days >= 2`)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось выбрать")
 		return
@@ -291,10 +314,19 @@ func (s *Service) HandleStreakRisk(w http.ResponseWriter, r *http.Request) {
 		var u string
 		_ = rows.Scan(&u)
 		users++
+		if !s.logOnce(ctx, u, "streak_risk", "sending") {
+			continue
+		}
 		n, _ := s.SendToUser(ctx, u, "Стрик в опасности 🔥", "Загляни сегодня — не прерывай серию!")
 		sent += n
+		st := "failed"
+		if n > 0 {
+			st = "sent"
+		}
 		_, _ = s.pg.Exec(ctx,
-			`INSERT INTO push_logs (user_id, kind, status) VALUES ($1,'streak_risk','sent')`, u)
+			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='streak_risk'
+			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
+			st, u)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "users": users, "sent": sent})
@@ -330,6 +362,8 @@ func (s *Service) HandlePushStats(w http.ResponseWriter, r *http.Request) {
 // RemindExpiring шлет пуш юзерам с подпиской, истекающей в ближайшие 72ч (см. U25).
 // Возвращает (напомнили, всего истекающих). Вызывать кроном 1 раз/день (см. T30 cron).
 func (s *Service) RemindExpiring(ctx context.Context) (int, int, error) {
+	// Аудит D: ретеншен логов 90 дней (таблица росла бесконечно).
+	_, _ = s.pg.Exec(ctx, `DELETE FROM push_logs WHERE created_at < now() - interval '90 days'`)
 	rows, err := s.pg.Query(ctx, `
 		SELECT DISTINCT user_id FROM subscriptions
 		 WHERE status='active' AND valid_until > now() AND valid_until < now() + interval '72 hours'`)
@@ -345,8 +379,20 @@ func (s *Service) RemindExpiring(ctx context.Context) (int, int, error) {
 	}
 	sent := 0
 	for _, u := range users {
+		// Аудит D: окно 72ч слало одному юзеру 3 дня подряд — дедуп по суткам.
+		if !s.logOnce(ctx, u, "expiring", "sending") {
+			continue
+		}
 		n, _ := s.SendToUser(ctx, u, "Безлимит скоро закончится", "Продли в 1 тап — карты уже ждут вечером 🌙")
 		sent += n
+		st := "failed"
+		if n > 0 {
+			st = "sent"
+		}
+		_, _ = s.pg.Exec(ctx,
+			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='expiring'
+			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
+			st, u)
 	}
 	return sent, len(users), nil
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +29,21 @@ func isLoopback(remoteAddr string) bool {
 	if err != nil {
 		host = remoteAddr
 	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLocalOrigin — Origin/Referer указывает на локальный SSH-туннель (аудит D).
+// Админка живёт только на 127.0.0.1:8081, любой внешний Origin — чужой сайт.
+func isLocalOrigin(r *http.Request, origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
 	if host == "localhost" {
 		return true
 	}
@@ -64,18 +80,23 @@ func AdminID(ctx context.Context) string {
 	return uid
 }
 
-// isAdmin: role=admin в БД ИЛИ tg_id в ADMIN_TG_IDS (первичная выдача).
-func (s *Service) isAdmin(ctx context.Context, userID string, tgID int64) bool {
-	var role string
-	if err := s.pg.QueryRow(ctx, `SELECT role FROM users WHERE id=$1`, userID).Scan(&role); err == nil && role == "admin" {
-		return true
-	}
+// whitelistedTgID — tg_id в ADMIN_TG_IDS (первичная выдача админа).
+func whitelistedTgID(tgID int64) bool {
 	for _, part := range strings.Split(os.Getenv("ADMIN_TG_IDS"), ",") {
 		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id == tgID && tgID != 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// isAdmin: role=admin в БД ИЛИ tg_id в ADMIN_TG_IDS (первичная выдача).
+func (s *Service) isAdmin(ctx context.Context, userID string, tgID int64) bool {
+	var role string
+	if err := s.pg.QueryRow(ctx, `SELECT role FROM users WHERE id=$1`, userID).Scan(&role); err == nil && role == "admin" {
+		return true
+	}
+	return whitelistedTgID(tgID)
 }
 
 // HandleLogin — POST /v1/admin/login {initData}: TG + admin → taro_admin cookie.
@@ -93,6 +114,14 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// Аудит D: whitelist ДО INSERT — иначе любой с валидным initData плодит строки в users.
+	if !whitelistedTgID(tgID) {
+		var role string
+		if err := s.pg.QueryRow(ctx, `SELECT role FROM users WHERE tg_id=$1`, tgID).Scan(&role); err != nil || role != "admin" {
+			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+			return
+		}
+	}
 	var userID string
 	err = s.pg.QueryRow(ctx, `SELECT id FROM users WHERE tg_id=$1`, tgID).Scan(&userID)
 	if err != nil {
@@ -168,6 +197,18 @@ func (s *Service) RequireAdmin(next http.Handler) http.Handler {
 		if n, err := s.rd.Exists(r.Context(), "sess:admin:"+uid).Result(); err != nil || n == 0 {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Сессия завершена")
 			return
+		}
+		// Аудит D: Origin-gate для cookie-ветки (браузер всегда шлёт Origin на POST;
+		// curl без Origin пропускаем — иначе ломаем скрипты владельца).
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				origin = r.Header.Get("Referer")
+			}
+			if origin != "" && !isLocalOrigin(r, origin) {
+				apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный Origin")
+				return
+			}
 		}
 		var role string
 		if err := s.pg.QueryRow(r.Context(), `SELECT role FROM users WHERE id=$1`, uid).Scan(&role); err != nil || role != "admin" {
@@ -493,6 +534,27 @@ func (s *Service) HandleRotateSeasonal(w http.ResponseWriter, r *http.Request) {
 	if json.Unmarshal(raw, &windows) != nil || len(windows) == 0 {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Пустой конфиг")
 		return
+	}
+	// Аудит D: даты обязаны парситься, код — существовать (иначе тихая неработающая ротация).
+	for _, win := range windows {
+		if _, err := time.Parse("2006-01-02", win.From); err != nil {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный from: "+win.Code)
+			return
+		}
+		if _, err := time.Parse("2006-01-02", win.To); err != nil {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный to: "+win.Code)
+			return
+		}
+		if win.From > win.To {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "from позже to: "+win.Code)
+			return
+		}
+		var ok bool
+		if err := s.pg.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM spreads WHERE code=$1)`, win.Code).Scan(&ok); err != nil || !ok {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный расклад: "+win.Code)
+			return
+		}
 	}
 	today := time.Now().Format("2006-01-02")
 	changed := 0

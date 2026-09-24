@@ -158,6 +158,12 @@ func (s *Service) CompleteOnFirstReading(ctx context.Context, refereeID string) 
 	if err != nil {
 		return // apply не было — нечего завершать
 	}
+	if referrer == refereeID {
+		// Аудит D: self-referral (артефакт мержа) — бонуса нет, помечаем rejected.
+		_, _ = tx.Exec(ctx, `UPDATE referrals SET status='rejected' WHERE id=$1 AND status='pending'`, refID)
+		_ = tx.Commit(ctx)
+		return
+	}
 	var tg *int64
 	_ = tx.QueryRow(ctx, `SELECT tg_id FROM users WHERE id=$1`, refereeID).Scan(&tg)
 	if tg == nil {

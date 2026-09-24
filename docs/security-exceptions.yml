@@ -82,6 +82,17 @@ exceptions:
     accepted_by: "owner"
     date: "2026-09-24"
     lift_when: "REDIS_PASSWORD задан, requirepass включён"
+  - id: E13
+    file: "api/internal/ai/cachecrypt.go"
+    title: "REDIS_ENC_KEY задаёт человек"
+    risk: "без ключа ai:cache лежит plaintext (dev-режим)"
+    reason: "owner-key: openssl rand -hex 32 в env VPS"
+    accepted_by: "owner"
+    date: "2026-09-24"
+    lift_when: "REDIS_ENC_KEY задан на VPS"
+
+# closed: — решённые (аудит их не поднимает; CI сверяет только активные выше).
+closed:
   - id: E11
     file: "web/components/Legal.tsx / api/internal/me/me.go:78"
     title: "Решение 18+: РЕШЕНО — режим честный (только оплата 18+)"
@@ -98,11 +109,3 @@ exceptions:
     accepted_by: "owner"
     date: "2026-09-24"
     lift_when: "владелец сказал делать ротацию"
-  - id: E13
-    file: "api/internal/ai/cachecrypt.go"
-    title: "REDIS_ENC_KEY задаёт человек"
-    risk: "без ключа ai:cache лежит plaintext (dev-режим)"
-    reason: "owner-key: openssl rand -hex 32 в env VPS"
-    accepted_by: "owner"
-    date: "2026-09-24"
-    lift_when: "REDIS_ENC_KEY задан на VPS"

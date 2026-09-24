@@ -82,12 +82,26 @@ jobs:
       - run: test ! -e .env || (echo ".env committed!" && exit 1)
       - run: test -z "$(grep -rn '11FvQdiQe2RUimQe1i3NtUZ4l3P9nzep71YYI96e5Oo' --exclude-dir=.git . || true)"
       - run: test -z "$(git ls-files | grep -E '(^|/)\.env$' || true)"
-      # Реестр исключений: каждый AUDIT-EXCEPTION(E0x) в коде обязан иметь парный id в yml
+      # Реестр исключений двусторонний (аудит D): код→yml и yml→код.
+      # РЕШЕНО-записи живут только в closed: ниже. Сканим код, не сам реестр.
       - run: |
-          for id in $(grep -rhoE 'AUDIT-EXCEPTION\(E[0-9]+\)' --exclude-dir=.git . | grep -oE 'E[0-9]+' | sort -u); do
+          for id in $(grep -rh 'AUDIT-EXCEPTION' api web deploy docker-compose.yml .env.example | grep -oE 'E[0-9]+' | sort -u); do
             grep -q "id: $id" docs/security-exceptions.yml || (echo "exception $id без записи в yml!" && exit 1)
           done
-          echo "exceptions OK"
+          python3 - <<'EOF'
+          import re, sys, subprocess
+          yml = open("docs/security-exceptions.yml").read()
+          active = yml.split("closed:")[0] if "closed:" in yml else yml
+          ids_yml = set(re.findall(r"id: (E\d+)", active))
+          code = subprocess.run(["grep", "-rh", "AUDIT-EXCEPTION", "api", "web", "deploy", "docker-compose.yml", ".env.example"],
+                                 capture_output=True, text=True).stdout
+          ids_code = set(re.findall(r"E\d+", code))
+          bad = ids_yml - ids_code
+          if bad:
+              print("exceptions без маркера в коде:", sorted(bad))
+              sys.exit(1)
+          print("exceptions OK bidirectional")
+          EOF
       # Fail-open флаги dev-авторизации — никогда в прод-конфигах (только код default-off + тесты)
       - run: |
           test -z "$(grep -rn 'TG_ALLOW_EMPTY=1\|TG_ALLOW_DEV_BOT=1' docker-compose.yml deploy/ .github/ .env.example 2>/dev/null || true)" \

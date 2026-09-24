@@ -73,10 +73,11 @@ func main() {
 	}()
 
 	r := chi.NewRouter()
-	// CSRF per-session (метод — нужен Redis, см. S07). Webhook исключен внутри.
-	r.Use(au.RequireCSRF)
+	// Аудит D: лимит ПЕРВЫМ (иначе 403 от CSRF не двигали счётчик — бесплатные пробы).
 	// Go rate limits — второй рубеж после nginx (см. V31, 04-api-spec.md).
 	r.Use(ratelimit.New(rd).Middleware)
+	// CSRF per-session (метод — нужен Redis, см. S07). Webhook исключен внутри.
+	r.Use(au.RequireCSRF)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","api":"public"}`))
