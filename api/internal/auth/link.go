@@ -142,7 +142,7 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 		`UPDATE diary_entries SET user_id=$1 WHERE user_id=$2`,
 		`UPDATE push_subscriptions SET user_id=$1 WHERE user_id=$2`,
 		`UPDATE push_preferences SET user_id=$1 WHERE user_id=$2 AND NOT EXISTS (SELECT 1 FROM push_preferences WHERE user_id=$1)`,
-		`DELETE FROM push_preferences WHERE user_id=$2`,
+		`DELETE FROM push_preferences WHERE user_id=$2 AND EXISTS (SELECT 1 FROM push_preferences WHERE user_id=$1)`,
 	} {
 		if _, err := tx.Exec(ctx, q, other, current); err != nil {
 			return "", false, err
