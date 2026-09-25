@@ -8,6 +8,7 @@ package readings
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -15,9 +16,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taro/api/internal/ai"
@@ -54,7 +57,19 @@ func defaultCrisisPolicy() crisisPolicy {
 }
 
 func normalizeCrisisText(value string) string {
-	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "ё", "е")
+	var out strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		if r == 'ё' {
+			r = 'е'
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
 }
 
 func crisisTextHasControl(value string) bool {
@@ -97,7 +112,8 @@ func cleanCrisisResourceText(value string) string {
 func (p crisisPolicy) matches(question string) bool {
 	question = normalizeCrisisText(question)
 	for _, pattern := range p.patterns {
-		if strings.Contains(question, pattern) {
+		pattern = normalizeCrisisText(pattern)
+		if pattern != "" && strings.Contains(question, pattern) {
 			return true
 		}
 	}
@@ -182,7 +198,7 @@ func (s *Service) fireReferralHook(uid string) {
 		defer cancel()
 		var n int
 		_ = s.pg.QueryRow(ctx,
-			`SELECT COUNT(*) FROM readings WHERE user_id=$1 AND status='done'`, uid).Scan(&n)
+			`SELECT COUNT(*) FROM readings WHERE user_id=$1 AND status='done' AND quota_state='allowed'`, uid).Scan(&n)
 		if n >= 1 {
 			s.rf.CompleteOnFirstReading(ctx, uid)
 		}
@@ -267,7 +283,6 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	// Аудит C: locked-секция — в хелпере со своим conn (пул не висит всю SSE-сессию).
 	id, _, cards, ok := s.prepareReading(w, r, uid, key, req)
 	if !ok {
 		return // ответ уже записан (повтор/paywall/кризис/ошибка)
@@ -284,108 +299,251 @@ func (s *Service) HandleCreate(w http.ResponseWriter, r *http.Request) {
 	s.fireReferralHook(uid)
 }
 
-// prepareReading — вся быстрая работа под advisory-lock на запиненном conn:
-// find/insert pending → Check квоты → single-consume. Возвращает ok=false если
-// ответ уже записан. Conn и lock освобождаются ДО долгой генерации (аудит C:
-// иначе 10 висящих SSE съедают весь пул MaxConns=10).
 func (s *Service) prepareReading(w http.ResponseWriter, r *http.Request, uid, key string, req createRequest) (string, entitlements.Verdict, []cardDraw, bool) {
 	ctx := r.Context()
+	req.Question = strings.TrimSpace(req.Question)
 	policy := s.loadCrisisPolicy(ctx)
-	conn, err := s.pg.Acquire(ctx)
+	if s.pg == nil || s.en == nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return "", entitlements.Verdict{}, nil, false
+	}
+	tx, err := s.pg.Begin(ctx)
 	if err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return "", entitlements.Verdict{}, nil, false
 	}
-	defer conn.Release()
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	lockKey := "reading:" + uid + ":" + key
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, lockKey); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey); err != nil {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return "", entitlements.Verdict{}, nil, false
 	}
-	defer func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, lockKey)
-	}()
-	db := conn // все SQL секции — через запиненное соединение
-	// спред активен? + число позиций
-	var positions json.RawMessage
-	var isPremium bool
-	if err := db.QueryRow(ctx,
-		`SELECT positions, is_premium FROM spreads WHERE code=$1 AND is_active`, req.SpreadCode).Scan(&positions, &isPremium); err != nil {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный расклад")
-		return "", entitlements.Verdict{}, nil, false
-	}
-	var posCount []any
-	if err := json.Unmarshal(positions, &posCount); err != nil || len(posCount) == 0 || len(posCount) > 78 {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Битый расклад")
-		return "", entitlements.Verdict{}, nil, false
-	}
-	// идемпотентность ДО списания лимита: повтор возвращает существующее.
-	// Мёртвые строки (cancelled/failed) — удаляем, ключ освобождается под fresh-вставку.
-	if existing := s.findByKey(ctx, uid, key); existing != "" {
-		var st string
-		if err := db.QueryRow(ctx, `SELECT status FROM readings WHERE id=$1`, existing).Scan(&st); err != nil || st == "cancelled" || st == "failed" {
-			_, _ = db.Exec(ctx, `DELETE FROM readings WHERE id=$1`, existing)
-		} else {
+	var posCount int
+	var id string
+	var cards []cardDraw
+	existing, err := findByKeyTx(ctx, tx, uid, key)
+	if err == nil {
+		var status, quotaState, existingSpread, existingQuestion string
+		var existingCards json.RawMessage
+		if err := tx.QueryRow(ctx, `
+			SELECT status, quota_state, spread_code, COALESCE(question, ''), cards
+			  FROM readings WHERE id=$1 AND user_id=$2`, existing, uid).Scan(&status, &quotaState, &existingSpread, &existingQuestion, &existingCards); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить расклад")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if existingSpread != req.SpreadCode {
+			apierr.Write(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Ключ уже привязан к другому раскладу")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if existingQuestion != req.Question {
+			apierr.Write(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Ключ уже привязан к другому вопросу")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if err := json.Unmarshal(existingCards, &cards); err != nil || !validStoredCards(cards) {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Битый расклад")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if status == "done" || status == "filtered" {
+			if err := tx.Commit(ctx); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return "", entitlements.Verdict{}, nil, false
+			}
 			s.respondReading(w, r, uid, existing)
 			return "", entitlements.Verdict{}, nil, false
 		}
+		if (status == "pending" || status == "pending_fallback") && (quotaState == "allowed" || quotaState == "unchecked") {
+			if err := tx.Commit(ctx); err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return "", entitlements.Verdict{}, nil, false
+			}
+			receiptCtx, receiptCancel := independentPersistenceContext()
+			replayVerdict, replayErr := s.en.AuthorizeReading(receiptCtx, existing, uid, req.SpreadCode)
+			receiptCancel()
+			if replayErr == nil && !replayVerdict.Allow {
+				s.writePaywall(w, r)
+				return "", entitlements.Verdict{}, nil, false
+			}
+			s.respondReading(w, r, uid, existing)
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if (status == "pending" || status == "pending_fallback") && quotaState != "unchecked" {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Проверка лимита ещё не завершена")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		if status == "failed" || status == "cancelled" {
+			tag, err := tx.Exec(ctx, `
+				UPDATE readings
+				   SET status='pending', interpretation='', quota_state='unchecked',
+				       worker_claim_token=NULL, worker_lease_until=now()+interval '2 minutes',
+				       worker_attempts=0, updated_at=now()
+				 WHERE id=$1 AND status=$2 AND quota_state=$3`, existing, status, quotaState)
+			if err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return "", entitlements.Verdict{}, nil, false
+			}
+			if tag.RowsAffected() != 1 {
+				apierr.Write(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Состояние расклада изменилось")
+				return "", entitlements.Verdict{}, nil, false
+			}
+		}
+		id = existing
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+		return "", entitlements.Verdict{}, nil, false
 	}
+	if id == "" {
+		var positions json.RawMessage
+		if err := tx.QueryRow(ctx,
+			`SELECT positions FROM spreads WHERE code=$1 AND is_active`, req.SpreadCode).Scan(&positions); err != nil {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Неизвестный расклад")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		var parsedPositions []any
+		if err := json.Unmarshal(positions, &parsedPositions); err != nil || len(parsedPositions) == 0 || len(parsedPositions) > 78 {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Битый расклад")
+			return "", entitlements.Verdict{}, nil, false
+		}
+		posCount = len(parsedPositions)
+	}
+
 	if isCrisisWithPolicy(req.Question, policy) {
-		id := s.createFilteredText(ctx, w, uid, req, key, len(posCount), policy.resourceText)
-		if id == "" {
+		if id != "" {
+			tag, err := tx.Exec(ctx, `
+				UPDATE readings
+				   SET interpretation=$1, status='filtered', quota_state='allowed',
+				       worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now()
+				 WHERE id=$2 AND quota_state='unchecked'`, policy.resourceText, id)
+			if err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return "", entitlements.Verdict{}, nil, false
+			}
+			if tag.RowsAffected() != 1 {
+				apierr.Write(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Состояние расклада изменилось")
+				return "", entitlements.Verdict{}, nil, false
+			}
+		} else {
+			id, err = createFilteredTextTx(ctx, tx, uid, req, key, posCount, policy.resourceText)
+			if err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
+				return "", entitlements.Verdict{}, nil, false
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
 			return "", entitlements.Verdict{}, nil, false
 		}
 		s.respondReading(w, r, uid, id)
 		return "", entitlements.Verdict{}, nil, false
 	}
-	seed := time.Now().UnixNano()
-	cards := draw(seed, len(posCount))
-	cardsJSON, _ := json.Marshal(cards)
 
-	// Аудит B: вставляем pending ДО списания квоты — падение вставки не сжигает лимит.
-	// Повторный конкурент заблокирован advisory-lock выше, ON CONFLICT — пояс поверх.
-	var id string
-	err = db.QueryRow(ctx, `
-		INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key, worker_lease_until)
-		VALUES ($1,$2,$3,$4,'', $5,1,'pending',$6,now()+interval '45 seconds')
-		ON CONFLICT (user_id, idempotency_key) DO NOTHING
-		RETURNING id`, uid, req.SpreadCode, req.Question, cardsJSON, seed, key).Scan(&id)
-	if err != nil {
-		// race: второй запрос вставил первым — возвращаем его
-		if existing := s.findByKey(ctx, uid, key); existing != "" {
-			s.respondReading(w, r, uid, existing)
+	if id == "" {
+		seed := time.Now().UnixNano()
+		cards = draw(seed, posCount)
+		cardsJSON, _ := json.Marshal(cards)
+		err = tx.QueryRow(ctx, `
+			INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key, worker_lease_until, quota_state)
+			VALUES ($1,$2,$3,$4,'', $5,1,'pending',$6,now()+interval '2 minutes','unchecked')
+			ON CONFLICT (user_id, idempotency_key) DO NOTHING
+			RETURNING id`, uid, req.SpreadCode, req.Question, cardsJSON, seed, key).Scan(&id)
+		if err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
 			return "", entitlements.Verdict{}, nil, false
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
 		return "", entitlements.Verdict{}, nil, false
 	}
-	// лимиты (consume внутри Check) — ПОСЛЕ вставки; отказ → строка в cancelled, квота цела
-	v, err := s.en.Check(ctx, uid, req.SpreadCode)
+
+	authorizationCtx, cancel := independentPersistenceContext()
+	verdict, err := s.en.AuthorizeReading(authorizationCtx, id, uid, req.SpreadCode)
+	cancel()
 	if err != nil {
-		_, _ = db.Exec(ctx, `UPDATE readings SET status='failed', worker_claim_token=NULL, worker_lease_until=NULL WHERE id=$1`, id)
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить лимит")
+		_ = s.transitionReadingQuota(id, "failed", "error")
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
 		return "", entitlements.Verdict{}, nil, false
 	}
-	if !v.Allow {
-		_, _ = db.Exec(ctx, `UPDATE readings SET status='cancelled', worker_claim_token=NULL, worker_lease_until=NULL WHERE id=$1`, id)
+	if !verdict.Allow {
 		s.writePaywall(w, r)
 		return "", entitlements.Verdict{}, nil, false
 	}
-	if v.Reason == "single" {
-		tag, err := db.Exec(ctx,
-			`UPDATE single_entitlements SET consumed_reading_id=$1 WHERE id=$2 AND consumed_reading_id IS NULL`, id, v.SingleID)
-		if err != nil || tag.RowsAffected() == 0 {
-			// race: второй запрос потребил single первым — откатываем pending и просим оплатить.
-			// Статус cancelled легален с миграции 018; ошибку Exec не глотаем, а проверяем.
-			if _, uerr := db.Exec(ctx, `UPDATE readings SET status='cancelled', worker_claim_token=NULL, worker_lease_until=NULL WHERE id=$1`, id); uerr != nil {
-				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось сохранить расклад")
-				return "", entitlements.Verdict{}, nil, false
-			}
-			s.writePaywall(w, r)
-			return "", entitlements.Verdict{}, nil, false
-		}
+	return id, verdict, cards, true
+}
+
+func findByKeyTx(ctx context.Context, tx pgx.Tx, uid, key string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM readings WHERE user_id=$1 AND idempotency_key=$2`, uid, key).Scan(&id)
+	return id, err
+}
+
+func validStoredCards(cards []cardDraw) bool {
+	if len(cards) == 0 || len(cards) > 78 {
+		return false
 	}
-	return id, v, cards, true
+	seen := make(map[int]struct{}, len(cards))
+	for i, card := range cards {
+		if card.CardID < 0 || card.CardID > 77 || card.Position != i {
+			return false
+		}
+		if _, ok := seen[card.CardID]; ok {
+			return false
+		}
+		seen[card.CardID] = struct{}{}
+	}
+	return true
+}
+
+func createFilteredTextTx(ctx context.Context, tx pgx.Tx, uid string, req createRequest, key string, n int, resourceText string) (string, error) {
+	if cleaned := cleanCrisisResourceText(resourceText); cleaned != "" {
+		resourceText = cleaned
+	} else {
+		resourceText = defaultCrisisResourceText
+	}
+	seed := time.Now().UnixNano()
+	cards := draw(seed, n)
+	cardsJSON, _ := json.Marshal(cards)
+	var id string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key, quota_state)
+		VALUES ($1,$2,$3,$4,$5,$6,1,'filtered',$7,'allowed')
+		ON CONFLICT (user_id, idempotency_key) DO NOTHING
+		RETURNING id`, uid, req.SpreadCode, req.Question, cardsJSON, resourceText, seed, key).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if existing, findErr := findByKeyTx(ctx, tx, uid, key); findErr == nil {
+		return existing, nil
+	}
+	return "", err
+}
+
+func (s *Service) transitionReadingQuota(id, status, quotaState string) bool {
+	ctx, cancel := independentPersistenceContext()
+	defer cancel()
+	tag, err := s.pg.Exec(ctx, `
+		UPDATE readings
+		   SET status=$1, quota_state=$2, worker_claim_token=NULL,
+		       worker_lease_until=NULL, updated_at=now()
+		 WHERE id=$3 AND quota_state='unchecked'`, status, quotaState, id)
+	return err == nil && tag.RowsAffected() == 1
+}
+
+func (s *Service) persistTerminalFallback(ctx context.Context, id, text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	status := "done"
+	if ai.ContainsStopWords(text) || text == ai.SafeReplacement {
+		text = ai.SafeReplacement
+		status = "filtered"
+	}
+	tag, err := s.pg.Exec(ctx, `
+		UPDATE readings
+		   SET interpretation=$1, status=$2, worker_claim_token=NULL,
+		       worker_lease_until=NULL, updated_at=now()
+		 WHERE id=$3 AND status IN ('pending', 'pending_fallback')
+		   AND quota_state='allowed' AND worker_claim_token IS NULL`, text, status, id)
+	return err == nil && tag.RowsAffected() == 1
 }
 
 func independentPersistenceContext() (context.Context, context.CancelFunc) {
@@ -395,10 +553,18 @@ func independentPersistenceContext() (context.Context, context.CancelFunc) {
 func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadCode, question string, cards []cardDraw) {
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
-	positions, values, spreadName := s.aiInputs(ctx, spreadCode, cards)
+	positions, values, spreadName, complete := s.aiInputsChecked(ctx, spreadCode, cards)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
+	if !complete {
+		persistCtx, persistCancel := independentPersistenceContext()
+		s.persistTerminalFallback(persistCtx, id, s.fallbackText(persistCtx, spreadCode, cards))
+		persistCancel()
+		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"fallback": true}))
+		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"done": true, "reading_id": id, "status": "done"}))
+		return
+	}
 	fl, _ := w.(http.Flusher)
 	ch := make(chan string, 256)
 	type res struct {
@@ -451,9 +617,16 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 		final = ai.SafeReplacement
 		status = "filtered"
 	}
-	_, _ = s.pg.Exec(persistCtx,
-		`UPDATE readings SET interpretation=$1, status=$2, worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now() WHERE id=$3 AND status IN ('pending', 'pending_fallback') AND worker_claim_token IS NULL`,
-		final, status, id)
+	tag, err := s.pg.Exec(persistCtx,
+		`UPDATE readings
+		    SET interpretation=$1, status=$2, worker_claim_token=NULL,
+		        worker_lease_until=NULL, updated_at=now()
+		  WHERE id=$3 AND status IN ('pending', 'pending_fallback')
+		    AND quota_state='allowed' AND worker_claim_token IS NULL`, final, status, id)
+	if err != nil || tag.RowsAffected() != 1 {
+		failed = true
+		status = "pending_fallback"
+	}
 	if failed {
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"fallback": true}))
 	}
@@ -461,17 +634,21 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 }
 
 func (s *Service) generate(ctx context.Context, id, spreadCode, question string, cards []cardDraw) {
+	positions, values, spreadName, complete := s.aiInputsChecked(ctx, spreadCode, cards)
+	if !complete {
+		persistCtx, persistCancel := independentPersistenceContext()
+		s.persistTerminalFallback(persistCtx, id, s.fallbackText(persistCtx, spreadCode, cards))
+		persistCancel()
+		return
+	}
 	if s.gw == nil || !s.gw.Enabled() {
 		persistCtx, persistCancel := independentPersistenceContext()
-		_, _ = s.pg.Exec(persistCtx,
-			`UPDATE readings SET interpretation=$1, status='done', worker_claim_token=NULL, worker_lease_until=NULL WHERE id=$2 AND status IN ('pending', 'pending_fallback') AND worker_claim_token IS NULL`,
-			s.fallbackText(persistCtx, spreadCode, cards), id)
+		s.persistTerminalFallback(persistCtx, id, s.fallbackText(persistCtx, spreadCode, cards))
 		persistCancel()
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	positions, values, spreadName := s.aiInputs(ctx, spreadCode, cards)
 	ch := make(chan string, 256)
 	type res struct {
 		text string
@@ -503,8 +680,12 @@ func (s *Service) generate(ctx context.Context, id, spreadCode, question string,
 	persistCtx, persistCancel := independentPersistenceContext()
 	defer persistCancel()
 	if result.err != nil || strings.TrimSpace(result.text) == "" {
-		_, _ = s.pg.Exec(persistCtx,
-			`UPDATE readings SET interpretation=$1, status='pending_fallback', worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now() WHERE id=$2 AND status IN ('pending', 'pending_fallback') AND worker_claim_token IS NULL`,
+		_, _ = s.pg.Exec(persistCtx, `
+			UPDATE readings
+			   SET interpretation=$1, status='pending_fallback', worker_claim_token=NULL,
+			       worker_lease_until=NULL, updated_at=now()
+			 WHERE id=$2 AND status IN ('pending', 'pending_fallback')
+			   AND quota_state='allowed' AND worker_claim_token IS NULL`,
 			s.fallbackText(persistCtx, spreadCode, cards)+"\n\nПолное толкование допишется автоматически.", id)
 		return
 	}
@@ -514,28 +695,64 @@ func (s *Service) generate(ctx context.Context, id, spreadCode, question string,
 		text = ai.SafeReplacement
 		status = "filtered"
 	}
-	_, _ = s.pg.Exec(persistCtx,
-		`UPDATE readings SET interpretation=$1, status=$2, worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now() WHERE id=$3 AND status IN ('pending', 'pending_fallback') AND worker_claim_token IS NULL`,
-		text, status, id)
+	_, _ = s.pg.Exec(persistCtx, `
+		UPDATE readings
+		   SET interpretation=$1, status=$2, worker_claim_token=NULL,
+		       worker_lease_until=NULL, updated_at=now()
+		 WHERE id=$3 AND status IN ('pending', 'pending_fallback')
+		   AND quota_state='allowed' AND worker_claim_token IS NULL`, text, status, id)
 }
 
-// aiInputs собирает позиции и значения карт для промпта.
 func (s *Service) aiInputs(ctx context.Context, spreadCode string, cards []cardDraw) ([]ai.Position, []ai.CardValue, string) {
+	positions, values, spreadName, complete := s.aiInputsChecked(ctx, spreadCode, cards)
+	if !complete {
+		return nil, nil, ""
+	}
+	return positions, values, spreadName
+}
+
+func (s *Service) aiInputsChecked(ctx context.Context, spreadCode string, cards []cardDraw) ([]ai.Position, []ai.CardValue, string, bool) {
+	if s.pg == nil || len(cards) == 0 {
+		return nil, nil, "", false
+	}
 	var spreadName string
 	var posRaw json.RawMessage
-	_ = s.pg.QueryRow(ctx, `SELECT name_ru, positions FROM spreads WHERE code=$1`, spreadCode).Scan(&spreadName, &posRaw)
+	if err := s.pg.QueryRow(ctx, `SELECT name_ru, positions FROM spreads WHERE code=$1 AND is_active`, spreadCode).Scan(&spreadName, &posRaw); err != nil || strings.TrimSpace(spreadName) == "" {
+		return nil, nil, "", false
+	}
 	var positions []ai.Position
-	_ = json.Unmarshal(posRaw, &positions)
+	if err := json.Unmarshal(posRaw, &positions); err != nil || len(positions) != len(cards) {
+		return nil, nil, "", false
+	}
+	for i, position := range positions {
+		if strings.TrimSpace(position.Label) == "" || strings.TrimSpace(position.Meaning) == "" {
+			return nil, nil, "", false
+		}
+		if cards[i].Position != i {
+			return nil, nil, "", false
+		}
+	}
 	values := make([]ai.CardValue, 0, len(cards))
+	seen := make(map[int]struct{}, len(cards))
 	for _, c := range cards {
+		if c.CardID < 0 || c.CardID > 77 {
+			return nil, nil, "", false
+		}
+		if _, ok := seen[c.CardID]; ok {
+			return nil, nil, "", false
+		}
+		seen[c.CardID] = struct{}{}
 		var name, up, rev string
 		if err := s.pg.QueryRow(ctx,
 			`SELECT name_ru, upright_ru, reversed_ru FROM cards WHERE id=$1`, c.CardID).Scan(&name, &up, &rev); err != nil {
-			continue
+			return nil, nil, "", false
+		}
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(up) == "" || strings.TrimSpace(rev) == "" {
+			return nil, nil, "", false
 		}
 		values = append(values, ai.CardValue{Name: name, Upright: up, ReversedText: rev, Reversed: c.Reversed, Position: c.Position, CardID: c.CardID})
 	}
-	return positions, values, spreadName
+	return positions, values, spreadName, true
 }
 
 func (s *Service) createFiltered(ctx context.Context, w http.ResponseWriter, uid string, req createRequest, key string, n int) string {
@@ -553,8 +770,8 @@ func (s *Service) createFilteredText(ctx context.Context, w http.ResponseWriter,
 	cardsJSON, _ := json.Marshal(cards)
 	var id string
 	err := s.pg.QueryRow(ctx, `
-		INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key)
-		VALUES ($1,$2,$3,$4,$5,$6,1,'filtered',$7)
+		INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, algo_version, status, idempotency_key, quota_state)
+		VALUES ($1,$2,$3,$4,$5,$6,1,'filtered',$7,'allowed')
 		ON CONFLICT (user_id, idempotency_key) DO NOTHING
 		RETURNING id`, uid, req.SpreadCode, req.Question, cardsJSON, resourceText, seed, key).Scan(&id)
 	if err != nil {
@@ -583,13 +800,18 @@ func (s *Service) respondReading(w http.ResponseWriter, r *http.Request, uid, id
 		s.streamReading(w, r, uid, id)
 		return
 	}
-	var status string
-	if err := s.pg.QueryRow(r.Context(), `SELECT status FROM readings WHERE id=$1 AND user_id=$2`, id, uid).Scan(&status); err == nil &&
-		(status == "pending" || status == "pending_fallback") {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]any{"reading_id": id, "status": status})
-		return
+	var status, quotaState string
+	if err := s.pg.QueryRow(r.Context(), `SELECT status, quota_state FROM readings WHERE id=$1 AND user_id=$2`, id, uid).Scan(&status, &quotaState); err == nil {
+		if (status == "pending" || status == "pending_fallback") && quotaState != "allowed" {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Проверка лимита ещё не завершена")
+			return
+		}
+		if status == "pending" || status == "pending_fallback" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"reading_id": id, "status": status})
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"reading_id": id})
@@ -598,11 +820,20 @@ func (s *Service) respondReading(w http.ResponseWriter, r *http.Request, uid, id
 // streamReading стримит сохраненный текст токенами-словами (T13: живые токены OpenRouter).
 // Аудит B: фильтр по владельцу в SQL (было: любой id без проверки — спящий IDOR).
 func (s *Service) streamReading(w http.ResponseWriter, r *http.Request, uid, id string) {
-	var text, status string
+	var text, status, quotaState string
 	if err := s.pg.QueryRow(r.Context(),
-		`SELECT COALESCE(left(interpretation, $3), ''), status FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(&text, &status); err != nil {
+		`SELECT CASE WHEN quota_state='allowed' THEN COALESCE(left(interpretation, $3), '') ELSE '' END,
+		        status, quota_state
+		   FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(&text, &status, &quotaState); err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Расклад не найден")
 		return
+	}
+	if (status == "pending" || status == "pending_fallback") && quotaState != "allowed" {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Проверка лимита ещё не завершена")
+		return
+	}
+	if quotaState != "allowed" {
+		text = ""
 	}
 	if ai.ContainsStopWords(text) {
 		text = ai.SafeReplacement
@@ -639,23 +870,16 @@ func mustJSON(v any) string {
 
 // fallbackText собирает толкование из значений карт БД (без AI).
 func (s *Service) fallbackText(ctx context.Context, spreadCode string, cards []cardDraw) string {
-	var sb strings.Builder
-	sb.WriteString("Карты вытянуты. Полное AI-толкование появится в T13 — а пока значения карт:\n")
+	values := make([]ai.CardValue, 0, len(cards))
 	for _, c := range cards {
 		var name, up, rev string
 		if err := s.pg.QueryRow(ctx,
 			`SELECT name_ru, upright_ru, reversed_ru FROM cards WHERE id=$1`, c.CardID).Scan(&name, &up, &rev); err != nil {
 			continue
 		}
-		val := up
-		orient := "прямая"
-		if c.Reversed {
-			val = rev
-			orient = "перевернутая"
-		}
-		fmt.Fprintf(&sb, "\n• %s (%s, позиция %d): %s", name, orient, c.Position+1, val)
+		values = append(values, ai.CardValue{Name: name, Upright: up, ReversedText: rev, Reversed: c.Reversed, Position: c.Position, CardID: c.CardID})
 	}
-	return sb.String()
+	return ai.FallbackInterpretation(values)
 }
 
 // writePaywall — 402 с активными планами из конфига (цены не хардкод).
@@ -726,7 +950,9 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows, err := s.pg.Query(ctx, `
-		SELECT id, spread_code, question, left(interpretation, $5), created_at
+		SELECT id, spread_code, question,
+		       CASE WHEN quota_state='allowed' THEN COALESCE(left(interpretation, $5), '') ELSE '' END,
+		       created_at
 		  FROM readings WHERE user_id=$1 AND status NOT IN ('cancelled','failed') AND ($3='' OR question ILIKE '%'||$3||'%' ESCAPE '\\')
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, q, offset, ai.MaxOutputBytes+1)
 	if err != nil {
@@ -773,16 +999,21 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	id := chi.URLParam(r, "id")
 	ctx := r.Context()
-	var spread, question, interp, status string
+	var spread, question, interp, status, quotaState string
 	var cards json.RawMessage
 	var created time.Time
 	// Аудит B: владелец фильтруется в SQL, чужая строка не читается вообще.
 	err := s.pg.QueryRow(ctx, `
-		SELECT spread_code, question, cards, COALESCE(left(interpretation, $3), ''), status, created_at
-		  FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(&spread, &question, &cards, &interp, &status, &created)
+		SELECT spread_code, question, cards,
+		       CASE WHEN quota_state='allowed' THEN COALESCE(left(interpretation, $3), '') ELSE '' END,
+		       status, quota_state, created_at
+		  FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(&spread, &question, &cards, &interp, &status, &quotaState, &created)
 	if err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Расклад не найден")
 		return
+	}
+	if quotaState != "allowed" {
+		interp = ""
 	}
 	if ai.ContainsStopWords(interp) {
 		interp = ai.SafeReplacement
@@ -843,7 +1074,7 @@ func (s *Service) HandleStreak(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pg.Query(r.Context(), `
 		SELECT DISTINCT d::text FROM (
 		  SELECT (created_at AT TIME ZONE 'Europe/Moscow')::date AS d
-		    FROM readings WHERE user_id=$1 AND status='done'
+		    FROM readings WHERE user_id=$1 AND status='done' AND quota_state='allowed'
 		  UNION
 		  SELECT (created_at AT TIME ZONE 'Europe/Moscow')::date AS d
 		    FROM diary_entries WHERE user_id=$1

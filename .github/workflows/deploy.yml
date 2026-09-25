@@ -1,9 +1,9 @@
 name: deploy
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
 
 concurrency:
   group: prod-deploy
@@ -11,16 +11,48 @@ concurrency:
 
 jobs:
   deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
+      - name: Resolve release tag
+        id: release
+        shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          case "${RELEASE_REF:-}" in
+            ''|v*|refs/tags/v*) ;;
+            *)
+              printf 'should_deploy=false\n' >> "$GITHUB_OUTPUT"
+              printf '%s\n' 'workflow run is not a release tag'
+              exit 0
+              ;;
+          esac
+          release_tag=''
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              if [ -n "$release_tag" ] && [ "$release_tag" != "$tag" ]; then
+                printf '%s\n' 'multiple release tags point at the tested commit' >&2
+                exit 1
+              fi
+              release_tag="$tag"
+            fi
+          done < <(git tag --points-at HEAD)
+          test -n "$release_tag"
+          printf 'should_deploy=true\n' >> "$GITHUB_OUTPUT"
+          printf 'RELEASE_TAG=%s\n' "$release_tag" >> "$GITHUB_ENV"
+      - name: Deploy over SSH
+        if: ${{ steps.release.outputs.should_deploy == 'true' }}
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -43,6 +75,7 @@ jobs:
             test -f .env
             test "$(stat -c '%a' .env)" = "600"
             grep -Eq '^BACKUP_GPG_KEY=.+$' .env
+            grep -Eq '^TLS_CERT_DIR=.+$' .env
             test -x deploy/migrate.sh
             test -x deploy/backup.sh
             test -x deploy/admin-job.sh
@@ -54,20 +87,28 @@ jobs:
             test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
             test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
             compose() {
-              docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml "$@"
+              docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml -f deploy/docker-compose.tls.yml "$@"
             }
             compose config --quiet
             compose up -d --wait --wait-timeout 120 db cache
             compose build
+            compose stop --timeout 30 web api-public api-admin admin-access nginx
+            for service in web api-public api-admin; do
+              container_id="$(compose ps -q "$service")"
+              if [ -n "$container_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$container_id")" = true ]; then
+                printf 'service did not stop: %s\n' "$service" >&2
+                exit 1
+              fi
+            done
             DEPLOY_ENV=prod ./deploy/migrate.sh up
-            DEPLOY_ENV=prod ./deploy/migrate.sh verify
-            compose up -d --remove-orphans --wait --wait-timeout 180
-            public_health="$(curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 2 --max-time 5 http://127.0.0.1/healthz)"
+            SCHEMA_READINESS_MODE=deploy DEPLOY_ENV=prod ./deploy/migrate.sh verify
+            compose up -d --force-recreate --remove-orphans --wait --wait-timeout 180
+            public_health="$(curl --insecure --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 2 --max-time 5 https://127.0.0.1/readyz)"
             case "$public_health" in
               *'"api":"public"'*) ;;
               *) exit 1 ;;
             esac
-            curl --fail --silent --show-error --max-time 10 http://127.0.0.1/v1/spreads >/dev/null
+            curl --insecure --fail --silent --show-error --max-time 10 https://127.0.0.1/v1/spreads >/dev/null
             admin_id="$(compose ps -q api-admin)"
             test -n "$admin_id"
             admin_endpoint="$(compose port api-admin 8082)"
@@ -79,7 +120,7 @@ jobs:
             case "$admin_port" in
               ''|*[!0-9]*) printf '%s\n' 'invalid admin loopback binding' >&2; exit 1 ;;
             esac
-            admin_health="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 --max-time 5 "http://127.0.0.1:${admin_port}/healthz")"
+            admin_health="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 --max-time 5 "http://127.0.0.1:${admin_port}/readyz")"
             case "$admin_health" in
               *'"api":"admin"'*) ;;
               *) exit 1 ;;

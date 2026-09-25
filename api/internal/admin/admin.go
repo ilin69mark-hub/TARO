@@ -1,11 +1,15 @@
 // Package admin — кабинет настроек на :8081 (см. docs/project-book/02-functional/07, D1).
-// Auth: taro_admin JWT 12ч (HttpOnly/Secure/SameSite=Strict) + role=admin в БД.
-// Login: POST /v1/admin/login {initData} — TG-подпись + (role admin ИЛИ tg_id в ADMIN_TG_IDS).
+// Auth: taro_admin JWT 12ч (HttpOnly/Secure/SameSite=Strict) + password account в БД.
+// Login: POST /v1/admin/login {username,password}.
 // Publish применяет diff + пишет admin_audit (см. D1).
 package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -14,11 +18,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 
 	"taro/api/internal/apierr"
 	"taro/api/internal/auth"
@@ -38,19 +44,22 @@ func isLoopback(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// isLocalOrigin — Origin/Referer указывает на локальный SSH-туннель (аудит D).
-// Админка живёт только на 127.0.0.1:8081, любой внешний Origin — чужой сайт.
-func isLocalOrigin(r *http.Request, origin string) bool {
-	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+const defaultAdminOrigin = "http://127.0.0.1:8081"
+
+func isLocalOrigin(_ *http.Request, origin string) bool {
+	configured := strings.TrimSpace(os.Getenv("ADMIN_ORIGIN"))
+	if configured == "" {
+		configured = defaultAdminOrigin
+	}
+	want, err := url.Parse(configured)
+	if err != nil || want.Scheme == "" || want.Host == "" || want.User != nil || want.RawQuery != "" || want.Fragment != "" {
 		return false
 	}
-	host := u.Hostname()
-	if host == "localhost" {
-		return true
+	got, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || got.Scheme == "" || got.Host == "" || got.User != nil || got.RawQuery != "" || got.Fragment != "" || got.Opaque != "" {
+		return false
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return strings.EqualFold(got.Scheme, want.Scheme) && strings.EqualFold(got.Host, want.Host)
 }
 
 // PlansCacheKey — см. 04-architecture/05-cache-redis.md.
@@ -62,15 +71,84 @@ const AdminCookie = "taro_admin"
 // AdminTTL — 12 часов (см. 04-api-spec.md).
 const AdminTTL = 12 * time.Hour
 
+const (
+	bcryptCost           = 12
+	minPasswordBytes     = 12
+	maxPasswordBytes     = 72
+	adminLoginRateMax    = 10
+	adminLoginRateWindow = 15 * time.Minute
+	adminLoginRateScript = `local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return n`
+	dummyAdminPassword   = "invalid-admin-password"
+)
+
+func validAdminUserID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, c := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func ValidUserID(value string) bool {
+	return validAdminUserID(value)
+}
+
+func validAdminTokenID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func newAdminSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func adminSessionKey(userID, sid string) string {
+	return "sess:admin:" + userID + ":" + sid
+}
+
+func legacyAdminSessionKey(userID string) string {
+	return "sess:admin:" + userID
+}
+
+func adminSessionMarker(jti string, sessionVersion int64) string {
+	return jti + ":" + strconv.FormatInt(sessionVersion, 10)
+}
+
+var (
+	dummyHashOnce sync.Once
+	dummyHash     []byte
+)
+
 // Service обслуживает кабинет.
 type Service struct {
-	pg *pgxpool.Pool
-	rd *redis.Client
+	pg        *pgxpool.Pool
+	rd        *redis.Client
+	dummyHash []byte
 }
 
 // New возвращает админ-сервис.
 func New(pg *pgxpool.Pool, rd *redis.Client) *Service {
-	return &Service{pg: pg, rd: rd}
+	dummyHashOnce.Do(func() {
+		dummyHash, _ = bcrypt.GenerateFromPassword([]byte(dummyAdminPassword), bcryptCost)
+	})
+	return &Service{pg: pg, rd: rd, dummyHash: dummyHash}
 }
 
 // adminCtxKey — admin user_id в контексте.
@@ -82,88 +160,236 @@ func AdminID(ctx context.Context) string {
 	return uid
 }
 
-// whitelistedTgID — tg_id в ADMIN_TG_IDS (первичная выдача админа).
-func whitelistedTgID(tgID int64) bool {
-	for _, part := range strings.Split(os.Getenv("ADMIN_TG_IDS"), ",") {
-		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id == tgID && tgID != 0 {
-			return true
-		}
-	}
-	return false
+func normalizeUsername(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
-// HandleLogin — POST /v1/admin/login {initData}: TG + admin → taro_admin cookie.
+func NormalizeUsername(value string) string {
+	return normalizeUsername(value)
+}
+
+func ValidateUsername(value string) bool {
+	return validUsername(normalizeUsername(value))
+}
+
+func validUsername(username string) bool {
+	if len(username) < 3 || len(username) > 64 {
+		return false
+	}
+	for i, c := range username {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		if i > 0 && (c == '.' || c == '_' || c == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validPassword(password string) bool {
+	if len(password) < minPasswordBytes || len(password) > maxPasswordBytes || strings.IndexByte(password, 0) >= 0 {
+		return false
+	}
+	for i := 0; i < len(password); i++ {
+		if password[i] < 0x20 || password[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func HashPassword(password string) (string, error) {
+	if !validPassword(password) {
+		return "", errors.New("password does not satisfy policy")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+func requestOrigin(r *http.Request) string {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		origin = strings.TrimSpace(r.Header.Get("Referer"))
+	}
+	return origin
+}
+
+func originAllowed(r *http.Request) bool {
+	origin := requestOrigin(r)
+	return origin == "" || isLocalOrigin(r, origin)
+}
+
+func mutatingOriginAllowed(r *http.Request) bool {
+	return isLocalOrigin(r, requestOrigin(r))
+}
+
+func requestIP(r *http.Request) string {
+	ip := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	if ip == "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			ip = host
+		} else {
+			ip = strings.Trim(r.RemoteAddr, "[]")
+		}
+	}
+	if parsed := net.ParseIP(ip); parsed != nil {
+		return parsed.String()
+	}
+	return "unknown"
+}
+
+func adminLoginRateKeys(r *http.Request, username string) []string {
+	ipHash := sha256.Sum256([]byte(requestIP(r)))
+	userHash := sha256.Sum256([]byte(username))
+	return []string{
+		"rl:admin-login:ip:" + hex.EncodeToString(ipHash[:]),
+		"rl:admin-login:user:" + hex.EncodeToString(userHash[:]),
+	}
+}
+
+func (s *Service) allowLogin(r *http.Request, username string) (bool, error) {
+	if s.rd == nil {
+		return false, errors.New("redis unavailable")
+	}
+	for _, key := range adminLoginRateKeys(r, username) {
+		n, err := s.rd.Eval(r.Context(), adminLoginRateScript,
+			[]string{key}, int(adminLoginRateWindow/time.Second)).Int()
+		if err != nil {
+			return false, err
+		}
+		if n > adminLoginRateMax {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (s *Service) verifyPassword(encoded, password string) bool {
+	hash := []byte(encoded)
+	if len(password) > maxPasswordBytes || len(hash) == 0 {
+		hash = s.dummyHash
+	}
+	matched := len(hash) > 0 && bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil
+	return len(password) <= maxPasswordBytes && matched
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		InitData string `json:"initData"`
-	}
-	if !apierr.Decode(w, r, &req) || req.InitData == "" {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
+	if !originAllowed(r) {
+		apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный Origin")
 		return
 	}
-	tgID, err := auth.VerifyInitData(req.InitData, os.Getenv("TG_BOT_TOKEN"))
+	var req loginRequest
+	if !apierr.Decode(w, r, &req) {
+		return
+	}
+	username := normalizeUsername(req.Username)
+	allowed, err := s.allowLogin(r, username)
 	if err != nil {
-		apierr.Write(w, http.StatusUnauthorized, apierr.CodeInvalidTg, "Не удалось подтвердить Telegram")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	ctx := r.Context()
-	var userID, role string
-	created := false
-	err = s.pg.QueryRow(ctx, `SELECT id, role FROM users WHERE tg_id=$1`, tgID).Scan(&userID, &role)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if !whitelistedTgID(tgID) {
-			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
-			return
-		}
-		if err := s.pg.QueryRow(ctx,
-			`INSERT INTO users (tg_id, role) VALUES ($1,'user') RETURNING id, role`, tgID).Scan(&userID, &role); err != nil {
-			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать")
-			return
-		}
-		created = true
-	} else if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось проверить доступ")
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(adminLoginRateWindow/time.Second)))
+		apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком много попыток, попробуй позже")
 		return
 	}
-	if role != "admin" {
-		if !created {
-			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
-			return
-		}
-		if _, err := s.pg.Exec(ctx, `UPDATE users SET role='admin' WHERE id=$1 AND role != 'admin'`, userID); err != nil {
-			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать")
-			return
-		}
+	var userID, passwordHash string
+	var sessionVersion int64
+	if validUsername(username) {
+		err = s.pg.QueryRow(r.Context(), `
+			SELECT a.user_id, a.password_hash, a.session_version
+			FROM admin_accounts a
+			JOIN users u ON u.id=a.user_id
+			WHERE a.username=$1 AND a.is_active AND u.role='admin' AND u.status='active'`, username).
+			Scan(&userID, &passwordHash, &sessionVersion)
+	} else {
+		err = pgx.ErrNoRows
 	}
-	tok, err := auth.IssueJWT("admin:"+userID, AdminTTL)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	passwordOK := s.verifyPassword(passwordHash, req.Password)
+	if err != nil || !passwordOK {
+		apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Неверный логин или пароль")
+		return
+	}
+	if s.rd == nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	sid, err := newAdminSessionID()
 	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	if err := s.rd.Set(ctx, "sess:admin:"+userID, "1", AdminTTL).Err(); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
+	tok, err := auth.IssueJWT("admin:"+userID, AdminTTL, sid)
+	if err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name: AdminCookie, Value: tok, Path: "/", MaxAge: int(AdminTTL.Seconds()),
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
-	})
+	claims, err := auth.ParseJWTClaims(tok)
+	if err != nil || claims.Subject != "admin:"+userID || claims.SID != sid || !validAdminTokenID(claims.JTI) {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	if _, err := s.pg.Exec(r.Context(), `UPDATE admin_accounts SET last_login_at=now(), updated_at=now() WHERE user_id=$1`, userID); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	if err := s.rd.Set(r.Context(), adminSessionKey(userID, sid), adminSessionMarker(claims.JTI, sessionVersion), AdminTTL).Err(); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	writeAdminCookie(w, tok, int(AdminTTL.Seconds()))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-// HandleLogout — POST /v1/admin/logout: отзыв admin-сессии (аудит B: угона без отзыва нет).
-func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(AdminCookie); err == nil {
-		if sub, err := auth.ParseJWT(c.Value); err == nil {
-			uid := strings.TrimPrefix(sub, "admin:")
-			_, _ = s.rd.Del(r.Context(), "sess:admin:"+uid).Result()
-		}
-	}
+func writeAdminCookie(w http.ResponseWriter, token string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
-		Name: AdminCookie, Value: "", Path: "/", MaxAge: -1,
+		Name: AdminCookie, Value: token, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// HandleLogout — POST /v1/admin/logout: отзыв admin-сессии (аудит B: угона без отзыва нет).
+func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	c, err := r.Cookie(AdminCookie)
+	if err != nil {
+		apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+		return
+	}
+	claims, err := auth.ParseJWTClaims(c.Value)
+	if err != nil || !strings.HasPrefix(claims.Subject, "admin:") {
+		apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+		return
+	}
+	uid := strings.TrimPrefix(claims.Subject, "admin:")
+	if !validAdminUserID(uid) || !validAdminTokenID(claims.SID) || !validAdminTokenID(claims.JTI) {
+		apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+		return
+	}
+	if s.rd == nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	if err := s.rd.Del(r.Context(), adminSessionKey(uid, claims.SID)).Err(); err != nil {
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
+	writeAdminCookie(w, "", -1)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -185,31 +411,46 @@ func (s *Service) RequireAdmin(next http.Handler) http.Handler {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
 			return
 		}
-		sub, err := auth.ParseJWT(c.Value)
-		if err != nil || !strings.HasPrefix(sub, "admin:") {
+		claims, err := auth.ParseJWTClaims(c.Value)
+		if err != nil || !strings.HasPrefix(claims.Subject, "admin:") {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
 			return
 		}
-		uid := strings.TrimPrefix(sub, "admin:")
-		if n, err := s.rd.Exists(r.Context(), "sess:admin:"+uid).Result(); err != nil || n == 0 {
+		uid := strings.TrimPrefix(claims.Subject, "admin:")
+		if !validAdminUserID(uid) || !validAdminTokenID(claims.SID) || !validAdminTokenID(claims.JTI) {
+			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+			return
+		}
+		if s.rd == nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		marker, err := s.rd.Get(r.Context(), adminSessionKey(uid, claims.SID)).Result()
+		if err == redis.Nil {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Сессия завершена")
 			return
 		}
-		// Аудит D: Origin-gate для cookie-ветки (браузер всегда шлёт Origin на POST;
-		// curl без Origin пропускаем — иначе ломаем скрипты владельца).
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				origin = r.Header.Get("Referer")
-			}
-			if origin != "" && !isLocalOrigin(r, origin) {
-				apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный Origin")
-				return
-			}
+		if err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !mutatingOriginAllowed(r) {
+			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный Origin")
+			return
 		}
 		var role string
-		if err := s.pg.QueryRow(r.Context(), `SELECT role FROM users WHERE id=$1`, uid).Scan(&role); err != nil || role != "admin" {
+		var sessionVersion int64
+		err = s.pg.QueryRow(r.Context(), `
+			SELECT u.role, a.session_version
+			FROM users u
+			JOIN admin_accounts a ON a.user_id=u.id
+			WHERE u.id=$1 AND a.is_active AND u.status='active'`, uid).Scan(&role, &sessionVersion)
+		if err != nil || role != "admin" {
 			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Нет доступа")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(marker), []byte(adminSessionMarker(claims.JTI, sessionVersion))) != 1 {
+			apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Сессия завершена")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminCtxKey{}, uid)))

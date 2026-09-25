@@ -350,3 +350,50 @@ func TestE2EMergePreservesMetadataReferralAndQuota(t *testing.T) {
 		t.Fatalf("redis quota floor missing: daily=%d love=%d", daily, love)
 	}
 }
+
+func TestE2EMergePreservesAuthorizationReceiptOwnership(t *testing.T) {
+	ctx, pg, rd, svc := liveAuth(t)
+	tgID := time.Now().UnixNano() - 3000000
+	var survivor, loser string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (tg_id, fingerprint) VALUES ($1,'receipt-merge-fp') RETURNING id`, tgID).Scan(&survivor); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid, fingerprint) VALUES (gen_random_uuid(),'receipt-merge-fp') RETURNING id`).Scan(&loser); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(context.Background(), `DELETE FROM trial_grants WHERE tg_id=$1`, tgID)
+		_, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id IN ($1,$2)`, survivor, loser)
+		_ = rd.Del(context.Background(), "ent:"+survivor+":*", "ent:"+loser+":*").Err()
+	})
+	cards := `[{"card_id":1,"reversed":false,"position":0}]`
+	var readingID string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, quota_state)
+		VALUES ($1,'daily','receipt merge',$2,1,'pending','allowed')
+		RETURNING id`, loser, cards).Scan(&readingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(ctx, `
+		INSERT INTO reading_authorization_receipts (reading_id, user_id, kind)
+		VALUES ($1,$2,'legacy')`, readingID, loser); err != nil {
+		t.Fatal(err)
+	}
+	mergedID, merged, err := svc.Link(ctx, loser, tgID, "receipt-merge-fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged || mergedID != survivor {
+		t.Fatalf("merge result: %q %v", mergedID, merged)
+	}
+	var owner, receiptOwner string
+	if err := pg.QueryRow(ctx, `SELECT user_id::text FROM readings WHERE id=$1`, readingID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(ctx, `SELECT user_id::text FROM reading_authorization_receipts WHERE reading_id=$1`, readingID).Scan(&receiptOwner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != survivor || receiptOwner != survivor {
+		t.Fatalf("owners reading=%q receipt=%q survivor=%q", owner, receiptOwner, survivor)
+	}
+}

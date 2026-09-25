@@ -18,8 +18,8 @@
 ## Где хранится
 - PG таблицы `plans`, `spreads`, `app_config(key,value,updated_at)` — источник правды.
 - Redis-кэш 5 мин, инвалидация по `POST /v1/admin/config/publish` (только через `admin-api :8081`): точечно `DEL spreads:list:v1 plans:active:v1` (<5с; без Publish ≤5 мин).
-- Доступ: только `role=admin` (ты), TG-ID whitelist + `taro_admin` JWT, audit-log в `admin_audit`.
-- Сеть: `admin-api :8081` слушает только `127.0.0.1`; наружу не публикуется, никакого IP-whitelist наружу. Доступ — только SSH-туннель `ssh -L 8081:127.0.0.1:8081 vps`. UI `/admin` в Next ходит только в `admin-api` через server-side proxy, JWT отдельный `taro_admin` TTL 12ч.
+- Доступ: только активная запись `admin_accounts` с `role=admin`, bcrypt-хэш пароля и `taro_admin` JWT; audit-log в `admin_audit`.
+- Сеть: `admin-api :8081` слушает только `127.0.0.1`; наружу не публикуется, никакого IP-whitelist наружу. Доступ — только SSH-туннель `ssh -L 8081:127.0.0.1:8081 vps`. Статическая панель и API живут на одном loopback-порту; `ADMIN_API_TOKEN` используется только server-to-client вызовами.
 
 ## User Story
 Как владелец, я хочу поменять цену с 299 на 349 и выключить Кельтский крест на выходные, чтобы проверить конверсию без программиста.

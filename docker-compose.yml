@@ -59,6 +59,12 @@ services:
       REDIS_ENC_KEY: ${REDIS_ENC_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_API_KEY_2: ${OPENROUTER_API_KEY_2:-}
+      AI_REQUIRE_CACHE_ENCRYPTION: ${AI_REQUIRE_CACHE_ENCRYPTION:-}
+      AI_WORKER_MAX_ATTEMPTS: ${AI_WORKER_MAX_ATTEMPTS:-5}
+      AI_WORKER_BACKOFF_SECONDS: ${AI_WORKER_BACKOFF_SECONDS:-30}
+      AI_WORKER_MAX_BACKOFF_SECONDS: ${AI_WORKER_MAX_BACKOFF_SECONDS:-900}
+      CRISIS_PATTERNS_JSON: ${CRISIS_PATTERNS_JSON:-}
+      CRISIS_RESOURCE_TEXT: ${CRISIS_RESOURCE_TEXT:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
       TG_STARS_SECRET_TOKEN: ${TG_STARS_SECRET_TOKEN:-dev-only-stars}
@@ -75,7 +81,7 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -97,8 +103,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-dev-only-bot}
+      ADMIN_ORIGIN: ${ADMIN_ORIGIN:-http://127.0.0.1:${ADMIN_HOST_PORT:-8081}}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
-      ADMIN_TG_IDS: ${ADMIN_TG_IDS:-}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
     depends_on:
       db:
@@ -110,7 +116,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/readyz >/dev/null || exit 1"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -127,6 +133,7 @@ services:
     network_mode: service:api-admin
     volumes:
       - ./deploy/admin-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/admin-ui:/usr/share/nginx/html:ro
     depends_on:
       api-admin:
         condition: service_healthy
@@ -139,7 +146,7 @@ services:
       - /tmp
     pids_limit: 64
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/healthz >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/readyz >/dev/null || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -150,7 +157,7 @@ services:
       context: ./web
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-}
+        NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3000}
         NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
     restart: unless-stopped
     environment:
@@ -263,6 +270,10 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taro_dev_only}
       EXPECTED_MIGRATION_VERSION: ${EXPECTED_MIGRATION_VERSION:-0}
+      SCHEMA_READINESS_MODE: ${SCHEMA_READINESS_MODE:-schema}
+      MIGRATION_PREFLIGHT: ${MIGRATION_PREFLIGHT:-0}
+      MIGRATION_DOWN_STEPS: ${MIGRATION_DOWN_STEPS:-}
+      MIGRATION_LATEST_VERSION: ${MIGRATION_LATEST_VERSION:-0}
     networks:
       - internal
     depends_on:

@@ -53,6 +53,52 @@ func TestWebhookIdentifiers(t *testing.T) {
 	}
 }
 
+func TestWebhookEventHashDelimiterAmbiguity(t *testing.T) {
+	first := successfulPayment{
+		Currency:              "XTR",
+		TotalAmount:           66,
+		InvoicePayload:        "00000000-0000-0000-0000-000000000001",
+		TelegramPaymentCharge: "charge|part",
+		ProviderPaymentCharge: "tail",
+	}
+	second := successfulPayment{
+		Currency:              "XTR",
+		TotalAmount:           66,
+		InvoicePayload:        "00000000-0000-0000-0000-000000000001",
+		TelegramPaymentCharge: "charge",
+		ProviderPaymentCharge: "part|tail",
+	}
+	if webhookEventHash(first, 42) == webhookEventHash(second, 42) {
+		t.Fatal("delimiter-ambiguous webhook events have the same hash")
+	}
+}
+
+func TestWebhookReconciliationRecovery(t *testing.T) {
+	owner := int64(42)
+	cases := []struct {
+		name   string
+		reason string
+		owner  *int64
+		want   bool
+	}{
+		{name: "amount", reason: "amount_mismatch", owner: &owner, want: true},
+		{name: "charge", reason: "charge_mismatch", owner: &owner, want: true},
+		{name: "reused", reason: "charge_reused", owner: &owner, want: true},
+		{name: "owner verified", reason: "owner_unverified", owner: &owner, want: true},
+		{name: "owner missing", reason: "owner_unverified", want: false},
+		{name: "unknown", reason: "refund_unknown", owner: &owner, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := tc.reason
+			p := webhookPayment{storedPayment: storedPayment{ReconciliationReason: &reason}, ownerTG: tc.owner}
+			if got := webhookReconciliationCanProceed(p); got != tc.want {
+				t.Fatalf("can proceed=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTelegramCharge(t *testing.T) {
 	charge := "ch-123_A"
 	p := storedPayment{ProviderPaymentID: "tg:" + charge}

@@ -50,14 +50,6 @@ exceptions:
     accepted_by: "owner"
     date: "2026-09-24"
     lift_when: "сильный пароль на VPS"
-  - id: E07
-    file: "docker-compose.yml:72 / docs/BACKLOG_OWNER.md:E04"
-    title: "ADMIN_TG_IDS задаёт человек"
-    risk: "пусто по умолчанию — админов нет"
-    reason: "owner-key: реальный TG-ID владельца"
-    accepted_by: "owner"
-    date: "2026-09-24"
-    lift_when: "ADMIN_TG_IDS задан"
   - id: E08
     file: "deploy/nginx.conf:38-39 / docker-compose.yml:109-111"
     title: "TLS/HSTS делает человек (certbot)"

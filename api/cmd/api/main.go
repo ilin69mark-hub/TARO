@@ -3,9 +3,16 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -25,7 +32,34 @@ import (
 	"taro/api/internal/store"
 )
 
+func validateOriginEnv(name string) error {
+	value := os.Getenv(name)
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) != value || strings.ContainsAny(value, "?#") {
+		return fmt.Errorf("%s must be an absolute HTTP(S) origin", name)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" ||
+		parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || parsed.RawFragment != "" || strings.HasSuffix(parsed.Host, ":") {
+		return fmt.Errorf("%s must be an absolute HTTP(S) origin", name)
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return fmt.Errorf("%s must be an absolute HTTP(S) origin", name)
+		}
+	}
+	return nil
+}
+
 func main() {
+	if err := validateOriginEnv("PUBLIC_ORIGIN"); err != nil {
+		log.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -51,6 +85,8 @@ func main() {
 	// worker дописывания pending_fallback (см. ai/worker.go, T12/T13)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
+	shutdownSignalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	gw.StartWorker(workerCtx, pg, 30*time.Second)
 	// тик протухания pending-платежей 15м (см. T29)
 	go func() {
@@ -64,7 +100,7 @@ func main() {
 			case <-t.C:
 				func() {
 					defer apierr.Recover() // S06
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					ctx, cancel := context.WithTimeout(workerCtx, 30*time.Second)
 					defer cancel()
 					_, _ = py.ExpirePending(ctx)
 				}()
@@ -81,6 +117,24 @@ func main() {
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","api":"public"}`))
+	})
+	r.Get("/readyz", func(w http.ResponseWriter, req *http.Request) {
+		if err := validateOriginEnv("PUBLIC_ORIGIN"); err != nil {
+			http.Error(w, "invalid PUBLIC_ORIGIN", http.StatusServiceUnavailable)
+			return
+		}
+		probeCtx, probeCancel := context.WithTimeout(req.Context(), 2*time.Second)
+		defer probeCancel()
+		if err := pg.Ping(probeCtx); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := rd.Ping(probeCtx).Err(); err != nil {
+			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready","api":"public"}`))
 	})
 	r.Post("/v1/auth/telegram", au.HandleTelegram)
 	r.Post("/v1/auth/anon", au.HandleAnon)
@@ -126,7 +180,26 @@ func main() {
 		addr = ":8080"
 	}
 	log.Printf("api-public listening on %s", addr)
-	if err := http.ListenAndServe(addr, r); err != nil {
-		log.Fatal(err)
+	server := &http.Server{Addr: addr, Handler: r}
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-shutdownSignalCtx.Done():
+		stopWorker()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer drainCancel()
+		if err := server.Shutdown(drainCtx); err != nil {
+			log.Printf("api-public shutdown: %v", err)
+			_ = server.Close()
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("api-public server: %v", err)
+		}
 	}
 }

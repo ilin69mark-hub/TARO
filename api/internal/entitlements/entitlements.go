@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -263,6 +264,497 @@ func (s *Service) Check(ctx context.Context, userID, spreadCode string) (Verdict
 		return Verdict{Allow: true, Reason: "daily"}, nil
 	}
 	return Verdict{Reason: "limit_exceeded"}, nil
+}
+
+var errReadingAuthorizationInvalid = errors.New("reading authorization state is invalid")
+
+const recoveryAuthorizationTimeout = 5 * time.Second
+
+type authorizationReceipt struct {
+	Kind          string
+	EntitlementID string
+	PeriodStart   *time.Time
+}
+
+func (s *Service) AuthorizeReading(ctx context.Context, readingID, userID, spreadCode string) (Verdict, error) {
+	if s == nil || s.pg == nil || readingID == "" || userID == "" {
+		return Verdict{}, errReadingAuthorizationInvalid
+	}
+	dailyLimit := atoi(s.config(ctx, "free.daily_limit", "1"), "1")
+	weeklyLimit := atoi(s.config(ctx, "love.free_weekly", "1"), "1")
+	now := time.Now()
+	tx, err := s.pg.Begin(ctx)
+	if err != nil {
+		return Verdict{}, err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var lockedUser string
+	if err := tx.QueryRow(ctx, `
+		SELECT id::text FROM users WHERE id=$1 FOR KEY SHARE`, userID).Scan(&lockedUser); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		return Verdict{}, err
+	}
+	var actualUser, actualSpread, status, quotaState string
+	if err := tx.QueryRow(ctx, `
+		SELECT user_id::text, spread_code, status, quota_state
+		  FROM readings WHERE id=$1 AND user_id=$2 FOR UPDATE`, readingID, userID).
+		Scan(&actualUser, &actualSpread, &status, &quotaState); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		return Verdict{}, err
+	}
+	if actualUser != userID || actualSpread != spreadCode {
+		return Verdict{}, errReadingAuthorizationInvalid
+	}
+
+	receipt, receiptErr := loadAuthorizationReceiptTx(ctx, tx, readingID)
+	if receiptErr == nil {
+		verdict, err := s.receiptVerdictTx(ctx, tx, readingID, receipt)
+		if err != nil {
+			return Verdict{}, err
+		}
+		if !verdict.Allow {
+			if err := tx.Commit(ctx); err != nil {
+				return Verdict{}, err
+			}
+			return verdict, nil
+		}
+		if quotaState != "allowed" {
+			if status != "pending" && status != "pending_fallback" {
+				return Verdict{}, errReadingAuthorizationInvalid
+			}
+			if err := setReadingQuotaAllowedTx(ctx, tx, readingID); err != nil {
+				return Verdict{}, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Verdict{}, err
+		}
+		return verdict, nil
+	}
+	if !errors.Is(receiptErr, pgx.ErrNoRows) {
+		return Verdict{}, receiptErr
+	}
+
+	if quotaState == "allowed" {
+		var linkedID string
+		linkedErr := tx.QueryRow(ctx, `
+			SELECT id::text
+			  FROM single_entitlements
+			 WHERE user_id=$1
+			   AND consumed_reading_id=$2
+			   AND (spread_code=$3 OR spread_code='any')
+			 FOR UPDATE`, userID, readingID, spreadCode).Scan(&linkedID)
+		kind := "legacy"
+		entitlementID := ""
+		verdict := Verdict{Allow: true, Reason: "subscription"}
+		if linkedErr == nil {
+			kind = "single"
+			entitlementID = linkedID
+			verdict = Verdict{Allow: true, Reason: "single", SingleID: linkedID}
+		} else if !errors.Is(linkedErr, pgx.ErrNoRows) {
+			return Verdict{}, linkedErr
+		}
+		if _, err := insertAuthorizationReceiptTx(ctx, tx, readingID, userID, kind, entitlementID, nil); err != nil {
+			return Verdict{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Verdict{}, err
+		}
+		return verdict, nil
+	}
+	if quotaState != "unchecked" || (status != "pending" && status != "pending_fallback") {
+		if status == "cancelled" && quotaState == "denied" {
+			return Verdict{Reason: "limit_exceeded"}, nil
+		}
+		return Verdict{}, errReadingAuthorizationInvalid
+	}
+
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM subscriptions
+			 WHERE user_id=$1 AND status='active' AND valid_until > now()
+		)`, userID).Scan(&active); err != nil {
+		return Verdict{}, err
+	}
+	var isPremium, isLove bool
+	if err := tx.QueryRow(ctx, `
+		SELECT is_premium, code='love' FROM spreads WHERE code=$1 AND is_active`, spreadCode).
+		Scan(&isPremium, &isLove); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		return Verdict{}, err
+	}
+
+	if isPremium {
+		var linkedID string
+		linkedErr := tx.QueryRow(ctx, `
+			SELECT id::text
+			  FROM single_entitlements
+			 WHERE user_id=$1
+			   AND consumed_reading_id=$2
+			   AND (spread_code=$3 OR spread_code='any')
+			 FOR UPDATE`, userID, readingID, spreadCode).Scan(&linkedID)
+		if linkedErr == nil {
+			if _, err := insertAuthorizationReceiptTx(ctx, tx, readingID, userID, "single", linkedID, nil); err != nil {
+				return Verdict{}, err
+			}
+			if err := setReadingQuotaAllowedTx(ctx, tx, readingID); err != nil {
+				return Verdict{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Verdict{}, err
+			}
+			return Verdict{Allow: true, Reason: "single", SingleID: linkedID}, nil
+		}
+		if !errors.Is(linkedErr, pgx.ErrNoRows) {
+			return Verdict{}, linkedErr
+		}
+	}
+
+	verdict := Verdict{Allow: true}
+	var period *time.Time
+	if active {
+		verdict.Reason = "subscription"
+	} else if isLove {
+		ok, _, consumeErr := consumeReadingQuotaTx(ctx, tx, userID, "love", weeklyLimit, mondayMSK(now))
+		if consumeErr != nil {
+			return Verdict{}, consumeErr
+		}
+		if !ok {
+			if err := setReadingQuotaDeniedTx(ctx, tx, readingID); err != nil {
+				return Verdict{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Verdict{}, err
+			}
+			return Verdict{Reason: "limit_exceeded"}, nil
+		}
+		periodValue, _ := time.Parse("2006-01-02", mondayMSK(now))
+		period = &periodValue
+		verdict.Reason = "love_weekly"
+	} else if isPremium {
+		singleID, selectErr := lockSingleEntitlementTx(ctx, tx, userID, spreadCode)
+		err := selectErr
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := setReadingQuotaDeniedTx(ctx, tx, readingID); err != nil {
+				return Verdict{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Verdict{}, err
+			}
+			return Verdict{Reason: "limit_exceeded"}, nil
+		}
+		if err != nil {
+			return Verdict{}, err
+		}
+		var linked string
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(consumed_reading_id::text,'')
+			  FROM single_entitlements WHERE id=$1 FOR UPDATE`, singleID).Scan(&linked); err != nil {
+			return Verdict{}, err
+		}
+		if linked != "" {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE single_entitlements
+			   SET consumed_reading_id=$1
+			 WHERE id=$2 AND consumed_reading_id IS NULL`, readingID, singleID)
+		if err != nil {
+			return Verdict{}, err
+		}
+		if tag.RowsAffected() != 1 {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		verdict.Reason = "single"
+		verdict.SingleID = singleID
+	} else {
+		ok, _, consumeErr := consumeReadingQuotaTx(ctx, tx, userID, "daily", dailyLimit, mskDate(now))
+		if consumeErr != nil {
+			return Verdict{}, consumeErr
+		}
+		if !ok {
+			if err := setReadingQuotaDeniedTx(ctx, tx, readingID); err != nil {
+				return Verdict{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Verdict{}, err
+			}
+			return Verdict{Reason: "limit_exceeded"}, nil
+		}
+		periodValue, _ := time.Parse("2006-01-02", mskDate(now))
+		period = &periodValue
+		verdict.Reason = "daily"
+	}
+
+	if _, err := insertAuthorizationReceiptTx(ctx, tx, readingID, userID, verdict.Reason, verdict.SingleID, period); err != nil {
+		return Verdict{}, err
+	}
+	if err := setReadingQuotaAllowedTx(ctx, tx, readingID); err != nil {
+		return Verdict{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Verdict{}, err
+	}
+	return verdict, nil
+}
+
+func lockSingleEntitlementTx(ctx context.Context, tx pgx.Tx, userID, spreadCode string) (string, error) {
+	var singleID string
+	err := tx.QueryRow(ctx, `
+		SELECT id::text
+		  FROM single_entitlements
+		 WHERE user_id=$1
+		   AND (spread_code=$2 OR spread_code='any')
+		   AND consumed_reading_id IS NULL
+		 ORDER BY created_at, id
+		 LIMIT 1
+		 FOR UPDATE SKIP LOCKED`, userID, spreadCode).Scan(&singleID)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return singleID, err
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT id::text
+		  FROM single_entitlements
+		 WHERE user_id=$1
+		   AND (spread_code=$2 OR spread_code='any')
+		   AND consumed_reading_id IS NULL
+		 ORDER BY created_at, id
+		 LIMIT 1
+		 FOR UPDATE`, userID, spreadCode).Scan(&singleID)
+	return singleID, err
+}
+
+func (s *Service) receiptVerdictTx(ctx context.Context, tx pgx.Tx, readingID string, receipt authorizationReceipt) (Verdict, error) {
+	switch receipt.Kind {
+	case "subscription", "legacy":
+		return Verdict{Allow: true, Reason: "subscription"}, nil
+	case "daily":
+		return Verdict{Allow: true, Reason: "daily"}, nil
+	case "love_weekly":
+		return Verdict{Allow: true, Reason: "love_weekly"}, nil
+	case "single":
+		if receipt.EntitlementID == "" {
+			return Verdict{Reason: "limit_exceeded"}, nil
+		}
+		var linked string
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(consumed_reading_id::text,'')
+			  FROM single_entitlements WHERE id=$1 FOR UPDATE`, receipt.EntitlementID).Scan(&linked); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return Verdict{}, errReadingAuthorizationInvalid
+			}
+			return Verdict{}, err
+		}
+		if linked != "" && linked != readingID {
+			return Verdict{}, errReadingAuthorizationInvalid
+		}
+		if linked == "" {
+			tag, err := tx.Exec(ctx, `
+				UPDATE single_entitlements
+				   SET consumed_reading_id=$1
+				 WHERE id=$2 AND consumed_reading_id IS NULL`, readingID, receipt.EntitlementID)
+			if err != nil {
+				return Verdict{}, err
+			}
+			if tag.RowsAffected() != 1 {
+				return Verdict{}, errReadingAuthorizationInvalid
+			}
+		}
+		return Verdict{Allow: true, Reason: "single", SingleID: receipt.EntitlementID}, nil
+	default:
+		return Verdict{}, errReadingAuthorizationInvalid
+	}
+}
+
+func loadAuthorizationReceiptTx(ctx context.Context, tx pgx.Tx, readingID string) (authorizationReceipt, error) {
+	var receipt authorizationReceipt
+	var period *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT kind, COALESCE(entitlement_id::text,''), period_start
+		  FROM reading_authorization_receipts
+		 WHERE reading_id=$1
+		 FOR UPDATE`, readingID).Scan(&receipt.Kind, &receipt.EntitlementID, &period)
+	receipt.PeriodStart = period
+	return receipt, err
+}
+
+func insertAuthorizationReceiptTx(ctx context.Context, tx pgx.Tx, readingID, userID, kind, entitlementID string, period *time.Time) (authorizationReceipt, error) {
+	var entitlement any
+	if entitlementID != "" {
+		entitlement = entitlementID
+	}
+	var periodValue any
+	if period != nil {
+		periodValue = *period
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO reading_authorization_receipts
+			(reading_id, user_id, kind, entitlement_id, period_start)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (reading_id) DO NOTHING`, readingID, userID, kind, entitlement, periodValue)
+	if err != nil {
+		return authorizationReceipt{}, err
+	}
+	if tag.RowsAffected() == 1 {
+		return authorizationReceipt{Kind: kind, EntitlementID: entitlementID, PeriodStart: period}, nil
+	}
+	existing, err := loadAuthorizationReceiptTx(ctx, tx, readingID)
+	if err != nil {
+		return authorizationReceipt{}, err
+	}
+	if existing.Kind != kind || existing.EntitlementID != entitlementID {
+		return authorizationReceipt{}, errReadingAuthorizationInvalid
+	}
+	return existing, nil
+}
+
+func setReadingQuotaAllowedTx(ctx context.Context, tx pgx.Tx, readingID string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE readings
+		   SET quota_state='allowed', worker_claim_token=NULL,
+		       worker_lease_until=now()+interval '2 minutes', worker_attempts=0, updated_at=now()
+		 WHERE id=$1 AND quota_state='unchecked'`, readingID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errReadingAuthorizationInvalid
+	}
+	return nil
+}
+
+func setReadingQuotaDeniedTx(ctx context.Context, tx pgx.Tx, readingID string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE readings
+		   SET status='cancelled', quota_state='denied', worker_claim_token=NULL,
+		       worker_lease_until=NULL, updated_at=now()
+		 WHERE id=$1 AND quota_state='unchecked'
+		   AND status IN ('pending', 'pending_fallback')`, readingID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errReadingAuthorizationInvalid
+	}
+	return nil
+}
+
+func consumeReadingQuotaTx(ctx context.Context, tx pgx.Tx, userID, kind string, limit int, period string) (bool, int, error) {
+	if limit <= 0 {
+		return false, 0, nil
+	}
+	var used int
+	var currentPeriod *string
+	var query string
+	if kind == "daily" {
+		query = `
+			INSERT INTO entitlements (user_id)
+			VALUES ($1)
+			ON CONFLICT (user_id) DO UPDATE SET user_id=EXCLUDED.user_id
+			RETURNING free_used_today, free_date::text`
+	} else {
+		query = `
+			INSERT INTO entitlements (user_id)
+			VALUES ($1)
+			ON CONFLICT (user_id) DO UPDATE SET user_id=EXCLUDED.user_id
+			RETURNING love_used_week, love_week::text`
+	}
+	if err := tx.QueryRow(ctx, query, userID).Scan(&used, &currentPeriod); err != nil {
+		return false, 0, err
+	}
+	value := used + 1
+	if currentPeriod == nil || *currentPeriod != period {
+		value = 1
+	}
+	if value > limit {
+		return false, used, nil
+	}
+	if kind == "daily" {
+		_, err := tx.Exec(ctx, `
+			UPDATE entitlements
+			   SET free_used_today=$2, free_date=$3::date
+			 WHERE user_id=$1`, userID, value, period)
+		if err != nil {
+			return false, 0, err
+		}
+	} else {
+		_, err := tx.Exec(ctx, `
+			UPDATE entitlements
+			   SET love_used_week=$2, love_week=$3::date
+			 WHERE user_id=$1`, userID, value, period)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+	return true, value, nil
+}
+
+func (s *Service) RecoverPendingAuthorizations(ctx context.Context, limit int) error {
+	if s == nil || s.pg == nil || limit <= 0 {
+		return nil
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := s.pg.Query(ctx, `
+		WITH candidates AS (
+			SELECT id
+			  FROM readings
+			 WHERE status IN ('pending', 'pending_fallback')
+			   AND quota_state='unchecked'
+			   AND (worker_lease_until IS NULL OR worker_lease_until <= now())
+			 ORDER BY updated_at, created_at
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT $1
+		)
+		UPDATE readings r
+		   SET worker_claim_token=gen_random_uuid(),
+		       worker_lease_until=now()+interval '2 minutes'
+		  FROM candidates
+		 WHERE r.id=candidates.id
+		RETURNING r.id::text, r.user_id::text, r.spread_code, r.worker_claim_token::text`, limit)
+	if err != nil {
+		return err
+	}
+	type candidate struct {
+		id, userID, spreadCode, token string
+	}
+	jobs := make([]candidate, 0, limit)
+	for rows.Next() {
+		var job candidate
+		if err := rows.Scan(&job.id, &job.userID, &job.spreadCode, &job.token); err == nil {
+			jobs = append(jobs, job)
+		}
+	}
+	rows.Close()
+	for _, job := range jobs {
+		authorizationCtx, cancel := context.WithTimeout(ctx, recoveryAuthorizationTimeout)
+		_, authorizationErr := s.AuthorizeReading(authorizationCtx, job.id, job.userID, job.spreadCode)
+		cancel()
+		if authorizationErr != nil {
+			if errors.Is(authorizationErr, errReadingAuthorizationInvalid) {
+				_, _ = s.pg.Exec(ctx, `
+					UPDATE readings
+					   SET status='failed', quota_state='error', worker_claim_token=NULL,
+					       worker_lease_until=NULL, updated_at=now()
+					 WHERE id=$1 AND quota_state='unchecked' AND worker_claim_token=$2`, job.id, job.token)
+				continue
+			}
+			_, _ = s.pg.Exec(ctx, `
+				UPDATE readings
+				   SET worker_claim_token=NULL, worker_lease_until=now()+interval '30 seconds', updated_at=now()
+				 WHERE id=$1 AND quota_state='unchecked' AND worker_claim_token=$2`, job.id, job.token)
+		}
+	}
+	return nil
 }
 
 // GrantBonusDays продлевает valid_until: max(now, valid)+days новой строкой bonus-плана.

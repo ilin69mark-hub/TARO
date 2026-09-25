@@ -8,7 +8,7 @@
 - [ ] E01 OpenRouter API key (+2-й для breaker) → env VPS; я проверю живой вызов U01 — связь: `04-architecture/06`
 - [ ] E02 TG-бот: токен + Stars + Secret-Token → env; я проверю U02 + G1 — связь: `04-architecture/07`
 - [ ] E03 PostHog-ключ → env/Next public; я проверю U03 + сверку ±5% — связь: `04-architecture/08`
-- [ ] E04 Свой TG-ID в admin-whitelist; Cloudflare CDN; домен `taro.me` + диплинк — связь: `02-functional/07`
+- [ ] E04 Provisioning пароля администратора; Cloudflare CDN; домен `taro.me` + диплинк — связь: `02-functional/07`
 - [ ] E05 VAPID-прод ключи (сейчас dev) — связь: `U21`
 
 ## E2 — Деньги и KYC
@@ -42,7 +42,7 @@
 
 ## D-пакет (код агента, 2026-09-23+)
 - [x] D-тесты до 70% — done (2026-09-23): Go **70.4%** (testutil + e2e на живых PG/Redis: entitlements-порядок, readings-флоу/SSE/crisis, referral-antifraud+hook, payments webhook-duplicate/winback/refund, ratelimit 429, spreads-кэш, admin-auth/publish/audit/rotate, auth-HMAC/сессии/merge, ai mock-OpenRouter/worker, push-крипто+send, diary, me); web vitest **14/14** (device/SSE/events/paywall/streak) + `npm test` в CI; `go test` в CI с сервисами+migrate. По пути пойманы и исправлены: referral self-row КРИТБАГ (миграция 014), worker NULL-question, pgx $1-дубли. Остаток: живые ключи (E01–E03), ручные FPS/арты.
-- [x] D1 admin-auth + publish/audit — done: taro_admin JWT 12ч + whitelist-промоушн + RequireAdmin на всех ручках; publish применяет diff (app_config/plans-версиями/spreads) + audit + DEL; config полный; e2e login/403/422/audit; по пути: ADMIN_TG_IDS в compose, off-by-one плейсхолдеров
+- [x] D1 admin-auth + publish/audit — done: taro_admin JWT 12ч + password login/bcrypt + RequireAdmin на всех ручках; publish применяет diff (app_config/plans-версиями/spreads) + audit + DEL; config полный; e2e login/403/422/audit; off-by-one плейсхолдеров закрыт
 - [x] D2 unit-тесты ядра + CI — done: entitlements (MSK-midnight, ISO-границы, Lua e2e), readings (draw/rate/crisis/MSK), payments (бакет/itoa), referral (формат/уникальность); CI: PG+Redis сервисы + migrate + go test; YAML valid; 9/9 пакетов зелено
 - [x] D3 invoice/verify/refund — done: invoice идемпотентный (миграция 013, e2e 1 строка), verify по спеке (оба поля), refund 502 без порчи при ошибке TG + note при ручном; e2e все пути
 - [x] D4 аналитика live — done: posthog-js lazy-init, visit/spread_open заведены, PII-grep в CI (clean); ключ — E03

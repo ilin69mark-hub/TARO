@@ -59,10 +59,33 @@ func (s *Service) HandleDelete(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	// admin_audit без CASCADE — чистим явно (админ тоже может удалиться)
-	_, _ = s.pg.Exec(ctx, `DELETE FROM admin_audit WHERE admin_id=$1`, uid)
-	_, err := s.pg.Exec(ctx, `DELETE FROM users WHERE id=$1`, uid)
+	// admin_audit, reading_quota_quarantine_034 и payment_webhook_events без CASCADE —
+	// чистим явно в одной транзакции, иначе после DELETE users остаются строки юзера.
+	tx, err := s.pg.Begin(ctx)
 	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
+		return
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM admin_audit WHERE admin_id=$1`, uid); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
+		return
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM reading_quota_quarantine_034 WHERE user_id=$1`, uid); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
+		return
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM payment_webhook_events
+		 WHERE payment_id IN (SELECT id FROM payments WHERE user_id=$1)`, uid); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
+		return
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id=$1`, uid); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось удалить данные")
 		return
 	}

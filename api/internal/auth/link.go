@@ -125,9 +125,17 @@ func (s *Service) HandleLink(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
+	csrf, err := s.issueCSRF(w, r.Context(), survivor)
+	if err != nil {
+		if s.rd != nil {
+			_ = s.rd.Del(r.Context(), sessKey(survivor), "csrf:"+survivor).Err()
+		}
+		ExpireAuthCookies(w)
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
 	writeCookie(w, tok, UserTTL)
 	writeFpCookie(w, fp)
-	csrf := s.issueCSRF(w, r.Context(), survivor)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"merged": merged, "user_id": survivor, "csrf_token": csrf})
 }
@@ -240,6 +248,9 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 		if _, err := tx.Exec(ctx, q, other.ID, current); err != nil {
 			return "", false, err
 		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE reading_authorization_receipts SET user_id=$1 WHERE user_id=$2`, other.ID, current); err != nil {
+		return "", false, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM subscriptions s USING subscriptions keep
 		WHERE s.user_id=$1 AND keep.user_id=$1 AND s.id<>keep.id

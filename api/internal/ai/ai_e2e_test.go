@@ -49,7 +49,7 @@ func testGateway(t *testing.T) (context.Context, *pgxpool.Pool, *redis.Client, *
 	return ctx, pg, rd, gw
 }
 
-var testCards = []CardValue{{Name: "Маг", Upright: "Воля", CardID: 1}}
+var testCards = []CardValue{{Name: "Маг", Upright: "Воля", ReversedText: "Сомнение", CardID: 1}}
 var testPos = []Position{{Label: "Карта дня", Meaning: "фокус"}}
 
 func drain(ch <-chan string) {
@@ -126,8 +126,8 @@ func TestE2EWorkerDrain(t *testing.T) {
 	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
 	var rid string
 	if err := pg.QueryRow(ctx, `
-		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation)
-		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending_fallback','')
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending_fallback','','allowed')
 		RETURNING id`, uid).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
@@ -142,9 +142,14 @@ func TestE2EWorkerDrain(t *testing.T) {
 func TestE2EStartWorkerTick(t *testing.T) {
 	ctx, pg, _, gw := testGateway(t)
 	cctx, cancel := context.WithCancel(ctx)
-	gw.StartWorker(cctx, pg, 20*time.Millisecond)
+	done := gw.startWorker(cctx, pg, 20*time.Millisecond)
 	time.Sleep(80 * time.Millisecond)
 	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop")
+	}
 }
 
 func TestE2EStreamPanicChannelOwnership(t *testing.T) {
@@ -236,7 +241,7 @@ func TestE2EModerationBeforeCache(t *testing.T) {
 		t.Fatalf("unsafe output: %q", streamed.String())
 	}
 	cfg := gw.LoadConfig(ctx)
-	raw, err := rd.Get(ctx, CacheKey(cfg.Model, "daily", testCards, "moderation")).Result()
+	raw, err := rd.Get(ctx, cacheKey(cfg.Model, "daily", testPos, testCards, "moderation", cfg)).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,8 +331,8 @@ func TestE2EWorkerClaimIsIdempotent(t *testing.T) {
 	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
 	var rid string
 	if err := pg.QueryRow(ctx, `
-		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation)
-		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','')
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
 		RETURNING id`, uid).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
@@ -347,5 +352,328 @@ func TestE2EWorkerClaimIsIdempotent(t *testing.T) {
 	}
 	if status != "done" || attempts != 1 || calls.Load() != 1 {
 		t.Fatalf("status=%s attempts=%d calls=%d", status, attempts, calls.Load())
+	}
+}
+
+func TestE2EWorkerClaimsBoundedBatch(t *testing.T) {
+	ctx, pg, _, gw := testGateway(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"bounded"}}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	var uid string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
+	ids := make([]string, 2)
+	for i := range ids {
+		if err := pg.QueryRow(ctx, `
+			INSERT INTO readings (user_id, spread_code, question, cards, seed, status, quota_state, updated_at)
+			VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','allowed',now()-interval '100 years')
+			RETURNING id`, uid).Scan(&ids[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gw.drainOnce(ctx, pg)
+	var done, pending, attempts int
+	if err := pg.QueryRow(ctx, `
+		SELECT COUNT(*) FILTER (WHERE status='done'),
+		       COUNT(*) FILTER (WHERE status='pending'),
+		       COALESCE(SUM(worker_attempts),0)
+		  FROM readings WHERE id=ANY($1)`, ids).Scan(&done, &pending, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if done != 1 || pending != 1 || attempts != 1 || calls.Load() < 1 {
+		t.Fatalf("done=%d pending=%d attempts=%d calls=%d", done, pending, attempts, calls.Load())
+	}
+}
+
+func setAIConfig(t *testing.T, ctx context.Context, pg *pgxpool.Pool, model, fallback string, monthly int) {
+	t.Helper()
+	var old json.RawMessage
+	if err := pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='ai'`).Scan(&old); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := json.Marshal(map[string]any{
+		"model": model, "fallback": fallback, "max_tokens": 64,
+		"temperature": 0, "monthly_calls": monthly,
+	})
+	if _, err := pg.Exec(ctx, `UPDATE app_config SET value=$1 WHERE key='ai'`, value); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(context.Background(), `DELETE FROM ai_budget_ledger WHERE model=$1 OR model=$2`, model, fallback)
+		_, _ = pg.Exec(context.Background(), `UPDATE app_config SET value=$1 WHERE key='ai'`, old)
+	})
+}
+
+func TestE2EFallbackCacheUsesFallbackIdentity(t *testing.T) {
+	ctx, pg, rd, gw := testGateway(t)
+	primary := fmt.Sprintf("test/primary-%d", time.Now().UnixNano())
+	fallback := fmt.Sprintf("test/fallback-%d", time.Now().UnixNano())
+	setAIConfig(t, ctx, pg, primary, fallback, 1000000)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"fallback answer"}}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	ch := make(chan string, 16)
+	text, model, cached, err := gw.Stream(ctx, "", "daily", testPos, testCards, "fallback-identity", ch)
+	drain(ch)
+	if err != nil || text != "fallback answer" || model != fallback || cached {
+		t.Fatalf("text=%q model=%q cached=%v err=%v", text, model, cached, err)
+	}
+	cfg := gw.LoadConfig(ctx)
+	primaryKey := cacheKey(primary, "daily", testPos, testCards, "fallback-identity", cfg)
+	fallbackKey := cacheKey(fallback, "daily", testPos, testCards, "fallback-identity", cfg)
+	if n, _ := rd.Exists(ctx, primaryKey).Result(); n != 0 {
+		t.Fatal("fallback response was cached under primary identity")
+	}
+	if n, _ := rd.Exists(ctx, fallbackKey).Result(); n != 1 {
+		t.Fatal("fallback response was not cached under fallback identity")
+	}
+	ch2 := make(chan string, 16)
+	text2, model2, cached2, err := gw.Stream(ctx, "", "daily", testPos, testCards, "fallback-identity", ch2)
+	drain(ch2)
+	if err != nil || text2 != text || model2 != fallback || !cached2 || calls.Load() != 2 {
+		t.Fatalf("cache hit text=%q model=%q cached=%v calls=%d err=%v", text2, model2, cached2, calls.Load(), err)
+	}
+}
+
+func TestE2EOpenBreakerDoesNotReserveBudget(t *testing.T) {
+	ctx, pg, rd, gw := testGateway(t)
+	model := fmt.Sprintf("test/breaker-%d", time.Now().UnixNano())
+	setAIConfig(t, ctx, pg, model, model, 1000000)
+	if err := rd.Set(ctx, breakerKey(model), "open", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	ch := make(chan string, 8)
+	_, _, _, err := gw.Stream(ctx, "", "daily", testPos, testCards, "breaker-budget", ch)
+	drain(ch)
+	if err == nil || calls.Load() != 0 {
+		t.Fatalf("err=%v calls=%d", err, calls.Load())
+	}
+	var reservations int
+	if err := pg.QueryRow(ctx, `SELECT COUNT(*) FROM ai_budget_ledger WHERE model=$1`, model).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 {
+		t.Fatalf("open breaker reserved %d budget rows", reservations)
+	}
+}
+
+func TestE2EWorkerSkipsUnverifiedQuotaAndBoundsRetries(t *testing.T) {
+	ctx, pg, _, gw := testGateway(t)
+	var uid string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
+	var unverified string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','unchecked','[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','error')
+		RETURNING id`, uid).Scan(&unverified); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"partial"}}]}`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	gw.drainOnce(ctx, pg)
+	var status, quota string
+	var attempts int
+	if err := pg.QueryRow(ctx, `SELECT status, quota_state, worker_attempts FROM readings WHERE id=$1`, unverified).Scan(&status, &quota, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || quota != "error" || attempts != 0 || calls.Load() != 0 {
+		t.Fatalf("unverified row status=%s quota=%s attempts=%d calls=%d", status, quota, attempts, calls.Load())
+	}
+	model := fmt.Sprintf("test/retry-%d", time.Now().UnixNano())
+	setAIConfig(t, ctx, pg, model, model, 1000000)
+	t.Setenv("AI_WORKER_MAX_ATTEMPTS", "2")
+	t.Setenv("AI_WORKER_BACKOFF_SECONDS", "1")
+	t.Setenv("AI_WORKER_MAX_BACKOFF_SECONDS", "1")
+	var rid string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','retry','[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
+		RETURNING id`, uid).Scan(&rid); err != nil {
+		t.Fatal(err)
+	}
+	gw.drainOnce(ctx, pg)
+	if _, err := pg.Exec(ctx, `UPDATE readings SET worker_lease_until=now()-interval '1 second' WHERE id=$1`, rid); err != nil {
+		t.Fatal(err)
+	}
+	gw.drainOnce(ctx, pg)
+	if err := pg.QueryRow(ctx, `SELECT status, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || attempts != 2 || calls.Load() != 2 {
+		t.Fatalf("retry row status=%s attempts=%d calls=%d", status, attempts, calls.Load())
+	}
+}
+
+func TestE2EWorkerPersistsTerminalFallbackWithoutAI(t *testing.T) {
+	ctx, pg, rd := testutil.Live(t)
+	t.Setenv("OPENROUTER_API_KEY", "")
+	gw := New(pg, rd)
+	if gw.Enabled() {
+		t.Fatal("gateway must be disabled")
+	}
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"disabled"}}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	var uid string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
+	var rid string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
+		RETURNING id`, uid).Scan(&rid); err != nil {
+		t.Fatal(err)
+	}
+	gw.drainOnce(ctx, pg)
+	var status, interpretation string
+	var attempts int
+	if err := pg.QueryRow(ctx, `SELECT status, interpretation, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &interpretation, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "done" || interpretation == "" || attempts != 1 || calls.Load() != 0 {
+		t.Fatalf("status=%s interpretation=%q attempts=%d calls=%d", status, interpretation, attempts, calls.Load())
+	}
+}
+
+func TestE2EWorkerPersistsTerminalFallbackForIncompleteContext(t *testing.T) {
+	ctx, pg, rd := testutil.Live(t)
+	gw := New(pg, rd)
+	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"incomplete"}}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	var uid string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
+	var rid string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
+		VALUES ($1,'daily','',
+			'[{"card_id":1,"reversed":false,"position":0},{"card_id":2,"reversed":true,"position":1}]',
+			1,'pending','','allowed')
+		RETURNING id`, uid).Scan(&rid); err != nil {
+		t.Fatal(err)
+	}
+	gw.drainOnce(ctx, pg)
+	var status, interpretation string
+	var attempts int
+	if err := pg.QueryRow(ctx, `SELECT status, interpretation, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &interpretation, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "done" || interpretation == "" || attempts != 1 || calls.Load() != 0 {
+		t.Fatalf("status=%s interpretation=%q attempts=%d calls=%d", status, interpretation, attempts, calls.Load())
+	}
+	gw.drainOnce(ctx, pg)
+	if err := pg.QueryRow(ctx, `SELECT status, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "done" || attempts != 1 {
+		t.Fatalf("terminal fallback was requeued: status=%s attempts=%d", status, attempts)
+	}
+}
+
+func TestE2EWorkerReclaimsOnlyExpiredClaims(t *testing.T) {
+	ctx, pg, _, gw := testGateway(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"reclaimed"}}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
+	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
+	var uid string
+	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
+	activeToken := "11111111-1111-4111-8111-111111111111"
+	expiredToken := "22222222-2222-4222-8222-222222222222"
+	insert := func(key, token string, lease time.Duration) string {
+		t.Helper()
+		var id string
+		if err := pg.QueryRow(ctx, `
+			INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, status, idempotency_key, quota_state, worker_claim_token, worker_lease_until, worker_attempts)
+			VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]','',1,'pending',$2,'allowed',$3,now()+$4::interval,1)
+			RETURNING id`, uid, key, token, lease.String()).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	activeID := insert("worker-active-claim", activeToken, 2*time.Minute)
+	expiredID := insert("worker-expired-claim", expiredToken, -time.Second)
+	gw.drainOnce(ctx, pg)
+	var activeStatus, activeTokenAfter, expiredStatus, expiredTokenAfter string
+	var activeAttempts, expiredAttempts int
+	if err := pg.QueryRow(ctx, `
+		SELECT status, worker_attempts, worker_claim_token::text FROM readings WHERE id=$1`, activeID).Scan(&activeStatus, &activeAttempts, &activeTokenAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(ctx, `
+		SELECT status, worker_attempts, COALESCE(worker_claim_token::text, '')
+		  FROM readings WHERE id=$1`, expiredID).Scan(&expiredStatus, &expiredAttempts, &expiredTokenAfter); err != nil {
+		t.Fatal(err)
+	}
+	if activeStatus != "pending" || activeAttempts != 1 || activeTokenAfter != activeToken {
+		t.Fatalf("active claim status=%s attempts=%d token=%s", activeStatus, activeAttempts, activeTokenAfter)
+	}
+	if expiredStatus != "done" || expiredAttempts != 2 || expiredTokenAfter != "" {
+		t.Fatalf("expired claim status=%s attempts=%d token=%s", expiredStatus, expiredAttempts, expiredTokenAfter)
 	}
 }

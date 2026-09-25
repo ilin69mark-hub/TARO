@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/redis/go-redis/v9"
@@ -106,6 +107,123 @@ func TestE2EAuthGuards(t *testing.T) {
 	// после logout токен мертв
 	if rec := post(tok, "/v1/auth/refresh", `{}`, csrf); rec.Code != 401 {
 		t.Fatalf("after logout: want 401 got %d", rec.Code)
+	}
+}
+
+func TestE2ERefreshRejectedCSRFDoesNotRotateSession(t *testing.T) {
+	r, _, rd, login := sessionRouter(t)
+	tok, uid, csrf := login()
+	before, err := rd.Get(context.Background(), sessKey(uid)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(value string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/auth/refresh", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-CSRF", value)
+		req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post("invalid"); rec.Code != http.StatusForbidden {
+		t.Fatalf("invalid CSRF: want 403 got %d: %s", rec.Code, rec.Body.String())
+	}
+	afterRejected, err := rd.Get(context.Background(), sessKey(uid)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRejected != before {
+		t.Fatal("rejected CSRF rotated the session")
+	}
+	if rec := post(csrf); rec.Code != http.StatusOK {
+		t.Fatalf("valid refresh: %d %s", rec.Code, rec.Body.String())
+	}
+	afterAccepted, err := rd.Get(context.Background(), sessKey(uid)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterAccepted == before {
+		t.Fatal("valid refresh did not rotate the session")
+	}
+}
+
+func TestE2ECSRFRedisLossSetsReplacementCookie(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret-0123456789abcdef0123456789")
+	r, _, rd, login := sessionRouter(t)
+	tok, uid, oldCSRF := login()
+	if err := rd.Del(context.Background(), "csrf:"+uid).Err(); err != nil {
+		t.Fatal(err)
+	}
+	post := func(value string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/auth/refresh", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-CSRF", value)
+		req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	rec := post(oldCSRF)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("stale CSRF: want 403 got %d: %s", rec.Code, rec.Body.String())
+	}
+	var replacement *http.Cookie
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == "taro_csrf" {
+			replacement = cookie
+		}
+	}
+	if replacement == nil || replacement.Value == "" || replacement.Value == oldCSRF {
+		t.Fatalf("replacement CSRF cookie missing: %#v", replacement)
+	}
+	if retry := post(replacement.Value); retry.Code != http.StatusOK {
+		t.Fatalf("replacement CSRF rejected: %d %s", retry.Code, retry.Body.String())
+	}
+}
+
+func TestE2EAuthLogoutRedisFailure(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret-0123456789abcdef0123456789")
+	_, _, _, login := sessionRouter(t)
+	_, uid, _ := login()
+	broken := redis.NewClient(&redis.Options{
+		Addr:         "127.0.0.1:1",
+		DialTimeout:  10 * time.Millisecond,
+		ReadTimeout:  10 * time.Millisecond,
+		WriteTimeout: 10 * time.Millisecond,
+		MaxRetries:   -1,
+	})
+	t.Cleanup(func() { _ = broken.Close() })
+	svc := New(nil, broken)
+	req := httptest.NewRequest("POST", "/v1/auth/logout", strings.NewReader(`{}`))
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey{}, uid))
+	rec := httptest.NewRecorder()
+	svc.HandleLogout(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("logout Redis failure: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("logout cleared cookies after failed revocation")
+	}
+}
+
+func TestE2ECSRedisFailureDoesNotExpireCookies(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret-0123456789abcdef0123456789")
+	_, _, _, login := sessionRouter(t)
+	tok, _, csrf := login()
+	svc := New(nil, nil)
+	req := httptest.NewRequest("POST", "/v1/auth/refresh", strings.NewReader(`{}`))
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
+	req.Header.Set("X-CSRF", csrf)
+	rec := httptest.NewRecorder()
+	svc.RequireCSRF(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("handler called after Redis failure")
+	})).ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Redis failure: want 503 got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("Redis failure expired auth cookies")
 	}
 }
 

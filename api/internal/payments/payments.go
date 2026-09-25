@@ -420,16 +420,18 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
+type successfulPayment struct {
+	Currency              string `json:"currency"`
+	TotalAmount           int    `json:"total_amount"`
+	InvoicePayload        string `json:"invoice_payload"`
+	TelegramPaymentCharge string `json:"telegram_payment_charge_id"`
+	ProviderPaymentCharge string `json:"provider_payment_charge_id"`
+}
+
 type tgUpdate struct {
 	Message *struct {
-		SuccessfulPayment *struct {
-			Currency              string `json:"currency"`
-			TotalAmount           int    `json:"total_amount"`
-			InvoicePayload        string `json:"invoice_payload"`
-			TelegramPaymentCharge string `json:"telegram_payment_charge_id"`
-			ProviderPaymentCharge string `json:"provider_payment_charge_id"`
-		} `json:"successful_payment"`
-		From *struct {
+		SuccessfulPayment *successfulPayment `json:"successful_payment"`
+		From              *struct {
 			ID int64 `json:"id"`
 		} `json:"from"`
 	} `json:"message"`
@@ -477,19 +479,126 @@ func writeWebhookReconciliation(w http.ResponseWriter) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "reconciliation_required": true})
 }
 
-func (s *Service) markLateReconciliation(ctx context.Context, tx pgx.Tx, p webhookPayment, sp *struct {
-	Currency              string `json:"currency"`
-	TotalAmount           int    `json:"total_amount"`
-	InvoicePayload        string `json:"invoice_payload"`
-	TelegramPaymentCharge string `json:"telegram_payment_charge_id"`
-	ProviderPaymentCharge string `json:"provider_payment_charge_id"`
-}, reason string) error {
-	_, err := tx.Exec(ctx, `UPDATE payments
+func webhookReconciliationCanProceed(p webhookPayment) bool {
+	if p.ReconciliationReason == nil {
+		return false
+	}
+	switch *p.ReconciliationReason {
+	case "amount_mismatch", "charge_mismatch", "owner_mismatch", "charge_reused":
+		return true
+	case "owner_unverified":
+		return p.ownerTG != nil && *p.ownerTG > 0
+	default:
+		return false
+	}
+}
+
+type webhookIdentity struct {
+	ownerTG        int64
+	telegramCharge string
+	providerCharge string
+}
+
+func (s *Service) originalOwnerUnverifiedEvent(ctx context.Context, q queryRower, paymentID string) (webhookIdentity, bool, error) {
+	var identity webhookIdentity
+	err := q.QueryRow(ctx, `SELECT owner_tg_id, telegram_charge_id, provider_charge_id
+		FROM payment_webhook_events
+		WHERE payment_id=$1 AND reason='owner_unverified'
+		ORDER BY created_at ASC, id ASC
+		LIMIT 1`, paymentID).Scan(&identity.ownerTG, &identity.telegramCharge, &identity.providerCharge)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return webhookIdentity{}, false, nil
+	}
+	if err != nil {
+		return webhookIdentity{}, false, err
+	}
+	return identity, true, nil
+}
+
+func webhookIdentityMatches(identity webhookIdentity, sp successfulPayment, ownerTG int64) bool {
+	return identity.ownerTG == ownerTG &&
+		identity.telegramCharge == sp.TelegramPaymentCharge &&
+		identity.providerCharge == sp.ProviderPaymentCharge
+}
+
+func (s *Service) webhookChargeReused(ctx context.Context, q queryRower, paymentID, telegramCharge, providerCharge string) (bool, error) {
+	var reused bool
+	err := q.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM payments WHERE provider='tg_stars' AND id<>$1
+		  AND (telegram_payment_charge_id=$2 OR provider_payment_charge_id=$3 OR provider_payment_id='tg:'||$2))`,
+		paymentID, telegramCharge, providerCharge).Scan(&reused)
+	return reused, err
+}
+
+func webhookEventHash(sp successfulPayment, ownerTG int64) string {
+	fields := []string{sp.Currency, strconv.Itoa(sp.TotalAmount), sp.InvoicePayload, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, strconv.FormatInt(ownerTG, 10)}
+	encoded := make([]byte, 0, 128)
+	for _, field := range fields {
+		encoded = strconv.AppendInt(encoded, int64(len(field)), 10)
+		encoded = append(encoded, ':')
+		encoded = append(encoded, field...)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Service) recordWebhookEvent(ctx context.Context, tx pgx.Tx, p webhookPayment, sp successfulPayment, ownerTG int64, reason string) (bool, error) {
+	tag, err := tx.Exec(ctx, `INSERT INTO payment_webhook_events
+		(payment_id, event_hash, reason, currency, total_amount, telegram_charge_id, provider_charge_id, owner_tg_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (payment_id, event_hash) DO NOTHING`, p.ID, webhookEventHash(sp, ownerTG), reason, sp.Currency, sp.TotalAmount, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, ownerTG)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *Service) markWebhookMismatch(ctx context.Context, tx pgx.Tx, p webhookPayment, sp successfulPayment, ownerTG int64, reason string, reconcile bool) error {
+	inserted, err := s.recordWebhookEvent(ctx, tx, p, sp, ownerTG, reason)
+	if err != nil || !inserted {
+		return err
+	}
+	if reconcile {
+		_, err = tx.Exec(ctx, `UPDATE payments
+			SET reconciliation_reason=CASE
+					WHEN status='reconciliation' AND reconciliation_reason='owner_unverified' AND $2<>'charge_reused' THEN reconciliation_reason
+					ELSE $2
+				END,
+				note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $3 ELSE note || ' ' || $3 END
+			WHERE id=$1 AND status IN ('pending','expired','reconciliation')`, p.ID, reason, "payment-reconciliation:"+reason)
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE payments
+		SET reconciliation_reason=CASE
+				WHEN status IN ('reconciliation','refunding') AND reconciliation_reason IS NOT NULL THEN reconciliation_reason
+				ELSE $2
+			END,
+			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $3 ELSE note || ' ' || $3 END
+		WHERE id=$1`, p.ID, reason, "payment-webhook:"+reason)
+	return err
+}
+
+func (s *Service) markOwnerUnverifiedReconciliation(ctx context.Context, tx pgx.Tx, p webhookPayment, sp successfulPayment, ownerTG int64, stateReason string, storeCharge bool) error {
+	inserted, err := s.recordWebhookEvent(ctx, tx, p, sp, ownerTG, "owner_unverified")
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE payments
 		SET status='reconciliation', reconciliation_reason=$2,
-			provider_payment_id='tg:'||$3, telegram_payment_charge_id=$3,
-			provider_payment_charge_id=$4,
-			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $5 ELSE note || ' ' || $5 END
-		WHERE id=$1 AND status IN ('pending','expired','reconciliation')`, p.ID, reason, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, "payment-reconciliation:"+reason)
+			note=CASE WHEN $3 THEN CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $4 ELSE note || ' ' || $4 END ELSE note END
+		WHERE id=$1 AND status IN ('pending','expired','reconciliation')`, p.ID, stateReason, inserted, "payment-reconciliation:"+stateReason)
+	if err != nil || !storeCharge {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE payments
+		SET provider_payment_id='tg:'||$2, telegram_payment_charge_id=$2,
+			provider_payment_charge_id=$3
+		WHERE id=$1 AND status IN ('pending','expired','reconciliation')
+		  AND NOT EXISTS (
+			SELECT 1 FROM payments other
+			 WHERE other.id<>$1 AND other.provider='tg_stars'
+			   AND (other.telegram_payment_charge_id=$2 OR other.provider_payment_charge_id=$3 OR other.provider_payment_id='tg:'||$2)
+		  )`, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge)
 	return err
 }
 
@@ -540,6 +649,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	ownerTG := upd.Message.From.ID
 	tx, err := s.pg.Begin(ctx)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
@@ -555,18 +665,48 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 		return
 	}
+	commitMismatch := func(reason string, reconcile bool) bool {
+		if err := s.markWebhookMismatch(ctx, tx, p, *sp, ownerTG, reason, reconcile); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+			return false
+		}
+		if err := tx.Commit(ctx); err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+			return false
+		}
+		return true
+	}
 	if p.Status == "succeeded" || p.Status == "refunded" {
-		if p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge {
-			_, _ = tx.Exec(ctx, `
-				UPDATE payments
-				   SET reconciliation_reason='duplicate_charge',
-				       note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN 'duplicate-charge' ELSE note || ' duplicate-charge' END
-				 WHERE id=$1`, p.ID)
+		knownTelegramCharge := telegramCharge(p.storedPayment)
+		chargeMismatch := (knownTelegramCharge != "" && knownTelegramCharge != sp.TelegramPaymentCharge) ||
+			(p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge) ||
+			(p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge)
+		ownerMismatch := p.ownerTG != nil && *p.ownerTG != ownerTG
+		amountMismatch := sp.TotalAmount != p.Stars
+		if chargeMismatch || ownerMismatch || amountMismatch {
+			reason := "duplicate_charge"
+			if !chargeMismatch && ownerMismatch && amountMismatch {
+				reason = "duplicate_owner_amount_mismatch"
+			} else if !chargeMismatch && ownerMismatch {
+				reason = "duplicate_owner_mismatch"
+			} else if !chargeMismatch && amountMismatch {
+				reason = "duplicate_amount_mismatch"
+			}
+			if !commitMismatch(reason, false) {
+				return
+			}
 		}
 		writeWebhookDuplicate(w)
 		return
 	}
-	if p.Status == "refunding" || (p.Status == "reconciliation" && (p.ReconciliationReason == nil || *p.ReconciliationReason != "owner_unverified")) {
+	if p.Status == "refunding" || (p.Status == "reconciliation" && !webhookReconciliationCanProceed(p)) {
+		reason := "refunding_payment"
+		if p.Status == "reconciliation" {
+			reason = "reconciliation_blocked"
+		}
+		if !commitMismatch(reason, false) {
+			return
+		}
 		writeWebhookReconciliation(w)
 		return
 	}
@@ -574,29 +714,88 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeWebhookDuplicate(w)
 		return
 	}
-	if p.ownerTG == nil {
-		if err := s.markLateReconciliation(ctx, tx, p, sp, "owner_unverified"); err != nil {
+	var originalOwnerEvent *webhookIdentity
+	if p.ReconciliationReason != nil || p.ownerTG == nil {
+		identity, found, err := s.originalOwnerUnverifiedEvent(ctx, tx, p.ID)
+		if err != nil {
 			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 			return
 		}
-		if err := tx.Commit(ctx); err != nil {
-			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+		if found {
+			originalOwnerEvent = &identity
+		}
+	}
+	if p.ReconciliationReason != nil && *p.ReconciliationReason == "owner_unverified" && originalOwnerEvent == nil {
+		if !commitMismatch("reconciliation_blocked", false) {
 			return
 		}
 		writeWebhookReconciliation(w)
 		return
 	}
-	if p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge {
-		writeWebhookIgnored(w, "charge_mismatch")
-		return
+	if originalOwnerEvent != nil {
+		ownerRecoveryReused := p.ReconciliationReason != nil && *p.ReconciliationReason == "charge_reused"
+		if p.ownerTG == nil {
+			writeWebhookReconciliation(w)
+			return
+		}
+		if !webhookIdentityMatches(*originalOwnerEvent, *sp, ownerTG) {
+			reused, err := s.webhookChargeReused(ctx, tx, p.ID, originalOwnerEvent.telegramCharge, originalOwnerEvent.providerCharge)
+			if err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			if !reused {
+				reused, err = s.webhookChargeReused(ctx, tx, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge)
+				if err != nil {
+					apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+					return
+				}
+			}
+			reason := "charge_mismatch"
+			if ownerTG != originalOwnerEvent.ownerTG {
+				reason = "owner_mismatch"
+			}
+			if reused || ownerRecoveryReused {
+				reason = "charge_reused"
+			}
+			if !commitMismatch(reason, true) {
+				return
+			}
+			writeWebhookReconciliation(w)
+			return
+		}
+		reused, err := s.webhookChargeReused(ctx, tx, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge)
+		if err != nil {
+			apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+			return
+		}
+		if reused || ownerRecoveryReused {
+			if !commitMismatch("charge_reused", true) {
+				return
+			}
+			writeWebhookReconciliation(w)
+			return
+		}
 	}
-	if p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge {
-		writeWebhookIgnored(w, "charge_mismatch")
-		return
-	}
-	if upd.Message.From.ID != *p.ownerTG {
-		if p.Status == "expired" {
-			if err := s.markLateReconciliation(ctx, tx, p, sp, "owner_mismatch"); err != nil {
+	if p.ownerTG == nil {
+		knownTelegramCharge := telegramCharge(p.storedPayment)
+		if (knownTelegramCharge != "" && knownTelegramCharge != sp.TelegramPaymentCharge) ||
+			(p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge) ||
+			(p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge) {
+			if !commitMismatch("charge_mismatch", true) {
+				return
+			}
+		} else {
+			reused, err := s.webhookChargeReused(ctx, tx, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge)
+			if err != nil {
+				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
+				return
+			}
+			stateReason := "owner_unverified"
+			if reused {
+				stateReason = "charge_reused"
+			}
+			if err := s.markOwnerUnverifiedReconciliation(ctx, tx, p, *sp, ownerTG, stateReason, !reused); err != nil {
 				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 				return
 			}
@@ -604,38 +803,42 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 				return
 			}
-			writeWebhookReconciliation(w)
+		}
+		writeWebhookReconciliation(w)
+		return
+	}
+	if (p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge) ||
+		(p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge) {
+		if !commitMismatch("charge_mismatch", true) {
 			return
 		}
-		writeWebhookIgnored(w, "owner_mismatch")
+		writeWebhookReconciliation(w)
+		return
+	}
+	if ownerTG != *p.ownerTG {
+		if !commitMismatch("owner_mismatch", true) {
+			return
+		}
+		writeWebhookReconciliation(w)
 		return
 	}
 	if sp.TotalAmount != p.Stars {
-		if p.Status == "expired" {
-			if err := s.markLateReconciliation(ctx, tx, p, sp, "amount_mismatch"); err != nil {
-				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
-				return
-			}
-			if err := tx.Commit(ctx); err != nil {
-				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
-				return
-			}
-			writeWebhookReconciliation(w)
+		if !commitMismatch("amount_mismatch", true) {
 			return
 		}
-		writeWebhookIgnored(w, "amount_mismatch")
+		writeWebhookReconciliation(w)
 		return
 	}
-	var reused bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(
-		SELECT 1 FROM payments WHERE provider='tg_stars' AND id<>$1
-		  AND (telegram_payment_charge_id=$2 OR provider_payment_charge_id=$3 OR provider_payment_id='tg:'||$2))`,
-		p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge).Scan(&reused); err != nil {
+	reused, err := s.webhookChargeReused(ctx, tx, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge)
+	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 		return
 	}
 	if reused {
-		writeWebhookIgnored(w, "charge_reused")
+		if !commitMismatch("charge_reused", true) {
+			return
+		}
+		writeWebhookReconciliation(w)
 		return
 	}
 	late := p.Status == "expired" || p.Status == "reconciliation"
@@ -652,7 +855,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN NULLIF($5,'')
 				WHEN $5='' THEN note ELSE note || ' ' || $5 END
 		WHERE id=$1 AND status IN ('pending','expired','reconciliation')
-		  AND (reconciliation_reason IS NULL OR reconciliation_reason='owner_unverified')
+		  AND (reconciliation_reason IS NULL OR reconciliation_reason IN ('owner_unverified','amount_mismatch','charge_mismatch','owner_mismatch','charge_reused'))
 		  AND (telegram_payment_charge_id IS NULL OR telegram_payment_charge_id=$2)
 		  AND (provider_payment_charge_id IS NULL OR provider_payment_charge_id=$3)
 		RETURNING true`, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, sp.TotalAmount, note).Scan(&updated)

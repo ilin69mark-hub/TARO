@@ -38,6 +38,7 @@ const (
 
 var (
 	ErrOutputLimit       = errors.New("AI output limit exceeded")
+	ErrIncompleteStream  = errors.New("provider stream did not complete")
 	ErrBudgetExhausted   = errors.New("monthly AI budget exhausted")
 	ErrBudgetUnavailable = errors.New("AI budget unavailable")
 )
@@ -71,12 +72,14 @@ type streamStats struct {
 	wireEvents int
 	bytes      int
 	usage      providerUsage
+	completed  bool
 }
 
 func (s *streamStats) add(other streamStats) {
 	s.events += other.events
 	s.wireEvents += other.wireEvents
 	s.bytes += other.bytes
+	s.completed = s.completed || other.completed
 	if !other.usage.Known {
 		return
 	}
@@ -234,20 +237,51 @@ type CardValue struct {
 	CardID       int
 }
 
-func PromptHash(model, spread string, cards []CardValue, question string) string {
+func promptHash(model, spread string, positions []Position, cards []CardValue, question string, cfg Config) string {
 	var sb strings.Builder
-	sb.WriteString("prompt-v2|" + model + "|" + spread + "|")
-	for _, c := range cards {
-		fmt.Fprintf(&sb, "%d:%t:%s:%s:%s:%d;", c.CardID, c.Reversed, c.Name, c.Upright, c.ReversedText, c.Position)
+	sb.WriteString("prompt-v3")
+	for _, part := range []string{model, spread, question, strconv.Itoa(cfg.MaxTokens), strconv.FormatFloat(cfg.Temperature, 'g', -1, 64), SystemPrompt, BuildUserPrompt(spread, positions, cards, question)} {
+		fmt.Fprintf(&sb, "|%d:%s", len(part), part)
 	}
-	qh := sha256.Sum256([]byte(question))
-	sb.WriteString("|" + hex.EncodeToString(qh[:]))
 	sum := sha256.Sum256([]byte(sb.String()))
 	return hex.EncodeToString(sum[:])
 }
 
+func PromptHash(model, spread string, cards []CardValue, question string) string {
+	return promptHash(model, spread, nil, cards, question, Config{})
+}
+
+func cacheKey(model, spread string, positions []Position, cards []CardValue, question string, cfg Config) string {
+	return "ai:cache:v3:" + model + ":" + spread + ":" + promptHash(model, spread, positions, cards, question, cfg)
+}
+
 func CacheKey(model, spread string, cards []CardValue, question string) string {
-	return "ai:cache:v2:" + model + ":" + spread + ":" + PromptHash(model, spread, cards, question)
+	return cacheKey(model, spread, nil, cards, question, Config{})
+}
+
+func validPromptContext(spread string, positions []Position, cards []CardValue) bool {
+	if strings.TrimSpace(spread) == "" || len(positions) == 0 || len(cards) != len(positions) {
+		return false
+	}
+	for _, position := range positions {
+		if strings.TrimSpace(position.Label) == "" || strings.TrimSpace(position.Meaning) == "" {
+			return false
+		}
+	}
+	seen := make(map[int]struct{}, len(cards))
+	for i, card := range cards {
+		if card.CardID < 0 || card.CardID > 77 || card.Position != i {
+			return false
+		}
+		if _, ok := seen[card.CardID]; ok {
+			return false
+		}
+		seen[card.CardID] = struct{}{}
+		if strings.TrimSpace(card.Name) == "" || strings.TrimSpace(card.Upright) == "" || strings.TrimSpace(card.ReversedText) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func openRouterURL() string {
@@ -452,6 +486,7 @@ func (g *Gateway) doStreamStats(ctx context.Context, model, system, user string,
 			return stats, fmt.Errorf("%w: events", ErrOutputLimit)
 		}
 		if data == "[DONE]" {
+			stats.completed = true
 			break
 		}
 		var chunk struct {
@@ -493,6 +528,9 @@ func (g *Gateway) doStreamStats(ctx context.Context, model, system, user string,
 	}
 	if limited.N <= 0 {
 		return stats, fmt.Errorf("%w: response bytes", ErrOutputLimit)
+	}
+	if !stats.completed {
+		return stats, fmt.Errorf("%w: missing [DONE]", ErrIncompleteStream)
 	}
 	return stats, nil
 }
@@ -576,6 +614,22 @@ func (g *Gateway) reserveBudget(ctx context.Context, cfg Config, readingID, mode
 	return budgetReservation{ID: reservationID, Month: month}, nil
 }
 
+// FallbackInterpretation собирает терминальное толкование из значений карт (без AI).
+func FallbackInterpretation(cards []CardValue) string {
+	var sb strings.Builder
+	sb.WriteString("Карты вытянуты. Полное AI-толкование появится в T13 — а пока значения карт:\n")
+	for _, c := range cards {
+		val := c.Upright
+		orient := "прямая"
+		if c.Reversed {
+			val = c.ReversedText
+			orient = "перевернутая"
+		}
+		fmt.Fprintf(&sb, "\n• %s (%s, позиция %d): %s", c.Name, orient, c.Position+1, val)
+	}
+	return sb.String()
+}
+
 func emitText(ctx context.Context, out chan<- string, text string) error {
 	if out == nil || text == "" {
 		return nil
@@ -617,57 +671,73 @@ func (g *Gateway) logBestEffort(readingID, model, hash string, in, out int, late
 	g.logUsage(ctx, readingID, model, hash, in, out, latency, status, errText, stats)
 }
 
+func (g *Gateway) readCached(ctx context.Context, key string) (string, bool) {
+	if g.rd == nil {
+		return "", false
+	}
+	raw, err := g.rd.Get(ctx, key).Result()
+	if err != nil || raw == "" {
+		return "", false
+	}
+	if len(raw) > MaxCacheValueBytes {
+		_ = g.rd.Del(ctx, key).Err()
+		return "", false
+	}
+	cached, err := openCache(raw)
+	if err != nil || cached == "" || len(cached) > MaxOutputBytes {
+		return "", false
+	}
+	return cached, true
+}
+
 func (g *Gateway) Stream(ctx context.Context, readingID, spread string, positions []Position, cards []CardValue, question string, out chan<- string) (string, string, bool, error) {
 	if out != nil {
 		defer close(out)
 	}
+	if !validPromptContext(spread, positions, cards) {
+		return "", "", false, errors.New("incomplete AI context")
+	}
 	start := time.Now()
 	cfg := g.LoadConfig(ctx)
-	hash := PromptHash(cfg.Model, spread, cards, question)
-	cacheKey := CacheKey(cfg.Model, spread, cards, question)
-	if g.rd != nil {
-		if raw, err := g.rd.Get(ctx, cacheKey).Result(); err == nil && raw != "" {
-			if len(raw) > MaxCacheValueBytes {
-				_ = g.rd.Del(ctx, cacheKey).Err()
-				raw = ""
+	models := []string{cfg.Model}
+	if cfg.Fallback != "" && cfg.Fallback != cfg.Model {
+		models = append(models, cfg.Fallback)
+	}
+	for _, model := range models {
+		hash := promptHash(model, spread, positions, cards, question, cfg)
+		key := cacheKey(model, spread, positions, cards, question, cfg)
+		if cached, ok := g.readCached(ctx, key); ok {
+			if ContainsStopWords(cached) {
+				g.logBestEffort(readingID, model, hash, 0, 0, time.Since(start), "filtered", "stop-words", streamStats{})
+				g.cacheText(key, SafeReplacement)
+				_ = emitText(ctx, out, SafeReplacement)
+				return SafeReplacement, model, true, nil
 			}
-			cached, cerr := openCache(raw)
-			if cerr == nil && cached != "" && len(cached) <= MaxOutputBytes {
-				if ContainsStopWords(cached) {
-					g.logBestEffort(readingID, cfg.Model, hash, 0, 0, time.Since(start), "filtered", "stop-words", streamStats{})
-					g.cacheText(cacheKey, SafeReplacement)
-					_ = emitText(ctx, out, SafeReplacement)
-					return SafeReplacement, cfg.Model, true, nil
-				}
-				_ = emitText(ctx, out, cached)
-				g.logBestEffort(readingID, cfg.Model, hash, 0, 0, time.Since(start), "ok", "cache_hit", streamStats{})
-				return cached, cfg.Model, true, nil
-			}
+			_ = emitText(ctx, out, cached)
+			g.logBestEffort(readingID, model, hash, 0, 0, time.Since(start), "ok", "cache_hit", streamStats{})
+			return cached, model, true, nil
 		}
 	}
 	if !g.Enabled() {
 		return "", "", false, fmt.Errorf("no api key")
 	}
-	models := []string{cfg.Model}
-	if cfg.Fallback != "" && cfg.Fallback != cfg.Model {
-		models = append(models, cfg.Fallback)
-	}
-	reservation, err := g.reserveBudget(ctx, cfg, readingID, cfg.Model)
-	if err != nil {
-		g.logBestEffort(readingID, cfg.Model, hash, 0, 0, time.Since(start), "failed", err.Error(), streamStats{})
-		return "", "", false, err
-	}
 	var totalStats streamStats
-	defer func() { g.finishBudget(reservation, totalStats) }()
 	var lastErr error
 	for i, model := range models {
+		hash := promptHash(model, spread, positions, cards, question, cfg)
 		if g.breakerOpen(ctx, model) {
 			lastErr = fmt.Errorf("breaker open for %s", model)
+			g.logBestEffort(readingID, model, hash, 0, 0, time.Since(start), "breaker", lastErr.Error(), streamStats{})
 			continue
 		}
-		key := g.apiKey
+		reservation, err := g.reserveBudget(ctx, cfg, readingID, model)
+		if err != nil {
+			g.logBestEffort(readingID, model, hash, 0, 0, time.Since(start), "failed", err.Error(), streamStats{})
+			return "", "", false, err
+		}
+		apiKey := g.apiKey
 		if i > 0 && g.apiKey2 != "" {
-			key = g.apiKey2
+			apiKey = g.apiKey2
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
 		inner := make(chan string, 64)
@@ -676,16 +746,16 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 			err   error
 		}
 		done := make(chan attemptResult, 1)
-		go func() {
+		go func(attemptModel, attemptKey string) {
 			defer close(inner)
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					done <- attemptResult{err: fmt.Errorf("stream panic: %v", recovered)}
 				}
 			}()
-			stats, streamErr := g.doStreamStats(attemptCtx, model, SystemPrompt, BuildUserPrompt(spread, positions, cards, question), cfg, key, inner)
+			stats, streamErr := g.doStreamStats(attemptCtx, attemptModel, SystemPrompt, BuildUserPrompt(spread, positions, cards, question), cfg, attemptKey, inner)
 			done <- attemptResult{stats: stats, err: streamErr}
-		}()
+		}(model, apiKey)
 		var builder strings.Builder
 		for token := range inner {
 			builder.WriteString(token)
@@ -693,6 +763,7 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 		result := <-done
 		cancel()
 		totalStats.add(result.stats)
+		g.finishBudget(reservation, result.stats)
 		text := builder.String()
 		if result.err != nil {
 			lastErr = result.err
@@ -711,6 +782,11 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 			g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "failed", result.err.Error(), result.stats)
 			continue
 		}
+		if !result.stats.completed {
+			lastErr = ErrIncompleteStream
+			g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "failed", lastErr.Error(), result.stats)
+			continue
+		}
 		if strings.TrimSpace(text) == "" || result.stats.events == 0 {
 			lastErr = fmt.Errorf("empty response from %s", model)
 			if totalStats.bytes >= MaxOutputBytes || totalStats.wireEvents >= MaxOutputEvents {
@@ -722,13 +798,14 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 			}
 			continue
 		}
+		key := cacheKey(model, spread, positions, cards, question, cfg)
 		if ContainsStopWords(text) {
 			g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "filtered", "stop-words", result.stats)
-			g.cacheText(cacheKey, SafeReplacement)
+			g.cacheText(key, SafeReplacement)
 			_ = emitText(ctx, out, SafeReplacement)
 			return SafeReplacement, model, false, nil
 		}
-		g.cacheText(cacheKey, text)
+		g.cacheText(key, text)
 		g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "ok", "", result.stats)
 		_ = emitText(ctx, out, text)
 		return text, model, false, nil
@@ -742,6 +819,9 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 func isServerError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrIncompleteStream) {
+		return true
 	}
 	if errors.Is(err, context.Canceled) {
 		return false

@@ -199,6 +199,20 @@ func parseJWT(token string) (tokenClaims, error) {
 	return tokenClaims{Subject: sub, SID: sid, JTI: jti, Legacy: legacy}, nil
 }
 
+type SessionClaims struct {
+	Subject string
+	SID     string
+	JTI     string
+}
+
+func ParseJWTClaims(token string) (SessionClaims, error) {
+	claims, err := parseJWT(token)
+	if err != nil {
+		return SessionClaims{}, err
+	}
+	return SessionClaims{Subject: claims.Subject, SID: claims.SID, JTI: claims.JTI}, nil
+}
+
 func ParseJWT(token string) (string, error) {
 	claims, err := parseJWT(token)
 	if err != nil {
@@ -296,9 +310,17 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
+	csrf, err := s.issueCSRF(w, r.Context(), id)
+	if err != nil {
+		if s.rd != nil {
+			_ = s.rd.Del(r.Context(), sessKey(id), "csrf:"+id).Err()
+		}
+		ExpireAuthCookies(w)
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
 	writeCookie(w, tok, UserTTL)
 	writeFpCookie(w, fpOf(r, req.Fingerprint))
-	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "is_new": isNew, "trial_days": trialDays, "csrf_token": csrf})
 }
@@ -349,9 +371,17 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
+	csrf, err := s.issueCSRF(w, r.Context(), id)
+	if err != nil {
+		if s.rd != nil {
+			_ = s.rd.Del(r.Context(), sessKey(id), "csrf:"+id).Err()
+		}
+		ExpireAuthCookies(w)
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+		return
+	}
 	writeCookie(w, tok, UserTTL)
 	writeFpCookie(w, fpOf(r, req.Fingerprint))
-	csrf := s.issueCSRF(w, r.Context(), id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "csrf_token": csrf})
 }

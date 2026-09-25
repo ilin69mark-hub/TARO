@@ -7,11 +7,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /api-admin ./cmd/admin
+RUN CGO_ENABLED=0 go build -o /adminctl ./cmd/adminctl
 
 FROM alpine:3.20
 # S09: tzdata (MSK-время!), non-root, healthcheck
 RUN apk add --no-cache ca-certificates tzdata wget && adduser -D -u 10001 app
 COPY --from=build /api-admin /api-admin
+COPY --from=build /adminctl /adminctl
 USER app
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8081/healthz || exit 1
 ENTRYPOINT ["/api-admin"]

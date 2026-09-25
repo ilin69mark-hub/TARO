@@ -101,12 +101,27 @@ func TestE2EVerifiedLateWebhookGrantsSnapshotEntitlements(t *testing.T) {
 	if result["reconciliation_required"] != true {
 		t.Fatalf("late mismatch was not reconciled: %s", rec.Body.String())
 	}
-	var status string
+	var status, reason string
 	if err := pg.QueryRow(ctx, `SELECT status FROM payments WHERE id=$1`, monthID).Scan(&status); err != nil || status != "succeeded" {
 		t.Fatalf("month status=%s err=%v", status, err)
 	}
-	if err := pg.QueryRow(ctx, `SELECT status FROM payments WHERE id=$1`, mismatchID).Scan(&status); err != nil || status != "reconciliation" {
-		t.Fatalf("mismatch status=%s err=%v", status, err)
+	if err := pg.QueryRow(ctx, `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, mismatchID).Scan(&status, &reason); err != nil || status != "expired" || reason != "amount_mismatch" {
+		t.Fatalf("mismatch state=%s/%s err=%v", status, reason, err)
+	}
+	rec = call(mismatchID, "month_299", 199, "ch_late_mismatch_valid", "pch_late_mismatch_valid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mismatch recovery: %d %s", rec.Code, rec.Body.String())
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result["late"] != true {
+		t.Fatalf("mismatch recovery marker: %s", rec.Body.String())
+	}
+	if err := pg.QueryRow(ctx, `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, mismatchID).Scan(&status, &reason); err != nil || status != "succeeded" || reason != "" {
+		t.Fatalf("recovered mismatch state=%s/%s err=%v", status, reason, err)
+	}
+	var recovered int
+	if err := pg.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1 AND source_type='payment'`, mismatchID).Scan(&recovered); err != nil || recovered != 1 {
+		t.Fatalf("recovered entitlement=%d err=%v", recovered, err)
 	}
 	var linked int
 	if err := pg.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1 AND source_type='payment'`, monthID).Scan(&linked); err != nil || linked != 1 {
@@ -135,8 +150,6 @@ func TestE2EWebhookRejectsUnverifiedFields(t *testing.T) {
 	cases := []string{
 		`{"message":{"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_missing_owner","provider_payment_charge_id":"pch_missing_owner"}}}`,
 		`{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_missing_provider"}}}`,
-		`{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":198,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_bad_amount","provider_payment_charge_id":"pch_bad_amount"}}}`,
-		`{"message":{"from":{"id":43},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_bad_owner","provider_payment_charge_id":"pch_bad_owner"}}}`,
 	}
 	for _, body := range cases {
 		rec := callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
@@ -155,22 +168,477 @@ func TestE2EWebhookRejectsUnverifiedFields(t *testing.T) {
 	}
 }
 
+func TestE2EWebhookDurablyRecordsPendingMismatches(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	cases := []struct {
+		name             string
+		amount           int
+		accountOwner     int64
+		webhookOwner     int64
+		existingTG       string
+		existingProvider string
+		reason           string
+	}{
+		{name: "amount", amount: 198, accountOwner: 4201, webhookOwner: 4201, reason: "amount_mismatch"},
+		{name: "owner", amount: 199, accountOwner: 4202, webhookOwner: 4203, reason: "owner_mismatch"},
+		{name: "charge", amount: 199, accountOwner: 4203, webhookOwner: 4203, existingTG: "ch_existing_charge", existingProvider: "pch_existing_charge", reason: "charge_mismatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, uid := newUser()
+			if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=$1 WHERE id=$2`, tc.accountOwner, uid); err != nil {
+				t.Fatal(err)
+			}
+			var paymentID string
+			if err := pg.QueryRow(context.Background(), `
+				INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key, telegram_payment_charge_id, provider_payment_charge_id)
+				SELECT $1, id, 'month_299', 299, 'tg_stars', 'pending:' || gen_random_uuid(), 299, 199, 'pending', $2, NULLIF($3, ''), NULLIF($4, '')
+				  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid, "mismatch-"+tc.name, tc.existingTG, tc.existingProvider).Scan(&paymentID); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"message":{"from":{"id":` + itoa(int(tc.webhookOwner)) + `},"successful_payment":{"currency":"XTR","total_amount":` + itoa(tc.amount) + `,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_` + tc.name + `","provider_payment_charge_id":"pch_` + tc.name + `"}}}`
+			headers := map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+			rec := callPay(r, "", "POST", "/v1/payments/stars/webhook", body, headers)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("mismatch response: %d %s", rec.Code, rec.Body.String())
+			}
+			var result map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || result["reconciliation_required"] != true {
+				t.Fatalf("mismatch result: %s", rec.Body.String())
+			}
+			var status, reason, note string
+			if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,''), note FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason, &note); err != nil {
+				t.Fatal(err)
+			}
+			if status != "pending" || reason != tc.reason || note == "" {
+				t.Fatalf("mismatch state=%s/%s note=%q", status, reason, note)
+			}
+			var events, entitlements int
+			if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1`, paymentID).Scan(&events); err != nil {
+				t.Fatal(err)
+			}
+			if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&entitlements); err != nil {
+				t.Fatal(err)
+			}
+			if events != 1 || entitlements != 0 {
+				t.Fatalf("mismatch audit=%d entitlements=%d", events, entitlements)
+			}
+			rec = callPay(r, "", "POST", "/v1/payments/stars/webhook", body, headers)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("mismatch retry: %d %s", rec.Code, rec.Body.String())
+			}
+			if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1`, paymentID).Scan(&events); err != nil {
+				t.Fatal(err)
+			}
+			if events != 1 {
+				t.Fatalf("mismatch retry audit=%d", events)
+			}
+			validCharge := "ch_" + tc.name + "_valid"
+			validProviderCharge := "pch_" + tc.name + "_valid"
+			if tc.existingTG != "" {
+				validCharge = tc.existingTG
+				validProviderCharge = tc.existingProvider
+			}
+			validBody := `{"message":{"from":{"id":` + itoa(int(tc.accountOwner)) + `},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"` + validCharge + `","provider_payment_charge_id":"` + validProviderCharge + `"}}}`
+			rec = callPay(r, "", "POST", "/v1/payments/stars/webhook", validBody, headers)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("valid recovery: %d %s", rec.Code, rec.Body.String())
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &result)
+			if result["ok"] != true || result["late"] == true {
+				t.Fatalf("valid recovery result: %s", rec.Body.String())
+			}
+			if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason); err != nil || status != "succeeded" || reason != "" {
+				t.Fatalf("recovered state=%s/%s err=%v", status, reason, err)
+			}
+			if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&entitlements); err != nil || entitlements != 1 {
+				t.Fatalf("recovered entitlement=%d err=%v", entitlements, err)
+			}
+		})
+	}
+}
+
+func TestE2EWebhookOwnerUnverifiedStaysBlocked(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, uid := newUser()
+	var paymentID string
+	if err := pg.QueryRow(context.Background(), `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'owner-unverified:' || gen_random_uuid(), 299, 199, 'pending', 'owner-unverified-e2e'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_owner_unverified","provider_payment_charge_id":"pch_owner_unverified"}}}`
+	headers := map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
+	rec := callPay(r, "", "POST", "/v1/payments/stars/webhook", body, headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner-unverified response: %d %s", rec.Code, rec.Body.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || result["reconciliation_required"] != true {
+		t.Fatalf("owner-unverified result: %s", rec.Body.String())
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason); err != nil || status != "reconciliation" || reason != "owner_unverified" {
+		t.Fatalf("owner-unverified state=%s/%s err=%v", status, reason, err)
+	}
+	var entitlements int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&entitlements); err != nil || entitlements != 0 {
+		t.Fatalf("owner-unverified entitlement=%d err=%v", entitlements, err)
+	}
+}
+
+func TestE2EWebhookOwnerUnverifiedOwnerSwapCannotRecover(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, uid := newUser()
+	var paymentID string
+	if err := pg.QueryRow(context.Background(), `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'owner-swap:' || gen_random_uuid(), 299, 199, 'pending', 'owner-swap-e2e'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	call := func(owner int64, charge, providerCharge string) *httptest.ResponseRecorder {
+		body := `{"message":{"from":{"id":` + itoa(int(owner)) + `},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"` + charge + `","provider_payment_charge_id":"` + providerCharge + `"}}}`
+		return callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
+	}
+	if rec := call(42, "ch_owner_swap", "pch_owner_swap"); rec.Code != http.StatusOK {
+		t.Fatalf("initial owner-unverified response: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=43 WHERE id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	rec := call(43, "ch_owner_swap", "pch_owner_swap")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner-swap response: %d %s", rec.Code, rec.Body.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || result["reconciliation_required"] != true {
+		t.Fatalf("owner-swap result: %s", rec.Body.String())
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason); err != nil || status != "reconciliation" || reason != "owner_unverified" {
+		t.Fatalf("owner-swap state=%s/%s err=%v", status, reason, err)
+	}
+	var entitlements int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&entitlements); err != nil || entitlements != 0 {
+		t.Fatalf("owner-swap entitlement=%d err=%v", entitlements, err)
+	}
+	var originalOwner int64
+	var originalTelegramCharge, originalProviderCharge string
+	if err := pg.QueryRow(context.Background(), `
+		SELECT owner_tg_id, telegram_charge_id, provider_charge_id
+		FROM payment_webhook_events WHERE payment_id=$1 AND reason='owner_unverified'
+		ORDER BY created_at, id LIMIT 1`, paymentID).Scan(&originalOwner, &originalTelegramCharge, &originalProviderCharge); err != nil {
+		t.Fatal(err)
+	}
+	if originalOwner != 42 || originalTelegramCharge != "ch_owner_swap" || originalProviderCharge != "pch_owner_swap" {
+		t.Fatalf("owner identity=%d/%s/%s", originalOwner, originalTelegramCharge, originalProviderCharge)
+	}
+}
+
+func TestE2EWebhookOwnerUnverifiedReusedChargeStaysManual(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, targetUID := newUser()
+	_, otherUID := newUser()
+	insert := func(uid, key string) string {
+		var id string
+		if err := pg.QueryRow(context.Background(), `
+			INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+			SELECT $1, id, 'month_299', 299, 'tg_stars', 'owner-reuse:' || gen_random_uuid(), 299, 199, 'pending', $2
+			  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid, key).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	otherID := insert(otherUID, "owner-reuse-other")
+	targetID := insert(targetUID, "owner-reuse-target")
+	if _, err := pg.Exec(context.Background(), `
+		UPDATE payments SET telegram_payment_charge_id='ch_owner_reused',
+		provider_payment_charge_id='pch_owner_reused' WHERE id=$1`, otherID); err != nil {
+		t.Fatal(err)
+	}
+	call := func(id string, charge, providerCharge string) *httptest.ResponseRecorder {
+		body := `{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + id + `","telegram_payment_charge_id":"` + charge + `","provider_payment_charge_id":"` + providerCharge + `"}}}`
+		return callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
+	}
+	if rec := call(targetID, "ch_owner_reused", "pch_owner_reused"); rec.Code != http.StatusOK {
+		t.Fatalf("reused owner-unverified response: %d %s", rec.Code, rec.Body.String())
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, targetID).Scan(&status, &reason); err != nil || status != "reconciliation" || reason != "charge_reused" {
+		t.Fatalf("reused owner-unverified state=%s/%s err=%v", status, reason, err)
+	}
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=42 WHERE id=$1`, targetUID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(targetID, "ch_owner_reused_other", "pch_owner_reused_other"); rec.Code != http.StatusOK {
+		t.Fatalf("different reused-charge response: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(targetID, "ch_owner_reused", "pch_owner_reused"); rec.Code != http.StatusOK {
+		t.Fatalf("same reused-charge response: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, targetID).Scan(&status, &reason); err != nil || status != "reconciliation" || reason != "charge_reused" {
+		t.Fatalf("reused owner-unverified final state=%s/%s err=%v", status, reason, err)
+	}
+	var entitlements, originalEvents, reuseEvents int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, targetID).Scan(&entitlements); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1 AND reason='owner_unverified'`, targetID).Scan(&originalEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1 AND reason='charge_reused'`, targetID).Scan(&reuseEvents); err != nil {
+		t.Fatal(err)
+	}
+	if entitlements != 0 || originalEvents != 1 || reuseEvents != 1 {
+		t.Fatalf("reused owner-unverified audit entitlements=%d original=%d reuse=%d", entitlements, originalEvents, reuseEvents)
+	}
+}
+
+func TestE2EWebhookReusedChargeMismatchCanRecover(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, uid := newUser()
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=42 WHERE id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(key string) string {
+		var id string
+		if err := pg.QueryRow(context.Background(), `
+			INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+			SELECT $1, id, 'month_299', 299, 'tg_stars', 'reuse:' || gen_random_uuid(), 299, 199, 'pending', $2
+			  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid, key).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	firstID := insert("reuse-first")
+	secondID := insert("reuse-second")
+	if _, err := pg.Exec(context.Background(), `UPDATE payments SET telegram_payment_charge_id='ch_reused_original', provider_payment_charge_id='pch_reused_original' WHERE id=$1`, firstID); err != nil {
+		t.Fatal(err)
+	}
+	call := func(id, charge, providerCharge string) *httptest.ResponseRecorder {
+		body := `{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + id + `","telegram_payment_charge_id":"` + charge + `","provider_payment_charge_id":"` + providerCharge + `"}}}`
+		return callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
+	}
+	rec := call(secondID, "ch_reused_original", "pch_reused_original")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reused mismatch: %d %s", rec.Code, rec.Body.String())
+	}
+	var result map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result["reconciliation_required"] != true {
+		t.Fatalf("reused mismatch result: %s", rec.Body.String())
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, secondID).Scan(&status, &reason); err != nil || status != "pending" || reason != "charge_reused" {
+		t.Fatalf("reused state=%s/%s err=%v", status, reason, err)
+	}
+	rec = call(secondID, "ch_reuse_valid", "pch_reuse_valid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reused recovery: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, secondID).Scan(&status, &reason); err != nil || status != "succeeded" || reason != "" {
+		t.Fatalf("reused recovered state=%s/%s err=%v", status, reason, err)
+	}
+	var audits, entitlements int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1 AND reason='charge_reused'`, secondID).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, secondID).Scan(&entitlements); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 || entitlements != 1 {
+		t.Fatalf("reused recovery audit=%d entitlement=%d", audits, entitlements)
+	}
+}
+
+func TestE2EWebhookDuplicateChargeIsDurableAndIdempotent(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, uid := newUser()
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=42 WHERE id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	var paymentID string
+	if err := pg.QueryRow(context.Background(), `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'pending:' || gen_random_uuid(), 299, 199, 'pending', 'duplicate-charge-e2e'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	call := func(charge, providerCharge string) *httptest.ResponseRecorder {
+		body := `{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"` + charge + `","provider_payment_charge_id":"` + providerCharge + `"}}}`
+		return callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
+	}
+	if rec := call("ch_original", "pch_original"); rec.Code != http.StatusOK {
+		t.Fatalf("initial webhook: %d %s", rec.Code, rec.Body.String())
+	}
+	for i := 0; i < 2; i++ {
+		rec := call("ch_duplicate", "pch_duplicate")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("duplicate webhook: %d %s", rec.Code, rec.Body.String())
+		}
+		var result map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || result["duplicate"] != true {
+			t.Fatalf("duplicate result: %s", rec.Body.String())
+		}
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, reconciliation_reason FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "succeeded" || reason != "duplicate_charge" {
+		t.Fatalf("duplicate state=%s/%s", status, reason)
+	}
+	var events, subscriptions int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1 AND reason='duplicate_charge'`, paymentID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&subscriptions); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || subscriptions != 1 {
+		t.Fatalf("duplicate audit=%d subscriptions=%d", events, subscriptions)
+	}
+}
+
+func TestE2EWebhookRecoversExistingReconciliation(t *testing.T) {
+	r, pg, newUser := testSetup(t)
+	t.Setenv("TG_STARS_SECRET_TOKEN", "test-secret")
+	_, uid := newUser()
+	if _, err := pg.Exec(context.Background(), `UPDATE users SET tg_id=42 WHERE id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	var paymentID string
+	if err := pg.QueryRow(context.Background(), `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key, reconciliation_reason)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'legacy-reconcile:' || gen_random_uuid(), 299, 199, 'reconciliation', 'legacy-reconcile-e2e', 'amount_mismatch'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"message":{"from":{"id":42},"successful_payment":{"currency":"XTR","total_amount":199,"invoice_payload":"` + paymentID + `","telegram_payment_charge_id":"ch_legacy_valid","provider_payment_charge_id":"pch_legacy_valid"}}}`
+	rec := callPay(r, "", "POST", "/v1/payments/stars/webhook", body, map[string]string{"X-Telegram-Bot-Api-Secret-Token": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy reconciliation: %d %s", rec.Code, rec.Body.String())
+	}
+	var result map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result["late"] != true {
+		t.Fatalf("legacy reconciliation result: %s", rec.Body.String())
+	}
+	var status, reason string
+	if err := pg.QueryRow(context.Background(), `SELECT status, COALESCE(reconciliation_reason,'') FROM payments WHERE id=$1`, paymentID).Scan(&status, &reason); err != nil || status != "succeeded" || reason != "" {
+		t.Fatalf("legacy recovered state=%s/%s err=%v", status, reason, err)
+	}
+	var entitlements int
+	if err := pg.QueryRow(context.Background(), `SELECT COUNT(*) FROM subscriptions WHERE payment_id=$1`, paymentID).Scan(&entitlements); err != nil || entitlements != 1 {
+		t.Fatalf("legacy entitlement=%d err=%v", entitlements, err)
+	}
+}
+
+func TestE2EWebhookAuditSurvivesPaymentDeletion(t *testing.T) {
+	_, pg, newUser := testSetup(t)
+	_, uid := newUser()
+	var paymentID string
+	if err := pg.QueryRow(context.Background(), `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'audit-delete:' || gen_random_uuid(), 299, 199, 'pending', 'audit-delete-e2e'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	sp := successfulPayment{Currency: "XTR", TotalAmount: 199, InvoicePayload: paymentID, TelegramPaymentCharge: "ch_audit_delete", ProviderPaymentCharge: "pch_audit_delete"}
+	if _, err := pg.Exec(context.Background(), `
+		INSERT INTO payment_webhook_events (payment_id, event_hash, reason, currency, total_amount, telegram_charge_id, provider_charge_id, owner_tg_id)
+		VALUES ($1,$2,'amount_mismatch','XTR',199,'ch_audit_delete','pch_audit_delete',42)`, paymentID, webhookEventHash(sp, 42)); err != nil {
+		t.Fatal(err)
+	}
+	var cascades bool
+	if err := pg.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conrelid='payment_webhook_events'::regclass AND contype='f' AND confdeltype='c'
+		)`).Scan(&cascades); err != nil {
+		t.Fatal(err)
+	}
+	if cascades {
+		t.Skip("029 is already applied with cascading payment_webhook_events foreign key")
+	}
+	if _, err := pg.Exec(context.Background(), `DELETE FROM payments WHERE id=$1`, paymentID); err != nil {
+		t.Fatal(err)
+	}
+	var auditPaymentID, telegramCharge, providerCharge string
+	var ownerTG int64
+	if err := pg.QueryRow(context.Background(), `
+		SELECT payment_id::text, telegram_charge_id, provider_charge_id, owner_tg_id
+		FROM payment_webhook_events WHERE payment_id=$1`, paymentID).Scan(&auditPaymentID, &telegramCharge, &providerCharge, &ownerTG); err != nil {
+		t.Fatal(err)
+	}
+	if auditPaymentID != paymentID || telegramCharge != "ch_audit_delete" || providerCharge != "pch_audit_delete" || ownerTG != 42 {
+		t.Fatalf("audit identity=%s/%s/%s/%d", auditPaymentID, telegramCharge, providerCharge, ownerTG)
+	}
+}
+
 func TestE2EPaymentSnapshotIsImmutable(t *testing.T) {
 	_, pg, newUser := testSetup(t)
 	_, uid := newUser()
 	var paymentID string
 	if err := pg.QueryRow(context.Background(), `
-		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status)
-		SELECT $1, id, 'month_299', 299, 'tg_stars', 'immutable:' || gen_random_uuid(), 299, 199, 'pending'
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, stars, status, idempotency_key)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'immutable:' || gen_random_uuid(), 299, 199, 'pending', 'immutable-snapshot-e2e'
 		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1 RETURNING id::text`, uid).Scan(&paymentID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pg.Exec(context.Background(), `UPDATE payments SET price_rub_snapshot=300 WHERE id=$1`, paymentID); err == nil {
-		t.Fatal("payment snapshot must be immutable")
+	var originalPlanID string
+	if err := pg.QueryRow(context.Background(), `SELECT plan_id::text FROM payments WHERE id=$1`, paymentID).Scan(&originalPlanID); err != nil {
+		t.Fatal(err)
 	}
-	var price int
-	if err := pg.QueryRow(context.Background(), `SELECT price_rub_snapshot FROM payments WHERE id=$1`, paymentID).Scan(&price); err != nil || price != 299 {
-		t.Fatalf("snapshot changed: price=%d err=%v", price, err)
+	updates := []string{
+		`UPDATE payments SET plan_id=(SELECT id FROM plans WHERE code='year_2490' ORDER BY valid_from DESC LIMIT 1) WHERE id=$1`,
+		`UPDATE payments SET amount_rub=300 WHERE id=$1`,
+		`UPDATE payments SET idempotency_key='changed-snapshot' WHERE id=$1`,
+	}
+	for _, update := range updates {
+		if _, err := pg.Exec(context.Background(), update, paymentID); err == nil {
+			t.Fatalf("payment snapshot update was accepted: %s", update)
+		}
+	}
+	var planID string
+	var price, amount int
+	var key string
+	if err := pg.QueryRow(context.Background(), `SELECT plan_id::text, price_rub_snapshot, amount_rub, idempotency_key FROM payments WHERE id=$1`, paymentID).Scan(&planID, &price, &amount, &key); err != nil {
+		t.Fatal(err)
+	}
+	if planID != originalPlanID || price != 299 || amount != 299 || key != "immutable-snapshot-e2e" {
+		t.Fatalf("snapshot changed: plan=%s price=%d amount=%d key=%s", planID, price, amount, key)
+	}
+}
+
+func TestE2EPaymentConstraintsAreValidated(t *testing.T) {
+	_, pg, _ := testSetup(t)
+	constraints := []struct {
+		table string
+		name  string
+	}{
+		{table: "payments", name: "payments_idempotency_key_check"},
+		{table: "payments", name: "payments_amounts_check"},
+		{table: "payments", name: "payments_duration_snapshot_check"},
+		{table: "payments", name: "payments_refund_state_transition_check"},
+		{table: "subscriptions", name: "subscriptions_price_snapshot_check"},
+	}
+	for _, constraint := range constraints {
+		var validated bool
+		if err := pg.QueryRow(context.Background(), `SELECT convalidated FROM pg_constraint WHERE conrelid=$1::regclass AND conname=$2`, constraint.table, constraint.name).Scan(&validated); err != nil {
+			t.Fatal(err)
+		}
+		if !validated {
+			t.Fatalf("constraint %s is not validated", constraint.name)
+		}
 	}
 }
 

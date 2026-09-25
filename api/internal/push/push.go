@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -25,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/hkdf"
 
@@ -32,15 +35,21 @@ import (
 	"taro/api/internal/auth"
 )
 
+type pushLogStore interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
 // Service — подписки и отправка.
 type Service struct {
-	pg   *pgxpool.Pool
-	http *http.Client
+	pg       *pgxpool.Pool
+	logStore pushLogStore
+	http     *http.Client
 }
 
 // New возвращает сервис.
 func New(pg *pgxpool.Pool) *Service {
-	return &Service{pg: pg, http: &http.Client{
+	return &Service{pg: pg, logStore: pg, http: &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			// Аудит B: dial-time блок private/loopback — закрывает rebinding-окно
@@ -67,6 +76,19 @@ func New(pg *pgxpool.Pool) *Service {
 	}}
 }
 
+func (s *Service) logStoreOrPool() pushLogStore {
+	if s.logStore != nil {
+		if pool, ok := s.logStore.(*pgxpool.Pool); ok && pool == nil {
+			return nil
+		}
+		return s.logStore
+	}
+	if s.pg == nil {
+		return nil
+	}
+	return s.pg
+}
+
 // HandlePublicKey — GET /v1/push/public: VAPID-публичник (не секрет, см. U21).
 func (s *Service) HandlePublicKey(w http.ResponseWriter, _ *http.Request) {
 	key := os.Getenv("VAPID_PUBLIC_KEY")
@@ -74,6 +96,7 @@ func (s *Service) HandlePublicKey(w http.ResponseWriter, _ *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Push не настроен")
 		return
 	}
+	key, _ = canonicalBase64URL(key)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"key": key})
 }
@@ -120,22 +143,37 @@ func validEndpoint(ctx context.Context, raw string) error {
 	return nil
 }
 
-func validPushKey(value string, size int, prefix byte) bool {
+func decodeBase64URL(value string) ([]byte, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err == nil {
+		return raw, nil
+	}
+	return base64.URLEncoding.DecodeString(value)
+}
+
+func canonicalBase64URL(value string) (string, error) {
+	raw, err := decodeBase64URL(value)
 	if err != nil {
-		raw, err = base64.URLEncoding.DecodeString(value)
+		return "", err
 	}
-	if err != nil || len(raw) != size {
-		return false
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func canonicalPushKey(value string, size int, prefix byte) (string, bool) {
+	raw, err := decodeBase64URL(value)
+	if err != nil || len(raw) != size || (prefix != 0 && raw[0] != prefix) {
+		return "", false
 	}
-	return prefix == 0 || raw[0] == prefix
+	return base64.RawURLEncoding.EncodeToString(raw), true
+}
+
+func validPushKey(value string, size int, prefix byte) bool {
+	_, ok := canonicalPushKey(value, size, prefix)
+	return ok
 }
 
 func validVAPIDPublicKey(value string) bool {
-	raw, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil {
-		raw, err = base64.URLEncoding.DecodeString(value)
-	}
+	raw, err := decodeBase64URL(value)
 	return err == nil && len(raw) == 65 && raw[0] == 4
 }
 
@@ -154,8 +192,17 @@ func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Endpoint) > 512 || len(req.P256DH) > 256 || len(req.Auth) > 128 ||
-		strings.ContainsRune(req.Endpoint, 0) || strings.ContainsRune(req.P256DH, 0) || strings.ContainsRune(req.Auth, 0) ||
-		!validPushKey(req.P256DH, 65, 4) || !validPushKey(req.Auth, 16, 0) {
+		strings.ContainsRune(req.Endpoint, 0) || strings.ContainsRune(req.P256DH, 0) || strings.ContainsRune(req.Auth, 0) {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимые данные подписки")
+		return
+	}
+	p256dh, ok := canonicalPushKey(req.P256DH, 65, 4)
+	if !ok {
+		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимые данные подписки")
+		return
+	}
+	authKey, ok := canonicalPushKey(req.Auth, 16, 0)
+	if !ok {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Недопустимые данные подписки")
 		return
 	}
@@ -167,7 +214,7 @@ func (s *Service) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 		INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES ($1,$2,$3,$4)
 		ON CONFLICT (endpoint) DO UPDATE SET p256dh=$3, auth=$4
 		WHERE push_subscriptions.user_id=$1`,
-		uid, req.Endpoint, req.P256DH, req.Auth)
+		uid, req.Endpoint, p256dh, authKey)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось подписать")
 		return
@@ -276,17 +323,49 @@ func (s *Service) eveningTargets(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// logOnce пишет строку лога один раз на (user, kind, сутки MSK).
-// Возвращает true если это первая отправка (можно слать), false — дубль.
-func (s *Service) logOnce(ctx context.Context, userID, kind, status string) bool {
-	tag, err := s.pg.Exec(ctx,
-		`INSERT INTO push_logs (user_id, kind, status) VALUES ($1,$2,$3)
-		 ON CONFLICT (user_id, kind, ((created_at AT TIME ZONE 'Europe/Moscow')::date)) DO NOTHING`,
-		userID, kind, status)
-	if err != nil {
-		return true // индекс отсутствует (миграция не применена) — не блокируем рассылку
+func (s *Service) logOnce(ctx context.Context, userID, kind, status string) (bool, time.Time, error) {
+	store := s.logStoreOrPool()
+	if store == nil {
+		return false, time.Time{}, fmt.Errorf("push log store unavailable")
 	}
-	return tag.RowsAffected() > 0
+	var claim time.Time
+	err := store.QueryRow(ctx,
+		`INSERT INTO push_logs (user_id, kind, status) VALUES ($1,$2,$3)
+		 ON CONFLICT (user_id, kind, ((created_at AT TIME ZONE 'Europe/Moscow')::date)) DO UPDATE
+		 SET status=$3, created_at=now()
+		 WHERE push_logs.status='failed'
+		    OR (push_logs.status='sending' AND push_logs.created_at < now() - interval '5 minutes')
+		 RETURNING created_at`,
+		userID, kind, status).Scan(&claim)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, time.Time{}, nil
+	}
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	return true, claim, nil
+}
+
+// errPushClaimLost — статус пишет воркер, чью заявку уже перехватили.
+var errPushClaimLost = errors.New("push log claim lost")
+
+func (s *Service) setPushLogStatus(ctx context.Context, userID, kind, status string, claim time.Time) error {
+	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	store := s.logStoreOrPool()
+	if store == nil {
+		return fmt.Errorf("push log store unavailable")
+	}
+	tag, err := store.Exec(statusCtx,
+		`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind=$3 AND created_at=$4`,
+		status, userID, kind, claim)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errPushClaimLost
+	}
+	return nil
 }
 
 // HandleEvening — POST /v1/admin/push-evening: вечерняя рассылка по hour/quite (см. V23/V24).
@@ -300,7 +379,12 @@ func (s *Service) HandleEvening(w http.ResponseWriter, r *http.Request) {
 	sent := 0
 	for _, u := range users {
 		// Аудит D: дедуп (повторный запуск крона не спамит) + честный статус.
-		if !s.logOnce(ctx, u, "evening", "sending") {
+		claimed, claim, err := s.logOnce(ctx, u, "evening", "sending")
+		if err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось записать рассылку")
+			return
+		}
+		if !claimed {
 			continue
 		}
 		n, _ := s.SendToUser(ctx, u, "Онлайн Таро", eveningFor(time.Now()))
@@ -309,10 +393,10 @@ func (s *Service) HandleEvening(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			st = "sent"
 		}
-		_, _ = s.pg.Exec(ctx,
-			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='evening'
-			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
-			st, u)
+		if err := s.setPushLogStatus(ctx, u, "evening", st, claim); err != nil && !errors.Is(err, errPushClaimLost) {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось записать рассылку")
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "users": len(users), "sent": sent})
@@ -325,7 +409,7 @@ func (s *Service) HandleStreakRisk(w http.ResponseWriter, r *http.Request) {
 		SELECT user_id FROM (
 		  SELECT user_id, MAX((created_at AT TIME ZONE 'Europe/Moscow')::date) AS last_day,
 		         COUNT(DISTINCT (created_at AT TIME ZONE 'Europe/Moscow')::date) AS days
-		    FROM (SELECT user_id, created_at FROM readings WHERE status='done'
+		    FROM (SELECT user_id, created_at FROM readings WHERE status='done' AND quota_state='allowed'
 		          UNION ALL SELECT user_id, created_at FROM diary_entries) t
 		   GROUP BY user_id
 		) s WHERE last_day = (now() AT TIME ZONE 'Europe/Moscow')::date - 1 AND days >= 2`)
@@ -339,7 +423,12 @@ func (s *Service) HandleStreakRisk(w http.ResponseWriter, r *http.Request) {
 		var u string
 		_ = rows.Scan(&u)
 		users++
-		if !s.logOnce(ctx, u, "streak_risk", "sending") {
+		claimed, claim, err := s.logOnce(ctx, u, "streak_risk", "sending")
+		if err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось записать рассылку")
+			return
+		}
+		if !claimed {
 			continue
 		}
 		n, _ := s.SendToUser(ctx, u, "Стрик в опасности 🔥", "Загляни сегодня — не прерывай серию!")
@@ -348,10 +437,10 @@ func (s *Service) HandleStreakRisk(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			st = "sent"
 		}
-		_, _ = s.pg.Exec(ctx,
-			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='streak_risk'
-			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
-			st, u)
+		if err := s.setPushLogStatus(ctx, u, "streak_risk", st, claim); err != nil && !errors.Is(err, errPushClaimLost) {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось записать рассылку")
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "users": users, "sent": sent})
@@ -405,7 +494,11 @@ func (s *Service) RemindExpiring(ctx context.Context) (int, int, error) {
 	sent := 0
 	for _, u := range users {
 		// Аудит D: окно 72ч слало одному юзеру 3 дня подряд — дедуп по суткам.
-		if !s.logOnce(ctx, u, "expiring", "sending") {
+		claimed, claim, err := s.logOnce(ctx, u, "expiring", "sending")
+		if err != nil {
+			return 0, 0, err
+		}
+		if !claimed {
 			continue
 		}
 		n, _ := s.SendToUser(ctx, u, "Безлимит скоро закончится", "Продли в 1 тап — карты уже ждут вечером 🌙")
@@ -414,10 +507,9 @@ func (s *Service) RemindExpiring(ctx context.Context) (int, int, error) {
 		if n > 0 {
 			st = "sent"
 		}
-		_, _ = s.pg.Exec(ctx,
-			`UPDATE push_logs SET status=$1 WHERE user_id=$2 AND kind='expiring'
-			   AND (created_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date`,
-			st, u)
+		if err := s.setPushLogStatus(ctx, u, "expiring", st, claim); err != nil && !errors.Is(err, errPushClaimLost) {
+			return sent, len(users), err
+		}
 	}
 	return sent, len(users), nil
 }
@@ -426,7 +518,7 @@ func (s *Service) RemindExpiring(ctx context.Context) (int, int, error) {
 func (s *Service) HandleRemindExpiring(w http.ResponseWriter, r *http.Request) {
 	sent, total, err := s.RemindExpiring(r.Context())
 	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось разослать")
+		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Не удалось записать рассылку")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -488,7 +580,7 @@ func vapidKey() (*ecdsa.PrivateKey, error) {
 	if raw == "" {
 		return nil, fmt.Errorf("no vapid key")
 	}
-	b, err := base64.RawURLEncoding.DecodeString(raw)
+	b, err := decodeBase64URL(raw)
 	if err != nil || len(b) != 32 {
 		return nil, fmt.Errorf("bad vapid key")
 	}
@@ -523,14 +615,26 @@ func vapidJWT(priv *ecdsa.PrivateKey, aud string) (string, error) {
 	return header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
-// encryptPayload — RFC8188 aes128gcm: ECDH ephemeral×client, HKDF, AES-GCM, pad 0x02.
+func padWebPushPayload(plaintext []byte) []byte {
+	padded := make([]byte, len(plaintext)+1)
+	copy(padded, plaintext)
+	padded[len(plaintext)] = 2
+	if r := len(padded) % 16; r != 0 {
+		padded = append(padded, make([]byte, 16-r)...)
+	}
+	return padded
+}
+
 func encryptPayload(clientP256dh, authSecret, plaintext []byte) (pub, salt, body []byte, err error) {
 	eph, err := ecdh.P256().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	raw := eph.PublicKey().Bytes() // 65 байт uncompressed — валидная точка
+	raw := eph.PublicKey().Bytes()
 	clientKey, err := ecdh.P256().NewPublicKey(clientP256dh)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	shared, err := eph.ECDH(clientKey)
 	if err != nil {
 		return nil, nil, nil, err
@@ -538,14 +642,23 @@ func encryptPayload(clientP256dh, authSecret, plaintext []byte) (pub, salt, body
 	authB := authSecret
 	info := append(append([]byte("WebPush: info\x00"), clientP256dh...), raw...)
 	prk := hkdfExtract(authB, shared)
-	ikm, _ := hkdfExpand(prk, info, 32)
+	ikm, err := hkdfExpand(prk, info, 32)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	salt = make([]byte, 16)
 	if _, err = rand.Read(salt); err != nil {
 		return nil, nil, nil, err
 	}
 	prk2 := hkdfExtract(salt, ikm)
-	cek, _ := hkdfExpand(prk2, []byte("Content-Encoding: aes128gcm\x00"), 16)
-	nonce, _ := hkdfExpand(prk2, []byte("Content-Encoding: nonce\x00"), 12)
+	cek, err := hkdfExpand(prk2, []byte("Content-Encoding: aes128gcm\x00"), 16)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	nonce, err := hkdfExpand(prk2, []byte("Content-Encoding: nonce\x00"), 12)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	block, err := aes.NewCipher(cek)
 	if err != nil {
 		return nil, nil, nil, err
@@ -554,12 +667,7 @@ func encryptPayload(clientP256dh, authSecret, plaintext []byte) (pub, salt, body
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	padded := append([]byte{0x02}, plaintext...)
-	// паддинг до блока кратно? aesgcm без паддинга ок, но добавим выравнивание 16
-	if r := len(padded) % 16; r != 0 {
-		padded = append(padded, make([]byte, 16-r)...)
-	}
-	ct := gcm.Seal(nil, nonce, padded, nil)
+	ct := gcm.Seal(nil, nonce, padWebPushPayload(plaintext), nil)
 	return raw, salt, ct, nil
 }
 
@@ -599,13 +707,13 @@ func (s *Service) doSend(ctx context.Context, sub Subscription, payload []byte) 
 	if err != nil {
 		return 0, err
 	}
-	pubBytes, err := base64.RawURLEncoding.DecodeString(sub.P256DH)
-	if err != nil {
-		return 0, err
+	pubBytes, err := decodeBase64URL(sub.P256DH)
+	if err != nil || len(pubBytes) != 65 || pubBytes[0] != 4 {
+		return 0, fmt.Errorf("bad push key")
 	}
-	authBytes, err := base64.RawURLEncoding.DecodeString(sub.Auth)
-	if err != nil {
-		return 0, err
+	authBytes, err := decodeBase64URL(sub.Auth)
+	if err != nil || len(authBytes) != 16 {
+		return 0, fmt.Errorf("bad push auth")
 	}
 	pub, salt, body, err := encryptPayload(pubBytes, authBytes, payload)
 	if err != nil {

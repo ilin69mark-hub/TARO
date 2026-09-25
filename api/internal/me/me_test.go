@@ -73,7 +73,37 @@ func TestE2EDeleteMe(t *testing.T) {
 	}
 	// чтение юзера для проверки каскада
 	if _, err := pg.Exec(ctx,
-		`INSERT INTO readings (user_id, spread_code, question, cards, seed, status) VALUES ($1,'daily','q','[]',1,'done')`, uid); err != nil {
+		`INSERT INTO readings (user_id, spread_code, question, cards, interpretation, seed, status, quota_state)
+		 VALUES ($1,'daily','q','[]','done',1,'done','allowed')`, uid); err != nil {
+		t.Fatal(err)
+	}
+	// строки без CASCADE: карантин 034 и аудит вебхуков
+	var readingID string
+	if err := pg.QueryRow(ctx,
+		`SELECT id FROM readings WHERE user_id=$1`, uid).Scan(&readingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(ctx, `
+		INSERT INTO reading_quota_quarantine_034
+			(reading_id, user_id, original_status, original_quota_state, original_interpretation)
+		VALUES ($1,$2,'done','error','quarantined')`, readingID, uid); err != nil {
+		t.Fatal(err)
+	}
+	var paymentID string
+	if err := pg.QueryRow(ctx, `
+		INSERT INTO payments (user_id, plan_id, plan_code, price_rub_snapshot, provider, provider_payment_id, amount_rub, status)
+		SELECT $1, id, 'month_299', 299, 'tg_stars', 'me-delete:' || gen_random_uuid(), 299, 'succeeded'
+		  FROM plans WHERE code='month_299' ORDER BY valid_from DESC LIMIT 1
+		RETURNING id`, uid).Scan(&paymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(ctx, `
+		INSERT INTO payment_webhook_events (payment_id, event_hash, reason, currency, total_amount, telegram_charge_id, provider_charge_id, owner_tg_id)
+		VALUES ($1, encode(digest('me-delete-event', 'sha256'), 'hex'), 'amount_mismatch','RUB',299,'charge-me-delete','provider-me-delete',4242)`,
+		paymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(ctx, `DELETE FROM admin_audit WHERE admin_id=$1`, uid); err != nil {
 		t.Fatal(err)
 	}
 	// delete без confirm → 422
@@ -89,6 +119,13 @@ func TestE2EDeleteMe(t *testing.T) {
 	_ = pg.QueryRow(ctx, `SELECT COUNT(*) FROM readings WHERE user_id=$1`, uid).Scan(&readings)
 	if users != 0 || readings != 0 {
 		t.Fatalf("not wiped: users=%d readings=%d", users, readings)
+	}
+	var quarantined, webhookEvents, orphanPayments int
+	_ = pg.QueryRow(ctx, `SELECT COUNT(*) FROM reading_quota_quarantine_034 WHERE user_id=$1`, uid).Scan(&quarantined)
+	_ = pg.QueryRow(ctx, `SELECT COUNT(*) FROM payment_webhook_events WHERE payment_id=$1`, paymentID).Scan(&webhookEvents)
+	_ = pg.QueryRow(ctx, `SELECT COUNT(*) FROM payment_webhook_events WHERE owner_tg_id=4242`).Scan(&orphanPayments)
+	if quarantined != 0 || webhookEvents != 0 || orphanPayments != 0 {
+		t.Fatalf("user rows survived delete: quarantine=%d webhook_events=%d owner_rows=%d", quarantined, webhookEvents, orphanPayments)
 	}
 	if n, _ := rd.Exists(ctx, "sess:"+uid).Result(); n != 0 {
 		t.Fatal("sess not deleted")

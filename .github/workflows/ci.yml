@@ -3,6 +3,8 @@ name: ci
 on:
   push:
     branches: [dev, main]
+    tags:
+      - "v*"
   pull_request:
 
 jobs:
@@ -19,6 +21,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - run: node --check ../deploy/admin-ui/app.js
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run lint
       - run: test -z "$(grep -rn 'track(events\.[a-zA-Z]*, {[^}]*\(question\|interpretation\)' lib app components || true)"
@@ -66,6 +69,21 @@ jobs:
       - run: go build ./...
       - run: |
           set -eu
+          if output="$(PUBLIC_ORIGIN='not-a-url' go run ./cmd/api 2>&1)"; then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F 'PUBLIC_ORIGIN must be an absolute HTTP(S) origin'
+          if output="$(ADMIN_ORIGIN='ftp://example.test' go run ./cmd/admin 2>&1)"; then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F 'ADMIN_ORIGIN must be an absolute HTTP(S) origin'
+      - run: docker build --no-cache --file Dockerfile.public --tag taro-api-public:ci .
+      - run: docker build --no-cache --file Dockerfile.admin --tag taro-api-admin:ci .
+      - run: ../deploy/migrate.sh manifest
+      - run: |
+          set -eu
           docker run --rm --network host --read-only --tmpfs /tmp \
             --security-opt no-new-privileges --cap-drop ALL \
             -e DATABASE_URL \
@@ -83,7 +101,9 @@ jobs:
             case "$number" in
               ''|*[!0-9]*) continue ;;
             esac
-            number=$((10#$number))
+            while [ "$number" != "0" ] && [ "${number#0}" != "$number" ]; do
+              number=${number#0}
+            done
             if [ "$number" -gt "$expected" ]; then
               expected="$number"
             fi
@@ -109,7 +129,42 @@ jobs:
           matches="$(git grep -n -I -e "$secret" -- ':!api/internal/push/push_test.go' ':!.github/workflows/ci.yml' || true)"
           test -z "$matches"
       - run: test -z "$(git ls-files | grep -E '(^|/)\.env$' || true)"
-      - run: sh -n deploy/*.sh
+      - run: |
+          for script in deploy/*.sh; do
+            sh -n "$script"
+            test -x "$script"
+          done
+      - run: |
+          grep -Fq 'location = /readyz' deploy/nginx-tls.conf
+          grep -Fq 'docker-compose.tls.yml' .github/workflows/deploy.yml
+          grep -Fq 'workflows: ["ci"]' .github/workflows/deploy.yml
+      - run: |
+          for path in \
+            api/cmd/adminctl/main.go \
+            deploy/admin-ui/index.html \
+            deploy/admin-ui/app.js \
+            deploy/admin-ui/styles.css \
+            api/migrations/027_admin_password_auth.up.sql \
+            api/migrations/027_admin_password_auth.down.sql \
+            api/migrations/028_reading_worker_hardening.up.sql \
+            api/migrations/028_reading_worker_hardening.down.sql \
+            api/migrations/029_payment_push_integrity.up.sql \
+            api/migrations/029_payment_push_integrity.down.sql \
+            api/migrations/030_admin_session_version.up.sql \
+            api/migrations/030_admin_session_version.down.sql \
+            api/migrations/031_reconcile_unverified_readings.up.sql \
+            api/migrations/031_reconcile_unverified_readings.down.sql \
+            api/migrations/032_reading_authorization_receipts.up.sql \
+            api/migrations/032_reading_authorization_receipts.down.sql \
+            api/migrations/033_payment_webhook_audit.up.sql \
+            api/migrations/033_payment_webhook_audit.down.sql \
+            api/migrations/034_reading_quota_guard.up.sql \
+            api/migrations/034_reading_quota_guard.down.sql; do
+            git ls-files --error-unmatch -- "$path" >/dev/null || {
+              printf 'required release file is not tracked: %s\n' "$path" >&2
+              exit 1
+            }
+          done
       - run: |
           for id in $(grep -rh 'AUDIT-EXCEPTION' api web deploy docker-compose.yml .env.example | grep -oE 'E[0-9]+' | sort -u); do
             grep -q "id: $id" docs/security-exceptions.yml || (printf 'exception %s missing\n' "$id" && exit 1)
@@ -144,8 +199,8 @@ jobs:
               "POSTGRES_PASSWORD", "REDIS_PASSWORD", "REDIS_ENC_KEY",
               "OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2", "JWT_SECRET",
               "TG_BOT_TOKEN", "TG_STARS_SECRET_TOKEN", "VAPID_PUBLIC_KEY",
-              "VAPID_PRIVATE_KEY", "ADMIN_TG_IDS", "ADMIN_API_TOKEN",
-              "DATABASE_URL",
+              "VAPID_PRIVATE_KEY", "ADMIN_API_TOKEN", "ADMIN_ORIGIN",
+              "PUBLIC_ORIGIN", "NEXT_PUBLIC_BASE_URL", "DATABASE_URL",
           )
           missing = [key for key in required if not re.search(r"\$\{" + re.escape(key) + r":\?", text)]
           if missing:

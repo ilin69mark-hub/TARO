@@ -38,8 +38,7 @@ INSERT INTO app_config (key, value) VALUES
   ('copy.paywall_cta', '"Продолжить безлимитно — 299₽/мес"'),
   ('ai', '{"model":"openai/gpt-4o-mini","fallback":"anthropic/claude-3-haiku","max_tokens":900,"temperature":0.7,"monthly_calls":5000}');
 
--- Админ-плейсхолдер: после первого входа через TG проставь свой tg_id:
---   UPDATE users SET tg_id = <твой_TG_ID> WHERE id = '00000000-0000-0000-0000-000000000001';
+-- Админ-пользователь без Telegram-привязки. Учётная запись создаётся provisioned-командой.
 INSERT INTO users (id, role) VALUES ('00000000-0000-0000-0000-000000000001', 'admin');
 
 -- 22 старших аркана

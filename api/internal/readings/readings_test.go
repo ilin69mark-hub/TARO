@@ -81,3 +81,22 @@ func TestCrisisPolicyIsSafeAndConfigurable(t *testing.T) {
 		t.Fatal("crisis policy is not configurable")
 	}
 }
+
+func TestCrisisPolicyDetectsObfuscation(t *testing.T) {
+	policy := defaultCrisisPolicy()
+	cases := []string{
+		"п о к о н ч и т ь с собой",
+		"покон-чить с собой",
+		"по\u200bкончить с собой",
+		"ПОКОНЧИТЬ\nСОБОЙ",
+		"не   хочу   жить",
+	}
+	for _, question := range cases {
+		if !policy.matches(question) {
+			t.Fatalf("crisis obfuscation missed: %q", question)
+		}
+	}
+	if policy.matches("покончатая работа") {
+		t.Fatal("crisis false positive")
+	}
+}

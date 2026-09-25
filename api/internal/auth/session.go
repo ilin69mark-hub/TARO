@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -84,6 +85,9 @@ func sessionClaims(ctx context.Context) (tokenClaims, bool) {
 }
 
 func (s *Service) sessionMarkerOK(ctx context.Context, claims tokenClaims) (bool, error) {
+	if s.rd == nil {
+		return false, errors.New("redis unavailable")
+	}
 	marker, err := s.rd.Get(ctx, sessKey(claims.Subject)).Result()
 	if err == redis.Nil {
 		return false, nil
@@ -145,8 +149,15 @@ func (s *Service) RequireCSRF(next http.Handler) http.Handler {
 					apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 					return
 				}
-				want, csrfErr := s.csrfFor(r.Context(), claims.Subject)
-				if csrfErr != nil || r.Header.Get("X-CSRF") == "" || r.Header.Get("X-CSRF") != want {
+				want, regenerated, csrfErr := s.csrfForState(r.Context(), claims.Subject)
+				if csrfErr != nil {
+					apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+					return
+				}
+				if regenerated {
+					setCSRFCookie(w, want)
+				}
+				if r.Header.Get("X-CSRF") == "" || r.Header.Get("X-CSRF") != want {
 					apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный CSRF-токен")
 					return
 				}
@@ -177,31 +188,70 @@ func jwtUser(r *http.Request) string {
 
 // csrfFor возвращает per-session CSRF-токен (создает при отсутствии, TTL=сессии).
 func (s *Service) csrfFor(ctx context.Context, uid string) (string, error) {
-	if v, err := s.rd.Get(ctx, "csrf:"+uid).Result(); err == nil && v != "" {
-		return v, nil
+	v, _, err := s.csrfForState(ctx, uid)
+	return v, err
+}
+
+const csrfRecoverLua = `
+local current = redis.call('GET', KEYS[1])
+if not current or current == '' then
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+  return 1
+end
+return 0
+`
+
+func (s *Service) csrfForState(ctx context.Context, uid string) (string, bool, error) {
+	if s.rd == nil {
+		return "", false, errors.New("redis unavailable")
 	}
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+	key := "csrf:" + uid
+	v, err := s.rd.Get(ctx, key).Result()
+	if err == nil && v != "" {
+		return v, false, nil
 	}
-	v := hex.EncodeToString(b[:])
-	if err := s.rd.Set(ctx, "csrf:"+uid, v, UserTTL).Err(); err != nil {
-		return "", err
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return "", false, err
 	}
-	return v, nil
+	for range 2 {
+		var b [32]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", false, err
+		}
+		value := hex.EncodeToString(b[:])
+		created, err := s.rd.Eval(ctx, csrfRecoverLua, []string{key}, value, strconv.FormatInt(UserTTL.Milliseconds(), 10)).Int()
+		if err != nil {
+			return "", false, err
+		}
+		if created == 1 {
+			return value, true, nil
+		}
+		v, err = s.rd.Get(ctx, key).Result()
+		if err == nil && v != "" {
+			return v, true, nil
+		}
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return "", false, err
+		}
+	}
+	return "", false, errors.New("csrf token race")
 }
 
 // issueCSRF выдает токен в читаемую cookie taro_csrf + поле ответа (см. S07).
-func (s *Service) issueCSRF(w http.ResponseWriter, ctx context.Context, uid string) string {
-	v, err := s.csrfFor(ctx, uid)
+func (s *Service) issueCSRF(w http.ResponseWriter, ctx context.Context, uid string) (string, error) {
+	v, _, err := s.csrfForState(ctx, uid)
 	if err != nil {
-		return ""
+		return "", err
 	}
+	setCSRFCookie(w, v)
+	return v, nil
+}
+
+func setCSRFCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, &http.Cookie{
-		Name: "taro_csrf", Value: v, Path: "/", MaxAge: int(UserTTL.Seconds()),
+		Name: "taro_csrf", Value: value, Path: "/", MaxAge: int(UserTTL.Seconds()),
 		Secure: true, SameSite: http.SameSiteNoneMode,
 	})
-	return v
 }
 
 // originOK сверяет Origin/Referer с хостом запроса (пустые — пропускаем: curl/тесты).
@@ -277,7 +327,14 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	uid := UserID(r.Context())
 	if uid != "" {
-		_ = s.rd.Del(r.Context(), sessKey(uid), "csrf:"+uid).Err()
+		if s.rd == nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
+		if err := s.rd.Del(r.Context(), sessKey(uid), "csrf:"+uid).Err(); err != nil {
+			apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
+			return
+		}
 	}
 	ExpireAuthCookies(w)
 	w.Header().Set("Content-Type", "application/json")
