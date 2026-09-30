@@ -18,6 +18,22 @@ const NAMES: Record<string, string> = {
   referral_bonus: "Бонус",
 };
 
+// Короткие подписи для горизонтальной полосы. Полные названия в колонке ~104px
+// не помещались: «Безлимит на год −30%» занимал три строки и line-clamp срезал
+// хвост вместе со «−30%», то есть с самой полезной частью — выгодой. Здесь
+// смысл сохранён целиком, а полное название лежит в title для наведения.
+// Подписи оставлены различимыми по смыслу, а не сокращены до одного слова:
+// существующий тест порядка Paywall.test.tsx опознаёт тариф по тексту первой
+// карточки, и подпись «Месяц» его бы сломал, не будучи полезнее.
+// Различаемость по цене тут важнее компактности — выбор делают по «−30%».
+const SHORT: Record<string, string> = {
+  month_299: "Безлимит",
+  year_2490: "Год −30%",
+  single_99: "Разовый",
+  trial_3d: "Trial",
+  referral_bonus: "Бонус",
+};
+
 export default function PaywallSheet({
   plans,
   abPrice,
@@ -151,52 +167,74 @@ export default function PaywallSheet({
         className="flex max-h-[90dvh] w-full max-w-md flex-col rounded-t-3xl border-t border-gold/40 bg-elev"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Шапка и подвал не уезжают — прокручивается только список тарифов. */}
-        <div className="shrink-0 px-6 pt-6">
-          <p className="text-xl font-semibold text-paper">Заглянем глубже?</p>
-          <p className="mt-1 text-sm text-mist">На сегодня бесплатные карты закончились</p>
-          <label className="mt-3 flex cursor-pointer items-center gap-2 rounded-2xl border border-white/10 p-3">
+
+        {/* Шапка. Чекбокс 18+ остаётся обязательным (без age_confirmed_at бэк
+            отдаёт 403), но в одну строку: рамка во всю ширину съедала ~52px,
+            которых не хватало на кнопку оплаты. */}
+        <div className="shrink-0 px-6 pt-4">
+          <p className="text-lg font-semibold leading-tight text-paper">Заглянем глубже?</p>
+          <p className="mt-0.5 text-xs text-mist">На сегодня бесплатные карты закончились</p>
+          <label className="mt-2 flex cursor-pointer items-center gap-2">
             <input
               type="checkbox"
               checked={adult}
               onChange={(e) => confirmAdult(e.target.checked)}
-              className="h-5 w-5 accent-[#D4AF37]"
+              className="h-4 w-4 shrink-0 accent-[#D4AF37]"
             />
-            <span className="text-sm text-paper">Мне есть 18, я понимаю условия выше</span>
+            <span className="text-xs text-paper">Мне есть 18, я понимаю условия выше</span>
           </label>
         </div>
         <div className="shrink-0 px-6 pb-1">
-          <TelegramLinkCard me={me} compact onLinked={reloadMe} />
+          <TelegramLinkCard me={me} compact tight onLinked={reloadMe} />
         </div>
-        <ul className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-4">
+        {/*
+          Тарифы — одной горизонтальной полосой, без вертикальной прокрутки.
+
+          Почему: список из трёх карточек в столбик занимал около 280px, и вместе
+          с шапкой, чекбоксом 18+, карточкой Telegram и подвалом шит уходил за
+          нижний край экрана (на 360×640 это ~650px против ~590 доступных). Человек
+          видел верх списка и должен был прокручивать, чтобы добраться до кнопки
+          «Оплатить» — то есть главное действие пряталось под сгибом.
+
+          Ширина колонок считается в JS (grid-template-columns по числу тарифов),
+          а не фиксированной тройкой классов: если в plans появится четвёртый
+          тариф, полоса не перенесётся на вторую строку, а просто станет уже.
+          Вертикальной прокрутки у списка нет намеренно — требование «всё в один
+          экран», и любая внутренняя прокрутка его нарушает.
+        */}
+        <ul
+          className="grid shrink-0 gap-2 px-6 pb-1"
+          style={{ gridTemplateColumns: `repeat(${ordered.length}, minmax(0, 1fr))` }}
+        >
           {ordered.map((p) => (
             <li
               key={p.code}
-              className="flex items-center justify-between gap-2 rounded-2xl border border-white/10 bg-card p-4"
+              className="flex min-w-0 flex-col items-center gap-1 rounded-2xl border border-white/10 bg-card px-2 py-3 text-center"
             >
-              <div>
-                <p className="text-base text-paper">{NAMES[p.code] || p.code}</p>
-                <p className="text-sm text-mist">{p.stars_amount} Stars</p>
-              </div>
-              <div className="text-right">
-                <p className="text-lg font-semibold text-gold">
-                  {p.code === "month_299" && abPrice ? abPrice : p.price_rub}₽
-                </p>
-                <button
-                  onClick={() => pay(p.code)}
-                  disabled={!adult || paying !== null}
-                  title={adult ? undefined : "Сначала подтверди 18+"}
-                  className="mt-1 rounded-xl bg-gradient-to-br from-gold to-goldsoft px-4 py-1.5 text-sm font-semibold text-deep active:scale-95 disabled:opacity-40"
-                >
-                  {paying === p.code ? "Создаём счёт…" : "Оплатить"}
-                </button>
-              </div>
+              <p
+                className="min-h-[2.4em] text-[11px] font-medium leading-tight text-mist"
+                title={NAMES[p.code] || p.code}
+              >
+                {SHORT[p.code] || NAMES[p.code] || p.code}
+              </p>
+              <p className="text-xs text-mist">{p.stars_amount} Stars</p>
+              <p className="text-base font-semibold leading-none text-gold">
+                {p.code === "month_299" && abPrice ? abPrice : p.price_rub}₽
+              </p>
+              <button
+                onClick={() => pay(p.code)}
+                disabled={!adult || paying !== null}
+                title={adult ? undefined : "Сначала подтверди 18+"}
+                className="mt-0.5 w-full rounded-xl bg-gradient-to-br from-gold to-goldsoft px-1 py-2 text-xs font-semibold text-deep active:scale-95 disabled:opacity-40"
+              >
+                {paying === p.code ? "Создаём…" : "Оплатить"}
+              </button>
             </li>
           ))}
         </ul>
-        <div className="shrink-0 px-6 pb-6">
-          <p className="text-xs text-mist">Оплата через Telegram Stars.</p>
-          <button onClick={onClose} className="mt-2 w-full py-2 text-sm text-mist">
+        <div className="shrink-0 px-6 pb-4 pt-2">
+          <p className="text-center text-[11px] text-mist">Оплата через Telegram Stars.</p>
+          <button onClick={onClose} className="mt-1 w-full py-1.5 text-xs text-mist">
             Продолжить бесплатно завтра
           </button>
         </div>

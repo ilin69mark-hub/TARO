@@ -19,9 +19,19 @@ export type LinkCardProps = {
   onLinked?: () => void;
   /** Компактный вид для paywall. */
   compact?: boolean;
+  /**
+   * Сжатый вид: одна строка-ссылка вместо карточки с заголовком и абзацем.
+   *
+   * Зачем: в paywall карточка занимала около 160px из ~590 доступных, и
+   * «Оплатить» уезжала под нижний край. В шите важен не тон, а действие —
+   * увести в Telegram, — поэтому текст сворачивается, а кнопка и подсказка
+   * «уже покупали» остаются: без них человек, заплативший в другом браузере,
+   * не поймёт, что делать.
+   */
+  tight?: boolean;
 };
 
-export default function TelegramLinkCard({ me, onLinked, compact = false }: LinkCardProps) {
+export default function TelegramLinkCard({ me, onLinked, compact = false, tight = false }: LinkCardProps) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [done, setDone] = useState(false);
@@ -36,6 +46,40 @@ export default function TelegramLinkCard({ me, onLinked, compact = false }: Link
   // только на нём». Один и тот же компонент с двумя формулировками: разводить
   // их в два компонента незачем, различается только тон.
   const paid = me.has_payment;
+
+  // Сжатый вид для paywall: одна полоса с кнопкой и подсказкой. Абзац про
+  // «доступ держится на этом устройстве» здесь не нужен — человек и так
+  // упёрся в paywall, то есть уже знает, что бесплатные карты кончились.
+  if (tight) {
+    return (
+      <section
+        className="shrink-0 rounded-2xl border border-gold/40 bg-card px-3 py-2"
+        data-testid="tg-link-card"
+        aria-labelledby="tg-link-title"
+      >
+        <h2 id="tg-link-title" className="sr-only">
+          {paid ? "Ваши покупки привязаны к устройству" : "Привяжите Telegram"}
+        </h2>
+        {appUrl ? (
+          <a
+            href={appUrl}
+            className="block truncate text-center text-xs font-semibold text-goldsoft active:opacity-70"
+          >
+            Открыть в Telegram
+          </a>
+        ) : (
+          <p className="text-center text-[11px] text-mist">
+            Привязка работает внутри Telegram
+          </p>
+        )}
+        {!paid && !insideTelegram() && (
+          <p className="mt-1 text-center text-[11px] text-mist" data-testid="tg-already-paid">
+            Уже покупали? Покупка осталась в Telegram — откройте там.
+          </p>
+        )}
+      </section>
+    );
+  }
 
   async function link() {
     setBusy(true);
