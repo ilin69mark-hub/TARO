@@ -465,10 +465,6 @@ func (g *Gateway) releaseClaim(pg *pgxpool.Pool, id, token string, delay time.Du
 		   AND status IN ('pending', 'pending_fallback') AND quota_state='allowed'`, id, token, seconds)
 }
 
-func (g *Gateway) complete(ctx context.Context, spread string, positions []Position, cards []CardValue, question string) string {
-	return g.completeReading(ctx, "", spread, positions, cards, question)
-}
-
 func (g *Gateway) completeReading(ctx context.Context, readingID, spread string, positions []Position, cards []CardValue, question string) (result string) {
 	ch := make(chan string, MaxOutputBytes/512+16)
 	defer func() {

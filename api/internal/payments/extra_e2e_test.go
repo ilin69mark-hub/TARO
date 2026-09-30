@@ -25,6 +25,7 @@ func extraSetup(t *testing.T) (*pgxpool.Pool, func(tok, method, path, body strin
 	au := auth.New(pg, rd)
 	r := chi.NewRouter()
 	r.With(au.RequireAuth).Post("/v1/payments/stars/verify", svc.HandleVerify)
+	r.With(au.RequireAuth).Post("/v1/payments/stars/invoice", svc.HandleInvoice)
 	r.Post("/v1/admin/refund", svc.HandleRefund)
 	r.Post("/v1/admin/refund", svc.HandleRefund)
 	r.Get("/v1/admin/payments", svc.HandleAdminList)
@@ -127,20 +128,53 @@ func TestE2ERefundPaths(t *testing.T) {
 	}
 }
 
-func TestE2EYooKassaFlag(t *testing.T) {
-	pg, do, _, _ := extraSetup(t)
+// ЮKassa: контракт зафиксирован — 501 ВСЕГДА, независимо от флага.
+//
+// Тест переписан 2026-09-30. Прежний комментарий утверждал, что «501 только
+// когда флаг выключен», но кода, который читал бы флаг, не существовало:
+// YooKassaProvider.enabled() имел 0 вызовов, а переключатель в админке писал в
+// базу и не менял ничего. Такой тест выглядел как проверка, а проверял
+// пустоту.
+//
+// Теперь контракт честный и проверяемый: провайдера нет до E07 (KYC), и флаг
+// не может его включить, потому что значения флага в коде нет. Когда появится
+// реализация — тест придётся переписать, и это правильный сигнал.
+func TestE2EYooKassaIsAlways501(t *testing.T) {
+	pg, do, tok, _ := extraSetup(t)
 	ctx := context.Background()
-	// enabled=true → провайдер узнан, но без KYC все равно 501? Нет: enabled флаг
-	// означает пройденный KYC — без реализации возвращаем 501 только когда выкл.
-	// Здесь проверяем выкл-путь (дефолт): invoice уже покрыт; флаг напрямую:
-	yk := YooKassaProvider{pg: pg}
-	if _, err := yk.CreateInvoice(ctx, nil, "p", "month_299", 0, 299); err == nil {
-		t.Fatal("want disabled error")
+
+	body := `{"plan_code":"month_299","provider":"yookassa","idempotency_key":"yk-1"}`
+
+	// Путь 1: строки в app_config нет вообще (обычное состояние).
+	if rec := do(tok, "POST", "/v1/payments/stars/invoice", body); rec.Code != http.StatusNotImplemented {
+		t.Fatalf("без флага: want 501 got %d: %s", rec.Code, rec.Body.String())
 	}
+
+	// Путь 2: флаг явно включён. Ответ обязан быть тем же — иначе галочка в
+	// админке снова окажется ложью, только уже с другой стороны.
+	restoreYookassa := testutil.SaveConfigValue(t, ctx, pg, "payments.yookassa")
 	if _, err := pg.Exec(ctx, `INSERT INTO app_config (key, value)
-		VALUES ('payments.yookassa','{"enabled":true}') ON CONFLICT (key) DO NOTHING`); err != nil {
+		VALUES ('payments.yookassa','{"enabled":true}') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`); err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='payments.yookassa'`)
-	_ = do
+	t.Cleanup(restoreYookassa)
+	if rec := do(tok, "POST", "/v1/payments/stars/invoice", body); rec.Code != http.StatusNotImplemented {
+		t.Fatalf("флаг включён — ответ обязан остаться 501, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// И код провайдера обязан честно отказать, а не выдумать ссылку.
+	yk := YooKassaProvider{pg: pg}
+	if _, err := yk.CreateInvoice(ctx, nil, "p", "month_299", 0, 299); err == nil {
+		t.Fatal("CreateInvoice обязан возвращать ошибку до появления реализации")
+	}
+
+	// tg_stars доходит до слоя провайдера и падает там, а не на нашем раннем
+	// возврате: без настоящего бота в деве Telegram отвечает ошибкой, и
+	// HandleInvoice честно отдаёт 500. Именно 500, а не 501 — доказательство,
+	// что 501 про ЮKassa приходит из нашего кода, а не маскирует общую поломку
+	// пути инвойса. (Та же конвенция, что в payments_e2e_test.go:68.)
+	if rec := do(tok, "POST", "/v1/payments/stars/invoice",
+		`{"plan_code":"month_299","provider":"tg_stars","idempotency_key":"yk-ok-1"}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("tg_stars обязан дойти до провайдера (500), а не вернуть 501: got %d: %s", rec.Code, rec.Body.String())
+	}
 }

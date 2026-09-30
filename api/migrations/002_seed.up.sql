@@ -31,7 +31,9 @@ INSERT INTO app_config (key, value) VALUES
   ('free.daily_limit', '1'),
   ('love.free_weekly', '1'),
   ('history.free_limit', '20'),
-  ('trial', '{"enabled":true,"days":3,"require_tg":true}'),
+  -- require_tg удалён 2026-09-30: ключ не читался кодом (parseTrialConfig берёт
+  -- только enabled и days), то есть был галочкой без действия.
+  ('trial', '{"enabled":true,"days":3}'),
   ('referral', '{"bonus_days":3,"monthly_cap":30}'),
   ('copy.paywall_title', '"На сегодня бесплатные карты закончились"'),
   ('copy.paywall_desc', '"Продолжим завтра — или заглянем глубже без лимита и со всеми раскладами."'),

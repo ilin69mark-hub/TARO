@@ -317,7 +317,12 @@ func (s *Service) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		prov = "tg_stars"
 	}
 	if prov == "yookassa" {
-		apierr.Write(w, http.StatusNotImplemented, "YOOKASSA_DISABLED", "Оплата картой скоро: проходим KYC")
+		// Ответ не зависит от app_config["payments.yookassa"].enabled: ключа в
+		// базе нет, а провайдера за флагом нет — он появится вместе с E07
+		// (ИП/самозанятость + KYC). Одноразовая галочка в админке, которая
+		// ничего не включала, убрана — см. deploy/admin-ui/app.js.
+		apierr.Write(w, http.StatusNotImplemented, "YOOKASSA_DISABLED",
+			"Оплата картой скоро: нужна регистрация ИП/самозанятости и KYC")
 		return
 	}
 	if prov != "tg_stars" {

@@ -15,9 +15,11 @@ package testutil
 // exist" на первой же чистке. Новые таблицы тоже подхватываются сами.
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -72,5 +74,37 @@ func PurgeUsers(t *testing.T, ctx context.Context, pg *pgxpool.Pool, ids ...stri
 				t.Fatalf("чистка users: %v", err)
 			}
 		}
+	}
+}
+
+// SaveConfigValue — прочитать значение app_config и вернуть функцию
+// восстановления.
+//
+// Зачем, а не просто DELETE: тесты, которые меняли настройки, восстанавливали
+// состояние через `DELETE FROM app_config WHERE key='...'`. Это было верно, пока
+// строки не существовало (delete = «как было»). Но после миграции 041 ключи
+// ab.price_month, offers.winback, spreads.seasonal посеяны — и тот же DELETE
+// стирал уже не тестовую, а боевую настройку dev-стенда.
+//
+// Хуже всего то, что после стирания всё выглядит правильно: A/B выключен,
+// winback выключен, сезонные окна пусты. Заметить можно только сравнением с
+// миграцией.
+func SaveConfigValue(t *testing.T, ctx context.Context, pg *pgxpool.Pool, key string) func() {
+	t.Helper()
+	var before []byte
+	err := pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key=$1`, key).Scan(&before)
+	existed := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("чтение app_config[%s]: %v", key, err)
+	}
+	return func() {
+		bg := context.Background()
+		if !existed {
+			_, _ = pg.Exec(bg, `DELETE FROM app_config WHERE key=$1`, key)
+			return
+		}
+		_, _ = pg.Exec(bg,
+			`INSERT INTO app_config (key, value) VALUES ($1,$2)
+			 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, key, before)
 	}
 }

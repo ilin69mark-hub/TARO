@@ -371,10 +371,6 @@ func (g *Gateway) breakerFail(ctx context.Context, model string) {
 	}
 }
 
-func (g *Gateway) log(ctx context.Context, readingID, model, hash string, in, out int, latency time.Duration, status, errText string) {
-	g.logUsage(ctx, readingID, model, hash, in, out, latency, status, errText, streamStats{})
-}
-
 func (g *Gateway) logUsage(ctx context.Context, readingID, model, hash string, in, out int, latency time.Duration, status, errText string, stats streamStats) {
 	if g.pg == nil {
 		return

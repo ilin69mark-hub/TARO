@@ -128,3 +128,40 @@ func TestAccessRequiresAdmin(t *testing.T) {
 		t.Fatalf("want 403 without admin session, got %d", rec.Code)
 	}
 }
+
+// Ключи, которые читает код, но которые нельзя было поменять из админки.
+//
+// Каждый пункт — реальная операционная ловушка: настройка существует, код её
+// читает, но добраться до неё можно было только правкой .env на сервере с
+// перезапуском. Для выключателя переноса покупки это особенно неудачно: план
+// «включить на стенде, потом на боевом» требовал вместо клика правку кода.
+func TestConfigValidateCoversOperationalKeys(t *testing.T) {
+	ok := map[string]string{
+		`{"handoff_enabled":true}`: "auth",
+		`{}`:                       "auth",
+		`{"crisis_resource_text":"Позвоните в экстренные службы"}`: "safety.crisis",
+		`{"crisis_patterns":["суицид","самоповреждение"]}`:         "safety.crisis",
+		`{"crisis_patterns":[]}`: "safety.crisis",
+	}
+	for v, key := range ok {
+		if !validateConfigValue(key, json.RawMessage(v)) {
+			t.Errorf("валидный %s=%s отвергнут", key, v)
+		}
+	}
+
+	// Мусор и выход за границы должны отсекаться, иначе в app_config попадёт
+	// значение, которое код потом не сможет разобрать.
+	bad := []struct{ key, v, why string }{
+		{"auth", `{"handoff_enabled":"yes"}`, "не bool"},
+		{"auth", `{"whatever":1}`, "неизвестное поле"},
+		{"auth", `{"handoff_enabled":true,"x":1}`, "неизвестное поле рядом"},
+		{"safety.crisis", `{"crisis_resource_text":""}`, "пустой текст"},
+		{"safety.crisis", `{"crisis_patterns":"нет"}`, "строка вместо массива"},
+		{"safety.crisis", `{"crisis_patterns":[1,2]}`, "не строки"},
+	}
+	for _, tc := range bad {
+		if validateConfigValue(tc.key, json.RawMessage(tc.v)) {
+			t.Errorf("мусорный %s=%s принят (%s)", tc.key, tc.v, tc.why)
+		}
+	}
+}

@@ -12,9 +12,16 @@ async function load(id: string): Promise<Card | null> {
   if (!CARD_ID_RE.test(id)) return null;
   const base = process.env.API_INTERNAL_URL || "http://localhost:8080";
   try {
-    // публичного GET /v1/cards/:id нет (карты — только SELECT в чтениях);
-    // U16 тянет напрямую из PG? Нет — web не ходит в PG (см. 04-architecture/02).
-    // Поэтому страница строится через внутренний прокси-роут /api/cards/[id] (см. ниже).
+    // Комментарий, который здесь стоял, утверждал, что публичного
+    // GET /v1/cards/:id не существует и страница ходит «через внутренний
+    // прокси-роут /api/cards/[id]». Это было неверно: роут есть
+    // (api/cmd/api/main.go, GET /v1/cards/{id}), страница дёргает его напрямую
+    // строкой ниже, а самого /api/cards/[id] в web/app/api нет вообще.
+    // Читатель комментария потратил бы час на поиск несуществующего прокси.
+    //
+    // Заметим: base — это API_INTERNAL_URL, то есть адрес api-public, а не
+    // same-origin /api. Запрос уходит с сервера Next (это server-компонент),
+    // поэтому cookie пользователя тут не нужны и не передаются.
     const res = await fetch(`${base}/v1/cards/${encodeURIComponent(id)}`, { next: { revalidate: 86400 } });
     if (!res.ok) return null;
     return (await res.json()) as Card;

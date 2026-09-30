@@ -377,8 +377,19 @@ const jsonSettings = [
   ["ab.price_month", "A/B цена", "JSON-настройки A/B"],
   ["offers.winback", "Winback", "JSON-настройки предложения"],
   ["spreads.seasonal", "Сезонные окна", "Массив окон с code/from/to"],
-  ["payments.yookassa", "ЮKassa", "JSON-настройки провайдера"],
+  ["auth", "Перенос покупки", '{"handoff_enabled": false}'],
+  ["safety.crisis", "Кризисный текст", '{"crisis_resource_text": "..."}'],
 ];
+
+// ЮKassa убрана из редактируемых НАМЕРЕННО (2026-09-30). Настройка была в
+// панели, но код её не читал: HandleInvoice отвечал 501YOOKASSA_DISABLED
+// безусловно, независимо от значения. То есть администратор щёлкал «Сохранить»,
+// получал «ok» — и ничего не менялось. Показывать переключатель, который не
+// переключает, хуже, чем не показывать его вовсе.
+//
+// Вернётся вместе с E07 (ИП/самозанятость + KYC) одним куском: чтение флага в
+// HandleInvoice, HTTP-клиент в YooKassaProvider.CreateInvoice и эта строка
+// обратно в jsonSettings. До тех пор ответ 501 остаётся и объясняет причину.
 
 function renderConfig(content) {
   const list = el("div", { className: "settings-list" });

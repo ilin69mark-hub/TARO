@@ -127,6 +127,11 @@ func genCode() string {
 
 // cfg — разобранный app_config 'referral'.
 type cfg struct {
+	// enabled — аварийный тормоз. Ключ сидился и валидировался, но НИ ОДНОГО
+	// чтения не имел: выключить реферальную программу из панели было нельзя.
+	// Это единственная настройка, которую нельзя было остановить при обнаружении
+	// злоупотребления, поэтому она читается по-настоящему, а не удаляется.
+	enabled        bool
 	bonusDays      int
 	monthlyCapDays int
 	lifetimeCap    int
@@ -155,6 +160,7 @@ func (c cfg) lifetimeCapOrUnlimited() int {
 // тоже дефолт (фича не должна падать из-за мусора в конфиге).
 func (s *Service) loadCfg(ctx context.Context) cfg {
 	out := cfg{
+		enabled:        true, // отсутствие ключа = программа работает
 		bonusDays:      defaultBonusDays,
 		monthlyCapDays: defaultMonthlyCapDays,
 		antifarmFP:     true,
@@ -177,6 +183,7 @@ func (s *Service) loadCfg(ctx context.Context) cfg {
 		return out
 	}
 	var doc struct {
+		Enabled            *bool `json:"enabled"`
 		BonusDays          *int  `json:"bonus_days"`
 		MonthlyCap         *int  `json:"monthly_cap"`
 		LifetimeCapDays    *int  `json:"lifetime_cap_days"`
@@ -187,6 +194,9 @@ func (s *Service) loadCfg(ctx context.Context) cfg {
 	}
 	if json.Unmarshal(raw, &doc) != nil {
 		return out
+	}
+	if doc.Enabled != nil {
+		out.enabled = *doc.Enabled
 	}
 	if doc.BonusDays != nil && *doc.BonusDays > 0 && *doc.BonusDays <= 365 {
 		out.bonusDays = *doc.BonusDays
@@ -337,6 +347,14 @@ func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	c := s.loadCfg(ctx)
+	// Аварийный тормоз: новые приглашения не создаются. Уже созданные pending
+	// при этом доходят до конца (см. complete) — иначе выключатель отбирал бы
+	// бонус у тех, кто честно применил код за минуту до остановки.
+	if !c.enabled {
+		apierr.Write(w, http.StatusServiceUnavailable, "REFERRAL_DISABLED",
+			"Реферальная программа временно приостановлена")
+		return
+	}
 
 	// status='active': код забаненного/удалённого юзера приниматься не должен
 	// (раньше фильтра не было — бан не мешал аккаунту качать бонусы).

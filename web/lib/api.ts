@@ -3,7 +3,8 @@
 // Прокси его НЕ инжектит — форвардит клиентский (см. S07).
 import { track, events } from "./analytics";
 
-export function csrf(): string {  try {
+export function csrf(): string {
+  try {
     const m = document.cookie.match(/(?:^|;\s*)taro_csrf=([^;]*)/);
     return m ? decodeURIComponent(m[1]) : "";
   } catch {
@@ -64,7 +65,9 @@ function bumpPaywalls(): void {
   } catch {
     /* ignore */
   }
-}export async function postReadingSSE(
+}
+
+export async function postReadingSSE(
   body: { spread_code: string; question?: string; idempotency_key: string },
   onToken: (t: string) => void,
   onReadingId?: (id: string) => void

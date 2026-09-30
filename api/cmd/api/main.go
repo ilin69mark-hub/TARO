@@ -161,28 +161,8 @@ func main() {
 	r.Use(ratelimit.New(rd).Middleware)
 	// CSRF per-session (метод — нужен Redis, см. S07). Webhook исключен внутри.
 	r.Use(au.RequireCSRF)
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","api":"public"}`))
-	})
-	r.Get("/readyz", func(w http.ResponseWriter, req *http.Request) {
-		if err := validateOriginEnv("PUBLIC_ORIGIN"); err != nil {
-			http.Error(w, "invalid PUBLIC_ORIGIN", http.StatusServiceUnavailable)
-			return
-		}
-		probeCtx, probeCancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer probeCancel()
-		if err := pg.Ping(probeCtx); err != nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if err := rd.Ping(probeCtx).Err(); err != nil {
-			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ready","api":"public"}`))
-	})
+	r.Get("/healthz", handleHealthz("public"))
+	r.Get("/readyz", handleReadyz("PUBLIC_ORIGIN", pg, rd))
 	r.Post("/v1/auth/telegram", au.HandleTelegram)
 	r.Post("/v1/auth/anon", au.HandleAnon)
 	r.With(au.RequireAuth).Post("/v1/auth/link", au.HandleLink)

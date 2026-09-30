@@ -11,8 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"taro/api/internal/auth"
 	"taro/api/internal/entitlements"
+
 	"taro/api/internal/testutil"
 )
 
@@ -167,4 +169,78 @@ func TestE2ECompleteHook(t *testing.T) {
 	}
 	// повторный хук — идемпотентен (pending больше нет)
 	svc.CompleteOnFirstReading(ctx, referee)
+}
+
+// Аварийный тормоз реферальной программы.
+//
+// Ключ `referral.enabled` сидился и проходил валидацию, но не читался НИ ОДНОГО
+// раза: выключить программу из панели было нельзя, оставался только SQL. При
+// обнаружении фермы это худший возможный ответ. Теперь флаг работает, и
+// проверяется на живом HTTP-пути, а не только на парсере конфига.
+func TestReferralEnabledIsAWorkingBrake(t *testing.T) {
+	ctx, pg, _ := testutil.Live(t)
+	r, login := testRouter(t)
+
+	referrer := testutil.NewUser(t, ctx, pg)
+	rec := callWith(r, login(referrer), "GET", "/v1/referral/me", "")
+	var me map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &me); err != nil || me["code"] == nil {
+		t.Fatalf("me: %d %s", rec.Code, rec.Body.String())
+	}
+	code := me["code"].(string)
+
+	// Дефолт: отсутствие ключа = программа работает.
+	if raw := referralCfg(t, ctx, pg); !cfgEnabled(raw) {
+		t.Fatal("по умолчанию программа должна быть включена")
+	}
+
+	restore := testutil.SaveConfigValue(t, ctx, pg, "referral")
+	// Мерджим, а не заменяем: в объекте referral живут ещё bonus_days и капы.
+	if _, err := pg.Exec(ctx,
+		`UPDATE app_config SET value = value || '{"enabled": false}'::jsonb WHERE key='referral'`); err != nil {
+		t.Fatal(err)
+	}
+
+	referee := testutil.NewUser(t, ctx, pg)
+	rec = callWith(r, login(referee), "POST", "/v1/referral/apply", `{"code":"`+code+`"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("при выключенной программе ждём 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// Главное: строка реферала НЕ должна была появиться. Иначе «программа
+	// выключена» значило бы только «новым нельзя применить», а бонус всё равно
+	// капал бы по дороге.
+	var n int
+	if err := pg.QueryRow(ctx, `SELECT count(*) FROM referrals WHERE referee_id=$1`, referee).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("при выключенной программе создано рефералов: %d", n)
+	}
+
+	// Возврат флага ничего не ломает.
+	restore()
+	referee2 := testutil.NewUser(t, ctx, pg)
+	rec = callWith(r, login(referee2), "POST", "/v1/referral/apply", `{"code":"`+code+`"}`)
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Fatal("после включения программа обязана принимать код снова")
+	}
+}
+
+func referralCfg(t *testing.T, ctx context.Context, pg *pgxpool.Pool) []byte {
+	t.Helper()
+	var raw []byte
+	if err := pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='referral'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func cfgEnabled(raw []byte) bool {
+	var doc struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || doc.Enabled == nil {
+		return true // отсутствие ключа = включено
+	}
+	return *doc.Enabled
 }

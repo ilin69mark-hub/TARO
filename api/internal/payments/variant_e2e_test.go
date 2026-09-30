@@ -62,13 +62,17 @@ func TestE2EVariantWinback(t *testing.T) {
 		t.Fatalf("ab off: %s", rec.Body.String())
 	}
 
+	// Снимок ДО изменения: SaveConfigValue возвращает замыкание, поэтому если
+	// вызвать её после INSERT, она запомнит уже испорченное значение и восстановит
+	// именно его. Порядок «снимок → правка → defer restore» обязателен.
+	restoreAB := testutil.SaveConfigValue(t, ctx, pg, "ab.price_month")
 	// split=100 → test/349
 	if _, err := pg.Exec(ctx, `INSERT INTO app_config (key, value)
 		VALUES ('ab.price_month','{"enabled":true,"control":299,"test":349,"split":100}')
 		ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`); err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='ab.price_month'`)
+	defer restoreAB()
 	rec := do("GET", "/v1/ab/me", "")
 	var v2 map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &v2)
@@ -83,12 +87,13 @@ func TestE2EVariantWinback(t *testing.T) {
 		  FROM plans WHERE code='month_299' LIMIT 1`, uid); err != nil {
 		t.Fatal(err)
 	}
+	restoreWinback := testutil.SaveConfigValue(t, ctx, pg, "offers.winback")
 	if _, err := pg.Exec(ctx, `INSERT INTO app_config (key, value)
 		VALUES ('offers.winback','{"enabled":true,"pct":20}')
 		ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`); err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='offers.winback'`)
+	defer restoreWinback()
 	// invoice без bot-ключа → 500, но строка с winback-ценой создана
 	if rec := do("POST", "/v1/payments/stars/invoice", `{"plan_code":"month_299","idempotency_key":"winback-e2e-1"}`); rec.Code != 500 {
 		t.Fatalf("invoice dev: want 500 got %d", rec.Code)

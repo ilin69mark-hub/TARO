@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -604,7 +605,7 @@ func TestValidateConfigValue(t *testing.T) {
 		"ai":                 `{"model":"openai/gpt-4o-mini","max_tokens":900,"temperature":0.7}`,
 		"ab.price_month":     `{"enabled":true,"control":299,"test":349,"split":50}`,
 		"offers.winback":     `{"enabled":true,"pct":20}`,
-		"trial":              `{"enabled":true,"days":3,"require_tg":true}`,
+		"trial":              `{"enabled":true,"days":3}`,
 		"referral":           `{"bonus_days":3,"monthly_cap":30}`,
 		"spreads.seasonal":   `[{"code":"fullmoon","from":"2026-01-01","to":"2026-12-31"}]`,
 		"payments.yookassa":  `{"enabled":true}`,
@@ -632,12 +633,13 @@ func TestValidateConfigValue(t *testing.T) {
 func TestE2ERotateSeasonal(t *testing.T) {
 	r, tok, pg, _ := adminSetup(t)
 	ctx := context.Background()
+	restoreSeasonal := testutil.SaveConfigValue(t, ctx, pg, "spreads.seasonal")
 	if _, err := pg.Exec(ctx, `INSERT INTO app_config (key, value)
 		VALUES ('spreads.seasonal','[{"code":"fullmoon","from":"2000-01-01","to":"2100-12-31"}]')
 		ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`); err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='spreads.seasonal'`)
+	defer restoreSeasonal()
 	defer pg.Exec(context.Background(), `UPDATE spreads SET is_active=false WHERE code='fullmoon'`)
 	rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/rotate-seasonal", `{}`, map[string]string{"Origin": defaultAdminOrigin})
 	var out map[string]any
@@ -650,4 +652,52 @@ func TestE2ERotateSeasonal(t *testing.T) {
 	if !active {
 		t.Fatal("fullmoon not activated")
 	}
+}
+
+// Перенос покупки должен включаться из админки, а не правкой SQL.
+//
+// Проверяем не только «publish принял ключ», но и что после этого
+// POST /v1/auth/handoff перестал отвечать 404. Иначе получится админка, которая
+// радостно пишет в базу, а фича остаётся выключенной — ровно тот класс
+// поломок, что и был причиной задачи.
+func TestE2EAuthHandoffFlagIsOperable(t *testing.T) {
+	r, tok, pg, _ := adminSetup(t)
+	origin := map[string]string{"Origin": defaultAdminOrigin}
+	ctx := context.Background()
+
+	before := handoffFlag(t, pg)
+
+	rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/config/publish",
+		`{"app_config":{"auth":{"handoff_enabled":true}}}`, origin)
+	if rec.Code != 200 {
+		t.Fatalf("publish auth flag: want 200 got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !handoffFlag(t, pg) {
+		t.Fatal("флаг записан в app_config, но остался выключенным")
+	}
+
+	// Грязный ключ по-прежнему не проходит.
+	if rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/config/publish",
+		`{"app_config":{"auth":{"handoff_enabled":true,"junk":1}}}`, origin); rec.Code != 422 {
+		t.Fatalf("мусор в auth: want 422 got %d", rec.Code)
+	}
+
+	_, _ = pg.Exec(ctx, `UPDATE app_config SET value=$1 WHERE key='auth'`, []byte(`{"handoff_enabled":`+strconv.FormatBool(before)+`}`))
+	_, _ = pg.Exec(ctx, `DELETE FROM admin_audit WHERE action='config:publish' AND diff::text LIKE '%handoff_enabled%'`)
+}
+
+func handoffFlag(t *testing.T, pg *pgxpool.Pool) bool {
+	t.Helper()
+	var raw []byte
+	if err := pg.QueryRow(context.Background(),
+		`SELECT value FROM app_config WHERE key='auth'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Enabled bool `json:"handoff_enabled"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		t.Fatalf("auth config не разбирается: %s", raw)
+	}
+	return cfg.Enabled
 }

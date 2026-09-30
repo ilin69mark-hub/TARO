@@ -251,6 +251,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # D9: список сетей Cloudflare для set_real_ip_from (генерируется
+      # deploy/update-cf-ips.sh). include в nginx.conf ссылается на этот путь.
+      - ./deploy/cloudflare-ips.conf:/etc/nginx/cloudflare-ips.conf:ro
     depends_on:
       web:
         condition: service_healthy

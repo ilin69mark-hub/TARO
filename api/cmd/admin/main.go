@@ -96,26 +96,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","api":"admin"}`))
 	})
-	r.Get("/readyz", func(w http.ResponseWriter, req *http.Request) {
-		if err := validateOriginEnv("ADMIN_ORIGIN"); err != nil {
-			http.Error(w, "invalid ADMIN_ORIGIN", http.StatusServiceUnavailable)
-			return
-		}
-		probeCtx, probeCancel := context.WithTimeout(req.Context(), 2*time.Second)
-		stopProbeOnWorkerStop := context.AfterFunc(workerCtx, probeCancel)
-		defer stopProbeOnWorkerStop()
-		defer probeCancel()
-		if err := pg.Ping(probeCtx); err != nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if err := rd.Ping(probeCtx).Err(); err != nil {
-			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ready","api":"admin"}`))
-	})
+	r.Get("/readyz", handleReadyz("ADMIN_ORIGIN", pg, rd, workerCtx))
 	r.Post("/v1/admin/login", ad.HandleLogin)                         // password login (см. D1)
 	r.With(ad.RequireAdmin).Post("/v1/admin/logout", ad.HandleLogout) // отзыв сессии (см. аудит B)
 	r.With(ad.RequireAdmin).Get("/v1/admin/config", ad.HandleGetConfig)

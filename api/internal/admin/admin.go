@@ -545,7 +545,7 @@ var allowedConfigKeys = map[string]bool{
 	"free.daily_limit": true, "love.free_weekly": true, "history.free_limit": true,
 	"trial": true, "referral": true, "copy.paywall_title": true, "copy.paywall_desc": true,
 	"copy.paywall_cta": true, "ai": true, "ab.price_month": true, "offers.winback": true,
-	"spreads.seasonal": true, "payments.yookassa": true,
+	"spreads.seasonal": true, "payments.yookassa": true, "auth": true, "safety.crisis": true,
 }
 
 func configObject(v json.RawMessage, allowed ...string) (map[string]json.RawMessage, bool) {
@@ -643,7 +643,11 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 		}
 		return true
 	case "ab.price_month":
-		m, ok := configObject(v, "enabled", "control", "test", "split", "pct")
+		// Только `split`: VariantFor (payments.go) читает именно его. Ключ `pct`
+		// тоже был разрешён валидатором, но не читался НИ ОДНОГО раза — то есть
+		// администратор мог записать `{"pct": 50}` и получить тихо работающий на
+		// старом `split` эксперимент. Второе имя для одной величины удалено.
+		m, ok := configObject(v, "enabled", "control", "test", "split")
 		if !ok {
 			return false
 		}
@@ -657,9 +661,6 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 			return false
 		}
 		if value, exists := m["split"]; exists && !configFloat(value, 0, 100) {
-			return false
-		}
-		if value, exists := m["pct"]; exists && !configFloat(value, 0, 90) {
 			return false
 		}
 		return true
@@ -676,7 +677,13 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 		}
 		return true
 	case "trial":
-		m, ok := configObject(v, "enabled", "days", "require_tg")
+		// require_tg удалён 2026-09-30: parseTrialConfig (auth.go) читает только
+		// enabled и days, поэтому ключ был галочкой без действия. Вместо того
+		// чтобы оставлять мёртвый переключатель, его убрали — если ограничение
+		// «триал только после входа через Telegram» понадобится, оно делается
+		// кодом с реальным смыслом, а не ключом, который читают дважды и не
+		// применяют.
+		m, ok := configObject(v, "enabled", "days")
 		if !ok {
 			return false
 		}
@@ -684,9 +691,6 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 			return false
 		}
 		if value, exists := m["days"]; exists && !configInt(value, 1, 365) {
-			return false
-		}
-		if value, exists := m["require_tg"]; exists && !configBool(value) {
 			return false
 		}
 		return true
@@ -729,7 +733,13 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 			From string `json:"from"`
 			To   string `json:"to"`
 		}
-		if json.Unmarshal(v, &windows) != nil || len(windows) == 0 || len(windows) > 100 {
+		// len(windows) == 0 РАЗРЕШЁН и означает «сезонные окна выключены».
+		// Раньше проверка требовала хотя бы одно окно, из-за чего «выключить»
+		// через панель было невозможно: пустой массив нельзя было сохранить.
+		// HandleRotateSeasonal такой массив и так трактует как no-op
+		// (admin.go: len(windows)==0 → return), то есть расхождение было только
+		// во входе, а не в поведении.
+		if json.Unmarshal(v, &windows) != nil || len(windows) > 100 {
 			return false
 		}
 		for _, window := range windows {
@@ -749,6 +759,37 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 	case "payments.yookassa":
 		m, ok := configObject(v, "enabled")
 		return ok && (len(m) == 0 || configBool(m["enabled"]))
+	case "auth":
+		// handoff_enabled — выключатель переноса покупки в Telegram (миграция 040).
+		// Ключ был не в allowlist, поэтому флаг переключался только SQL, а план
+		// «включить на стенде, потом на боевом» упирался в правку кода. Теперь он
+		// виден в админке рядом с остальными флагами.
+		m, ok := configObject(v, "handoff_enabled")
+		return ok && (len(m) == 0 || configBool(m["handoff_enabled"]))
+	case "safety.crisis":
+		// crisis_resource_text — текст, который видит человек вместо толкования,
+		// если вопрос попал под фильтр. Раньше настраивался только env на сервере.
+		m, ok := configObject(v, "crisis_patterns", "crisis_resource_text")
+		if !ok {
+			return false
+		}
+		if value, exists := m["crisis_resource_text"]; exists && !configString(value, 1000) {
+			return false
+		}
+		if value, exists := m["crisis_patterns"]; exists {
+			// configObject отдаёт json.RawMessage, а не any, поэтому массив
+			// разбираем вручную: type-assertion на []any здесь невозможен.
+			var patterns []json.RawMessage
+			if json.Unmarshal(value, &patterns) != nil || len(patterns) > 200 {
+				return false
+			}
+			for _, pat := range patterns {
+				if !configString(pat, 100) {
+					return false
+				}
+			}
+		}
+		return true
 	case "copy.paywall_title", "copy.paywall_desc", "copy.paywall_cta":
 		return configString(v, 500)
 	default:

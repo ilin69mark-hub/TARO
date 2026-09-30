@@ -74,19 +74,6 @@ type YooKassaProvider struct{ pg *pgxpool.Pool }
 
 func (YooKassaProvider) Name() string { return "yookassa" }
 
-func (p YooKassaProvider) enabled(ctx context.Context) bool {
-	var raw json.RawMessage
-	if err := p.pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='payments.yookassa'`).Scan(&raw); err != nil {
-		return false
-	}
-	var m map[string]any
-	if json.Unmarshal(raw, &m) != nil {
-		return false
-	}
-	on, _ := m["enabled"].(bool)
-	return on
-}
-
 func (YooKassaProvider) CreateInvoice(ctx context.Context, client *http.Client, paymentID, planCode string, stars, amountRub int) (string, error) {
 	return "", fmt.Errorf("yookassa disabled: нужен ИП/самозанятость + KYC (см. V15)")
 }
