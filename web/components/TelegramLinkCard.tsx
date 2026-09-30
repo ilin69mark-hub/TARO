@@ -29,9 +29,24 @@ export type LinkCardProps = {
    * не поймёт, что делать.
    */
   tight?: boolean;
+  /**
+   * Дополнительные классы корня.
+   *
+   * Зачем, а не просто отступ на месте вызова: карточка возвращает null, когда
+   * Telegram уже привязан. Обёртка с отступом на странице осталась бы в разметке
+   * и давала бы пустое место; условие «показывать» тогда пришлось бы
+   * продублировать, и через правку карточки или профиля они бы разошлись.
+   */
+  className?: string;
 };
 
-export default function TelegramLinkCard({ me, onLinked, compact = false, tight = false }: LinkCardProps) {
+export default function TelegramLinkCard({
+  me,
+  onLinked,
+  compact = false,
+  tight = false,
+  className = "",
+}: LinkCardProps) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [done, setDone] = useState(false);
@@ -53,7 +68,7 @@ export default function TelegramLinkCard({ me, onLinked, compact = false, tight 
   if (tight) {
     return (
       <section
-        className="shrink-0 rounded-2xl border border-gold/40 bg-card px-3 py-2"
+        className={`shrink-0 rounded-2xl border border-gold/40 bg-card px-3 py-2 ${className}`}
         data-testid="tg-link-card"
         aria-labelledby="tg-link-title"
       >
@@ -110,11 +125,11 @@ export default function TelegramLinkCard({ me, onLinked, compact = false, tight 
 
   return (
     <section
-      className={
+      className={`${
         compact
           ? "rounded-2xl border border-gold/40 bg-card p-3"
           : "rounded-2xl border border-gold/40 bg-card p-4"
-      }
+      } ${className}`}
       data-testid="tg-link-card"
       aria-labelledby="tg-link-title"
     >
