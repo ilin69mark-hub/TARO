@@ -3,10 +3,17 @@ set -eu
 umask 077
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-BACKUP_DIR="${BACKUP_DIR:-/opt/taro/backups}"
+BACKUP_DIR="${BACKUP_DIR:-$(dirname -- "$ROOT")/taro-backups}"
 KEEP_DAYS="${KEEP_DAYS:-30}"
 POSTGRES_USER="${POSTGRES_USER:-taro}"
 POSTGRES_DB="${POSTGRES_DB:-taro}"
+
+case "$BACKUP_DIR/" in
+  "$ROOT"/*)
+    printf 'BACKUP_DIR must be outside the repository worktree (%s), got %s\n' "$ROOT" "$BACKUP_DIR" >&2
+    exit 1
+    ;;
+esac
 
 case "$KEEP_DAYS" in
   ''|*[!0-9]*)

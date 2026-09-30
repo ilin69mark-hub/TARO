@@ -1,5 +1,6 @@
-// Package main — api-admin 127.0.0.1:8081, наружу не публикуется
-// (см. ADR-06, docs/project-book/02-functional/07).
+// Package main — api-admin слушает ADMIN_LISTEN_ADDR (по умолчанию 0.0.0.0:8081)
+// и наружу не публикуется: единственная точка входа — admin-access на loopback
+// хоста (см. ADR-06, docs/project-book/02-functional/07).
 // Доступ — только SSH-туннель: ssh -L 8081:127.0.0.1:8081 vps
 package main
 
@@ -20,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"taro/api/internal/admin"
+	"taro/api/internal/ai"
 	"taro/api/internal/apierr"
 	"taro/api/internal/me"
 	"taro/api/internal/payments"
@@ -66,6 +68,17 @@ func main() {
 	defer pg.Close()
 	rd := store.ConnectRedis()
 	defer func() { _ = rd.Close() }()
+	// A17/F-43: админке нужен и клиент роли ai_cache, иначе отчёт cache_bytes
+	// показывал бы только critical. Ошибка здесь не фатальна: админка обязана
+	// подниматься даже если кэш недоступен.
+	aiCacheRd, _, aiCacheErr := store.ConnectRedisAI()
+	if aiCacheErr != nil {
+		log.Printf("WARN: %v — роль ai_cache не будет показана в /v1/admin/cache", aiCacheErr)
+		aiCacheRd = nil
+	}
+	if aiCacheRd != nil && aiCacheRd != rd {
+		defer func() { _ = aiCacheRd.Close() }()
+	}
 
 	ad := admin.New(pg, rd)
 	mv := me.New(pg, rd)
@@ -107,18 +120,31 @@ func main() {
 	r.With(ad.RequireAdmin).Post("/v1/admin/logout", ad.HandleLogout) // отзыв сессии (см. аудит B)
 	r.With(ad.RequireAdmin).Get("/v1/admin/config", ad.HandleGetConfig)
 	r.With(ad.RequireAdmin).Post("/v1/admin/config/publish", ad.HandlePublish)
-	r.With(ad.RequireAdmin).Post("/v1/admin/refund", py.HandleRefund)                  // ручной возврат Stars (см. T29)
-	r.With(ad.RequireAdmin).Post("/v1/admin/remind-expiring", pu.HandleRemindExpiring) // пуши за 72ч (см. U25)
-	r.With(ad.RequireAdmin).Post("/v1/admin/push-evening", pu.HandleEvening)           // вечерняя рассылка (см. V23/V24)
-	r.With(ad.RequireAdmin).Post("/v1/admin/push-streak-risk", pu.HandleStreakRisk)    // риск обрыва стрика (см. V25)
-	r.With(ad.RequireAdmin).Get("/v1/admin/push-stats", pu.HandlePushStats)            // статистика 7д (см. V26)
-	r.With(ad.RequireAdmin).Get("/v1/admin/payments", py.HandleAdminList)              // список платежей (см. V19)
+	r.With(ad.RequireAdmin).Post("/v1/admin/refund", py.HandleRefund)                   // ручной возврат Stars (см. T29)
+	r.With(ad.RequireAdmin).Post("/v1/admin/remind-expiring", pu.HandleRemindExpiring)  // пуши за 72ч (см. U25)
+	r.With(ad.RequireAdmin).Post("/v1/admin/push-evening", pu.HandleEvening)            // вечерняя рассылка (см. V23/V24)
+	r.With(ad.RequireAdmin).Post("/v1/admin/push-streak-risk", pu.HandleStreakRisk)     // риск обрыва стрика (см. V25)
+	r.With(ad.RequireAdmin).Get("/v1/admin/push-stats", pu.HandlePushStats)             // статистика 7д (см. V26)
+	r.With(ad.RequireAdmin).Get("/v1/admin/payments", py.HandleAdminList)               // список платежей (см. V19)
+	r.With(ad.RequireAdmin).Get("/v1/admin/payments/audit", py.HandleAdminWebhookAudit) // A09/F-09: читатель payment_webhook_events
+	// A17/F-43: cache_bytes{role} — единственная доступная форма метрики без
+	// prometheus: роли ai_cache и critical считаются отдельно.
+	r.With(ad.RequireAdmin).Get("/v1/admin/cache", ai.HandleCacheStats(rd, aiCacheRd))
 	r.With(ad.RequireAdmin).Post("/v1/admin/rotate-seasonal", ad.HandleRotateSeasonal) // сезоны по датам (см. V22)
+	ad.RegisterAccessRoutes(r)                                                         // безлимит владельцу: grant/revoke/list (внутреннее/access)
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Не найдено")
 	})
 
-	const addr = "127.0.0.1:8081" // НЕ менять на :8081 — наружу нельзя (см. Книгу)
+	// Наружу не публикуется: единственная точка входа — admin-access на
+	// loopback хоста. Слушать нужно 0.0.0.0, потому что admin-access больше не
+	// делит с нами network namespace (A02/F-02) и ходит по DNS-имени
+	// api-admin из compose-сети admin. Для одиночного запуска на VPS:
+	// ADMIN_LISTEN_ADDR=127.0.0.1:8081.
+	addr := os.Getenv("ADMIN_LISTEN_ADDR")
+	if addr == "" {
+		addr = "0.0.0.0:8081"
+	}
 	log.Printf("api-admin listening on %s", addr)
 	server := &http.Server{Addr: addr, Handler: r}
 	serverErr := make(chan error, 1)

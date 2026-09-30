@@ -13,15 +13,29 @@ services:
     mem_limit: 384m
     pids_limit: 128
 
+  # A17/F-43: отдельная роль для bulk-кэша ответов AI. Свой пароль (REDIS_AI_PASSWORD)
+  # и свой бюджет памяти; портов наружу нет — инстанс живёт только в internal.
+  cache-ai:
+    environment:
+      REDIS_PASSWORD: ${REDIS_AI_PASSWORD:?REDIS_AI_PASSWORD is required}
+    ports: !reset []
+    mem_limit: 192m
+    pids_limit: 128
+
   api-public:
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_AI_ADDR: cache-ai:6379
+      REDIS_AI_PASSWORD: ${REDIS_AI_PASSWORD:?REDIS_AI_PASSWORD is required}
       REDIS_ENC_KEY: ${REDIS_ENC_KEY:?REDIS_ENC_KEY is required}
       AI_REQUIRE_CACHE_ENCRYPTION: "1"
       AI_WORKER_MAX_ATTEMPTS: ${AI_WORKER_MAX_ATTEMPTS:-5}
       AI_WORKER_BACKOFF_SECONDS: ${AI_WORKER_BACKOFF_SECONDS:-30}
       AI_WORKER_MAX_BACKOFF_SECONDS: ${AI_WORKER_MAX_BACKOFF_SECONDS:-900}
+      AI_WORKER_TICK_SECONDS: ${AI_WORKER_TICK_SECONDS:-2}
+      AI_WORKER_BATCH_SIZE: ${AI_WORKER_BATCH_SIZE:-10}
+      AI_CACHE_MAX_ENTRIES: ${AI_CACHE_MAX_ENTRIES:-5000}
       CRISIS_PATTERNS_JSON: ${CRISIS_PATTERNS_JSON:-}
       CRISIS_RESOURCE_TEXT: ${CRISIS_RESOURCE_TEXT:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
@@ -38,6 +52,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_AI_ADDR: cache-ai:6379
+      REDIS_AI_PASSWORD: ${REDIS_AI_PASSWORD:?REDIS_AI_PASSWORD is required}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:?TG_BOT_TOKEN is required}
       ADMIN_ORIGIN: ${ADMIN_ORIGIN:?ADMIN_ORIGIN is required}

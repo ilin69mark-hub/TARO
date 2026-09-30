@@ -28,7 +28,17 @@ async function req(path: string, init: RequestInit = {}) {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message_ru || `Ошибка ${res.status}`);
+    // Код ошибки обязан доехать до клиента. Без него linkTelegram() не может
+    // отличить ALREADY_LINKED (не ошибка) от FP_MISMATCH (ошибка), а перенос
+    // покупки — тем более не сможет тихо перевыдать токен на
+    // HANDOFF_IP_MISMATCH. Раньше code терялся здесь, и ветки в клиенте были
+    // мёртвыми: любой отказ выглядел одинаково.
+    const err: Error & { code?: string; status?: number } = new Error(
+      body?.error?.message_ru || `Ошибка ${res.status}`
+    );
+    err.code = body?.error?.code;
+    err.status = res.status;
+    throw err;
   }
   return res;
 }
@@ -56,7 +66,8 @@ function bumpPaywalls(): void {
   }
 }export async function postReadingSSE(
   body: { spread_code: string; question?: string; idempotency_key: string },
-  onToken: (t: string) => void
+  onToken: (t: string) => void,
+  onReadingId?: (id: string) => void
 ): Promise<{ reading_id: string; status: string }> {
   const res = await fetch("/api/readings", {
     method: "POST",
@@ -87,6 +98,13 @@ function bumpPaywalls(): void {
       if (!line.startsWith("data:")) continue;
       const payload = JSON.parse(line.slice(5).trim());
       if (payload.token) onToken(payload.token);
+      // id приходит первым же кадром (сервер создал расклад до генерации) —
+      // по нему можно открыть страницу с картами, не дожидаясь толкования.
+      // Финальный кадр дублирует id, поэтому защищаемся от повторного вызова.
+      if (payload.reading_id && payload.reading_id !== readingId) {
+        readingId = payload.reading_id;
+        onReadingId?.(readingId);
+      }
       if (payload.done) {
         readingId = payload.reading_id;
         status = payload.status;

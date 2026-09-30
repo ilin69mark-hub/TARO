@@ -3,16 +3,71 @@
 > Статус: `draft`. Связи: `05-entitlements-billing.md`.
 
 ## Механика (простая, антифрод-устойчивая)
-- Код `taro.me/r/<ref_code>` (`referrals.code UNIQUE`, генерация при первом `GET /v1/referral/me`). Флоу: `POST /v1/referral/apply {code}` до 1-го reading → `pending`; хук после 1-го reading → проверка → `completed`.
-- Бонус +3 дня premium обоим (конфиг `referral.bonus_days=3`) начисляется в `subscriptions` (не в `entitlements`), только если `referee.tg_id IS NOT NULL` (anon-ферма отрезана) + `referrer != referee` + fingerprint/IP mismatch.
-- Лимиты: max 30 дней/календарный месяц (`entitlements.referral_bonus_month` + ключ `YYYY-MM`) + lifetime-счетчик `referral_bonus_lifetime`. Второй код на того же referee → 409 ALREADY_REFERRED (не 500).
+- Код юзера — `users.referral_code` (partial UNIQUE, 8 символов из 32-символьного алфавита, `32^8 ≈ 1.1e12`; генерация при первом `GET /v1/referral/me`). Приглашение — ссылка `/r/<ref_code>`, страница применяет код автоматически до первого расклада. Флоу: `POST /v1/referral/apply {code}` до 1-го `done`-чтения → `pending`; хук после 1-го чтения → проверки → `completed`.
+- Бонус (конфиг `referral.bonus_days`, по умолчанию 3 дня) обоим начисляется в `subscriptions` (не в `entitlements`).
+- Условия выдачи: `referee.tg_id IS NOT NULL` (anon-ферма отрезана) + `referrer != referee` + антиферма по снапшоту.
+- Конфиг читается из `app_config['referral']` (раньше был мёртвой записью: `bonus_days`/`monthly_cap` были захардкожены в коде).
+
+## Антиферма (миграция 037)
+Сигналы снимаются в **момент apply** и пишутся в `referrals` (`referee_fp`, `referee_ip`, `referrer_fp`, `referrer_ip`; IP — sha256-хэш, сырой адрес не хранится). Проверка в **момент завершения** сверяет снапшот с текущим состоянием пользователей:
+
+| Причина отказа | Условие | Выключается конфигом |
+|---|---|---|
+| `identity` | fingerprint рефера сменился между apply и complete (подмена личности через merge) | **нет** — это подмена субъекта, а не «мягкий» признак |
+| `fingerprint` | реферер и рефёр пришли из одного браузера | `antifarm_fp` |
+| `ip` | реферер и рефёр за одним адресом | `antifarm_ip` (**выкл по умолчанию**, см. ниже) |
+| `anon` | у рефера нет `tg_id` | — |
+| `self` | `referrer_id = referee_id` | — |
+| `cluster` | fingerprint уже делят ≥ `fingerprint_cluster_limit` аккаунтов, либо (при `ip_cluster_limit > 0`) с одного адреса пришло ≥ `ip_cluster_limit` разных рефёров за 30 дней | `fingerprint_cluster_limit` / `ip_cluster_limit` |
+| `monthly_cap` / `lifetime_cap` | исчерпан потолок бонусов реферера | `monthly_cap` / `lifetime_cap_days` |
+
+Почему снапшот, а не проверка «на лету»: пока referee аноним, строка `pending` висела без единой проверки, и при merge аккаунтов переезжала на tg-юзера, где и завершалась. Проверка «есть ли tg_id» в момент хука этот обход не закрывала.
+
+### Кластерная проверка — почему она отдельная
+Парные проверки сравнивают реферера с рефёром. Этого **недостаточно**: главный вектор — «чужой реферальный код + N своих аккаунтов из одного браузера». Fingerprint реферера чужой, совпадения нет, а бонусы (по 3 дня на аккаунт) получает атакующий. Поэтому дополнительно считается, сколько аккаунтов **вообще** делят этот fingerprint (`fingerprint_cluster_limit`, по умолчанию 3), и сколько разных рефёров пришло с одного адреса за 30 дней (`ip_cluster_limit`, по умолчанию **0** — выключено).
+
+### Почему `antifarm_ip` и `ip_cluster_limit` выключены по умолчанию
+Обе IP-проверки опираются на `X-Real-IP`, который nginx ставит из `$remote_addr`. В `deploy/nginx.conf` **нет `set_real_ip_from`**. Как только перед nginx встанет Cloudflare (запланировано, E04), `$remote_addr` станет edge-IP Cloudflare — одинаковым для всех посетителей — и проверка «реферер и рефёр за одним адресом` начнёт отклонять почти все легитимные рефералки. Второй источник ложных отказов — CGNAT мобильных операторов.
+
+Носитель защиты — fingerprint: парная проверка `referrer_fp == referee_fp` плюс кластерная `fingerprint_cluster_limit`. Обе работают без IP. IP-сигналы остаются в коде и включаются одним флагом после того, как в nginx появится `real_ip` (диапазоны Cloudflare + `real_ip_header CF-Connecting-IP`). Решение за владельцем — `docs/BACKLOG_OWNER.md` (D8).
+
+Тот же пустой/одинаковый IP попадает в ключ `ratelimit` для маршрутов `byUser=false` (`/v1/auth/`, `/v1/spreads`, `/v1/share`) — это отдельная проблема, не реферальная.
+
+### Что здесь НЕ является границей безопасности
+`fingerprint_cluster_limit` — **размен, а не защита**. Сервер видит одно и то же у «семьи за одним ноутбуком» и у «фермы из одного браузера»; отличить их нельзя в принципе, поэтому любой порог кого-то не пропустит. Настоящие границы ущерба:
+- месячный кэп реферера (30 дней) — ограничивает потери жертвы независимо от числа аккаунтов атакующего;
+- цена Telegram-аккаунта, которая многократно выше стоимости 3 дней безлимита — делает ферму экономически бессмысленной;
+- рефёр обязан быть новым (0 `done`-чтений) и иметь `tg_id`.
+
+Проверяется это тестами: `TestRedTeamClusterCheckIsWhatBoundsTheFarm` (с выключенным порогом ферма проходит целиком — доказывает, что ограничивает именно порог) и `TestRedTeamIPClusterCanBeEnabled`.
+
+## Лимиты
+- Месячный: `referral.monthly_cap_days` (по умолчанию 30) дней бонусных дней реферера за календарный месяц **МСК** (`Europe/Moscow`; `time.Now()` сдвигал переключение на 3 часа на сервере в UTC).
+- Lifetime: `referral.lifetime_cap_days` (по умолчанию 300, `0` = без потолка) за всю жизнь.
+- Оба проверяются атомарно: advisory-lock по рефереру + условный upsert `WHERE ... <= cap` (A10/F-24). Отказ по антиферме кап **не** расходует.
+- `referral_bonus_lifetime` до 037 писался, но нигде не проверялся — месячный кэп был единственным ограничителем, что и делало его целью атаки.
+
+## Контракт `apply`
+- У рефера ровно одна привязка (`referee_id UNIQUE`). Второй код → **409 ALREADY_REFERRED**, привязка не переписывается. Раньше был 200 `applied:pending` при `ON CONFLICT DO NOTHING`, и юзер думал, что привязан ко второму коду.
+- Единственное исключение — переигров отказа с причиной **`anon`**: человек применил код до входа через Telegram, отказ был не по его вине. После входа код применяется снова. Отказы по антиферме и самому себе переигрывать нельзя.
+- Код `status != 'active'` юзера не принимается (бан аккаунта не должен мешать ему качать бонусы).
+
+## Надёжность
+Хук `CompleteOnFirstReading` — горутина с таймаутом, поэтому рестарт/деплой мог оставить `pending` навсегда, а `referee_id UNIQUE` не давал применить код заново. `ReconcilePending` (тик 5 мин в `cmd/api`) возвращает зависшие строки в оборот: берёт `pending` старше 10 минут, у рефера есть `tg_id` и ≥1 `done`-чтение. Повторный вызов идемпотентен (`FOR UPDATE` + предикат `status='pending'`).
+
+## Аудит (см. `applied_code`)
+- `referrals.applied_code` — **фактически применённый** код, для расследований. До 037 `referrals.code` писался случайным `genCode()` и **не читался ни одним запросом**.
+- `referrals.code` остаётся как legacy-токен строки с UNIQUE: одним кодом пользуются многие рефереи, UNIQUE на самом коде невозможен.
 
 ## User Story
-Как пользователь, я хочу поделиться красивым раскладом с подругой, чтобы мы обе получили бонус.
+Как пользователь, я хочу поделиться ссылкой-приглашением с подругой, чтобы мы обе получили бонус.
 
 ## GWT
-- Given `apply` до reading + referee привязал TG + 1 reading, When хук, Then оба `subscriptions.valid_until = max(now,valid)+3д`, `referrals completed`.
-- Given сам себе по своей ссылке (тот же fingerprint) или anon без TG, When хук, Then бонуса нет, `referrals status=rejected`.
+- Given `apply` до reading + referee привязал TG + 1 reading, When хук, Then оба `subscriptions.valid_until = max(now,valid)+bonus_days`, `referrals completed`.
+- Given сам себе по своей ссылке, или anon без TG, или общий fingerprint/IP с реферером, When хук, Then бонуса нет, `referrals status=rejected` + заполненный `reject_reason`.
+- Given `apply` анонимом без TG + чтение, When хук, Then `rejected` с причиной `anon`; Given затем вход через TG и повторный `apply`, Then `pending` и бонус выдаётся.
+- Given второй `apply` с другим кодом, Then 409 ALREADY_REFERRED, привязка к первому коду не меняется.
+- Given `pending` старше 10 минут у юзера с `tg_id` и `done`-чтением, When reconciler, Then `completed`.
 
 ## Таблица `referrals`
-`id, referrer_id, referee_id, code, status(pending/completed/rejected), bonus_days, created_at` — уникальный `referee_id`; код юзера — `users.referral_code` (self-строки запрещены с миграции 014: ломали apply).
+`id, referrer_id, referee_id, code (legacy-токен), applied_code, status(pending/completed/rejected), reject_reason, bonus_days, referee_fp, referee_ip, referrer_fp, referrer_ip, created_at` — уникальный `referee_id`; код юзера — `users.referral_code` (self-строки запрещены с миграции 014: ломали apply).

@@ -1,14 +1,9 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
-
-import { fwdHeaders, bodyTooLarge, tooLarge } from "@/lib/proxy";
-
-function hdrs(req: NextRequest) {
-  return fwdHeaders(req);
-}
+import { fwdHeaders, bodyTooLarge, tooLarge, relayJSON } from "@/lib/proxy";
 
 // GET /api/push/prefs → Go (cookie дальше, см. V24).
 export async function GET(req: NextRequest) {
@@ -16,11 +11,7 @@ export async function GET(req: NextRequest) {
     headers: { Cookie: req.headers.get("cookie") || "" },
     cache: "no-store",
   });
-  const body = await res.arrayBuffer();
-  return new NextResponse(body, {
-    status: res.status,
-    headers: { "Content-Type": "application/json" },
-  });
+  return relayJSON(res);
 }
 
 // POST /api/push/prefs → Go.
@@ -29,12 +20,8 @@ export async function POST(req: NextRequest) {
   const body = await req.text();
   const res = await fetch(`${GO}/v1/push/prefs`, {
     method: "POST",
-    headers: hdrs(req),
+    headers: fwdHeaders(req),
     body,
   });
-  const buf = await res.arrayBuffer();
-  return new NextResponse(buf, {
-    status: res.status,
-    headers: { "Content-Type": "application/json" },
-  });
+  return relayJSON(res);
 }

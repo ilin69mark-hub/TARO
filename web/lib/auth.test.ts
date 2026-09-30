@@ -115,3 +115,89 @@ describe("auth bootstrap", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+// Анонимная личность была невосстановима: fingerprint живёт в httpOnly-cookie,
+// localStorage хранит только маркер готовности. Потеря cookie => getFp() == "" =>
+// 403 FP_REQUIRED навсегда, потому что генерировать новый fingerprint строка
+// `if (fingerprintReady()) return ""` не даёт, а сервер на новый ответил бы
+// FP_MISMATCH (в БД у uuid записан старый). Пользователь оставался заперт в
+// стартовой сессии. Теперь 403 от привязки сбрасывает личность и заводит новую.
+describe("recovery from an unrecoverable fingerprint", () => {
+  const READY = { taro_fp_ready: "1", taro_uuid: "00000000-0000-4000-8000-00000000000a" };
+
+  function fpLockout(code: string): Response {
+    return new Response(JSON.stringify({ error: { code, message_ru: "Устройство не узнано" } }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  function stubCrypto() {
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "00000000-0000-4000-8000-00000000000b",
+      getRandomValues: vi.fn((bytes: Uint8Array) => {
+        bytes.fill(9);
+        return bytes;
+      }),
+    });
+  }
+
+  for (const code of ["FP_REQUIRED", "FP_MISMATCH"]) {
+    it(`resets the identity and retries once on ${code}`, async () => {
+      const stores = installStorage({ ...READY });
+      stubCrypto();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(fpLockout(code))
+        .mockResolvedValueOnce(response(true));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { ensureAuth } = await import("@/lib/auth");
+      await ensureAuth();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // Первая попытка шла с запертым состоянием (без fingerprint), вторая — с
+      // новым uuid И новым fingerprint, то есть это новая личность, не подделка.
+      expect(bodyOf(fetchMock.mock.calls[0])).not.toHaveProperty("fingerprint");
+      expect(bodyOf(fetchMock.mock.calls[1])).toMatchObject({
+        uuid: "00000000-0000-4000-8000-00000000000b",
+        fingerprint: "09090909090909090909090909090909",
+      });
+      expect(stores.local.values.taro_fp_ready).toBe("1");
+    });
+  }
+
+  it("does not loop when the reset identity is rejected too", async () => {
+    installStorage({ ...READY });
+    stubCrypto();
+    const fetchMock = vi.fn().mockResolvedValue(fpLockout("FP_REQUIRED"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { ensureAuth } = await import("@/lib/auth");
+    await expect(ensureAuth()).rejects.toThrow("Auth failed: 403");
+    // Ровно две попытки: исходная и одна с новой личностью. Третьей быть не должно.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the identity for 403 that is not a fingerprint lockout", async () => {
+    const stores = installStorage({ ...READY });
+    stubCrypto();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "FORBIDDEN", message_ru: "Неверный CSRF-токен" } }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        })
+      )
+      .mockResolvedValueOnce(response(true));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { ensureAuth } = await import("@/lib/auth");
+    await expect(ensureAuth()).rejects.toThrow("Auth failed: 403");
+
+    // Чужой 403 не должен стирать личность: uuid на месте, попыток ровно одна.
+    expect(stores.local.values.taro_uuid).toBe("00000000-0000-4000-8000-00000000000a");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

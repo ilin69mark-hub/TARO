@@ -25,6 +25,23 @@ const (
 )
 
 func main() {
+	// Подкоманды (A09/F-09). Старое поведение provisioning'а сохранено: любые
+	// аргументы без первого «payments» идут в исходный путь, поэтому все
+	// документированные вызовы (`adminctl -username ...`) работают как раньше.
+	if len(os.Args) > 1 && os.Args[1] == "access" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		os.Exit(accessCmd(ctx, os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "payments" {
+		if len(os.Args) < 3 || os.Args[2] != "reconcile" {
+			fmt.Fprintf(os.Stderr, "usage: adminctl payments reconcile [--since RFC3339] [--limit N] [--all] [--json]\n")
+			os.Exit(1)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		os.Exit(paymentsReconcile(ctx, os.Args[3:]))
+	}
 	usernameFlag := flag.String("username", "", "admin username")
 	userIDFlag := flag.String("user-id", "00000000-0000-0000-0000-000000000001", "admin user UUID")
 	flag.Parse()

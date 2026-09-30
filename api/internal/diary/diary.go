@@ -16,6 +16,7 @@ import (
 
 	"taro/api/internal/apierr"
 	"taro/api/internal/auth"
+	"taro/api/internal/readings"
 )
 
 // Entry — запись дневника.
@@ -26,6 +27,25 @@ type Entry struct {
 	Mood      *string `json:"mood"`
 	CreatedAt string  `json:"created_at"`
 	UpdatedAt string  `json:"updated_at"`
+	// Снимок расклада, к которому привязана запись. Нужен, чтобы из дневника
+	// можно было и прочитать толкование, и снова посмотреть карты, не открывая
+	// исходное чтение (владелец: «чтобы я мог потом и прочитать и посмотреть
+	// снова»). Приходит одним LEFT JOIN, а не N+1 запросами на клиенте.
+	Question       *string       `json:"question"`
+	SpreadCode     *string       `json:"spread_code"`
+	Cards          []ReadingCard `json:"cards"`
+	Interpretation *string       `json:"interpretation"`
+	ReadingLocked  *bool         `json:"reading_locked"`
+}
+
+// ReadingCard — карта в снимке расклада. Картинка отдаётся по image_key, а не
+// ссылкой: клиент сам склеивает /<image_key> (см. контракт артов, A05/F-04).
+type ReadingCard struct {
+	CardID   int    `json:"card_id"`
+	Position int    `json:"position"`
+	NameRU   string `json:"name_ru"`
+	ImageKey string `json:"image_key"`
+	Reversed bool   `json:"reversed"`
 }
 
 // Service — дневник.
@@ -115,24 +135,54 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный mood")
 		return
 	}
+	// LEFT JOIN readings: запись может быть без расклада (тогда снимок пустой),
+	// и расклад мог быть удалён — ON DELETE SET NULL у reading_id.
+	// Колонки locked в readings НЕТ: блокировка вычисляется (не premium И не
+	// сегодняшний день), поэтому sameMSKDay переиспользуется ниже.
 	rows, err := s.pg.Query(r.Context(), `
-		SELECT id, reading_id, body, mood, created_at, updated_at FROM diary_entries
-		 WHERE user_id=$1 AND ($3='' OR mood=$3)
-		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, mood, offset)
+		SELECT d.id, d.reading_id, d.body, d.mood, d.created_at, d.updated_at,
+		       r.question, r.spread_code, r.cards, r.interpretation, r.created_at
+		  FROM diary_entries d
+		  LEFT JOIN readings r ON r.id = d.reading_id
+		 WHERE d.user_id=$1 AND ($3='' OR d.mood=$3)
+		 ORDER BY d.created_at DESC LIMIT $2 OFFSET $4`, uid, limit, mood, offset)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить")
 		return
 	}
+	// Та же логика доступа, что в GET /v1/readings: без подписки толкование
+	// вчерашнего чтения не отдаём. Снимок в дневнике не должен стать обходом.
+	premium := false
+	_ = s.pg.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id=$1 AND status='active' AND valid_until > now())`,
+		uid).Scan(&premium)
 	defer rows.Close()
 	out := []Entry{}
 	for rows.Next() {
 		var e Entry
 		var c, u time.Time
-		if err := rows.Scan(&e.ID, &e.ReadingID, &e.Body, &e.Mood, &c, &u); err != nil {
+		var question, spread, interp *string
+		var cardsRaw []byte
+		var readingCreated *time.Time
+		if err := rows.Scan(&e.ID, &e.ReadingID, &e.Body, &e.Mood, &c, &u,
+			&question, &spread, &cardsRaw, &interp, &readingCreated); err != nil {
 			continue
 		}
 		e.CreatedAt = c.Format(time.RFC3339)
 		e.UpdatedAt = u.Format(time.RFC3339)
+		e.Question, e.SpreadCode = question, spread
+		e.Cards = []ReadingCard{}
+		locked := false
+		if e.ReadingID != nil {
+			if !premium && (readingCreated == nil || !readings.SameMSKDay(*readingCreated, time.Now())) {
+				locked = true
+				interp = nil
+			}
+			if len(cardsRaw) > 0 {
+				_ = json.Unmarshal(cardsRaw, &e.Cards)
+			}
+		}
+		e.Interpretation, e.ReadingLocked = interp, &locked
 		out = append(out, e)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -196,55 +246,6 @@ func (s *Service) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	e.UpdatedAt = u.Format(time.RFC3339)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(e)
-}
-
-// HandleExport — POST /v1/diary/export: свои записи одним JSON (см. V12).
-// POST+CSRF намеренно: GET-ссылка позволяла cross-site триггер скачивания (см. аудит B).
-// Аудит D: cap 5000 строк — полный дамп без лимита клал воркер в OOM.
-func (s *Service) HandleExport(w http.ResponseWriter, r *http.Request) {
-	uid := auth.UserID(r.Context())
-	var n int
-	if err := s.pg.QueryRow(r.Context(),
-		`SELECT COUNT(*) FROM diary_entries WHERE user_id=$1`, uid).Scan(&n); err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось выгрузить")
-		return
-	}
-	if n > 5000 {
-		apierr.Write(w, http.StatusRequestEntityTooLarge, apierr.CodeValidation, "Слишком много записей для выгрузки")
-		return
-	}
-	rows, err := s.pg.Query(r.Context(), `
-		SELECT id, reading_id, body, mood, created_at, updated_at FROM diary_entries
-		 WHERE user_id=$1 ORDER BY created_at`, uid)
-	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось выгрузить")
-		return
-	}
-	defer rows.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", `attachment; filename="taro-diary.json"`)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("["))
-	first := true
-	encoder := json.NewEncoder(w)
-	for rows.Next() {
-		var e Entry
-		var c, u time.Time
-		if err := rows.Scan(&e.ID, &e.ReadingID, &e.Body, &e.Mood, &c, &u); err != nil {
-			continue
-		}
-		e.CreatedAt = c.Format(time.RFC3339)
-		e.UpdatedAt = u.Format(time.RFC3339)
-		if !first {
-			_, _ = w.Write([]byte(","))
-		}
-		first = false
-		_ = encoder.Encode(e)
-	}
-	if rows.Err() != nil {
-		return
-	}
-	_, _ = w.Write([]byte("]\n"))
 }
 
 // HandleDelete — DELETE /v1/diary/{id} (только своя).

@@ -8,9 +8,22 @@ import { useFrame, useThree } from "@react-three/fiber";
 import { easing } from "maath";
 import * as THREE from "three";
 
-const ARRIVAL = new THREE.Vector3(0, 1.6, 3.2);
-const READING = new THREE.Vector3(0, 3.0, 2.2); // топ-даун 15°
+// Камера отодвинута: раньше стояла в 3.2 единицах от алтаря, и храм шириной
+// 5.2 занимал весь кадр — это читалось как «предметы в тёмной комнате».
+// Теперь алтарь в 5.5, камера в 5.0: зал виден целиком, и остаётся место
+// под заголовок поверх.
+const ARRIVAL = new THREE.Vector3(0, 2.0, 5.0);
+const READING = new THREE.Vector3(0, 3.4, 4.2); // топ-даун
 const MIN_DIST = 2.2;
+/**
+ * Точка взгляда. Раньше стояла на 1.4 — алтарь с книгой попадал ровно в
+ * середину кадра, где на главной живёт заголовок, и то, ради чего сцена
+ * делалась, оказывалось закрыто текстом. Поднятая точка взгляда опускает
+ * всю сцену в кадре: алтарь уходит под текстовый блок, а небо
+ * ОДНОВРЕМЕННО занимает больше верхней части кадра. Оба условия
+ * выполняются одним движением.
+ */
+const LOOK_AT = new THREE.Vector3(0, 2.2, -3.5);
 
 export default function CameraRig() {
   const { camera } = useThree();
@@ -30,7 +43,7 @@ export default function CameraRig() {
     // assert дистанции (см. 09: clamp, не доверие словам)
     const d = camera.position.length();
     if (d < MIN_DIST) camera.position.setLength(MIN_DIST);
-    camera.lookAt(0, 0.4, -0.5);
+    camera.lookAt(LOOK_AT);
   });
   return null;
 }

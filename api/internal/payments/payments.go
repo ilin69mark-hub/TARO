@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taro/api/internal/apierr"
@@ -42,6 +44,28 @@ type tgCallError struct {
 
 func (e *tgCallError) Error() string { return e.message }
 
+// telegramAPIURL — адрес Telegram API. Подмена разрешена ТОЛЬКО для локального
+// http-хоста и ТОЛЬКО при явном флаге (A14/F-18): без этого ветку отказа
+// Telegram-возврата невозможно прогнать в тестах детерминированно, а с
+// безусловной подменой адреса refunds можно было бы увести на чужой хост.
+// В проде значение всегда https://api.telegram.org.
+func telegramAPIURL() string {
+	const prod = "https://api.telegram.org"
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("TELEGRAM_API_BASE")), "/")
+	if base == "" {
+		return prod
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || u.User != nil {
+		return prod
+	}
+	if os.Getenv("TELEGRAM_ALLOW_CUSTOM_BASE") == "1" && u.Scheme == "http" &&
+		(u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost") {
+		return base
+	}
+	return prod
+}
+
 func (s *Service) tgCall(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	token := os.Getenv("TG_BOT_TOKEN")
 	if token == "" || token == "dev-only-bot" {
@@ -52,7 +76,7 @@ func (s *Service) tgCall(ctx context.Context, method string, params map[string]a
 		return nil, &tgCallError{message: "invalid telegram request", ambiguous: true}
 	}
 	req, err := http.NewRequestWithContext(ctx,
-		"POST", "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(body))
+		"POST", telegramAPIURL()+"/bot"+token+"/"+method, bytes.NewReader(body))
 	if err != nil {
 		return nil, &tgCallError{message: "invalid telegram request", ambiguous: true}
 	}
@@ -127,6 +151,7 @@ type refundPayment struct {
 
 type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
 
 const storedPaymentColumns = `p.id::text, p.user_id::text, p.plan_id::text, p.plan_code,
@@ -151,7 +176,22 @@ func (s *Service) loadPaymentByKey(ctx context.Context, userID, key string) (sto
 	return p, err
 }
 
+// loadWebhookPayment читает платёж под блокировкой строки.
+//
+// ПОРЯДОК БЛОКИРОВОК (A08/F-08): единственный глобальный порядок в проекте —
+// users → payments. Раньше вебхук брал payments, а вставка в subscriptions
+// требовала KEY SHARE на users через FK — то есть payments → users, тогда как
+// DELETE /v1/me шёл users → payments (ON DELETE CASCADE). Два конкурентных
+// запроса давали 40P01, и DELETE всегда проигрывал (500 + принудительный
+// повторный логин). Поэтому user-строку блокируем ПЕРВОЙ, отдельным
+// оператором: порядок не зависит от плана запроса, в отличие от порядка
+// locking-клауз в одном SELECT.
 func (s *Service) loadWebhookPayment(ctx context.Context, q queryRower, id string) (webhookPayment, error) {
+	if _, err := q.Exec(ctx, `SELECT 1
+		FROM users u JOIN payments p ON p.user_id = u.id
+		WHERE p.id = $1 FOR KEY SHARE OF u`, id); err != nil {
+		return webhookPayment{}, err
+	}
 	var p webhookPayment
 	dest := paymentScanDest(&p.storedPayment)
 	dest = append(dest, &p.ownerTG)
@@ -484,9 +524,9 @@ func webhookReconciliationCanProceed(p webhookPayment) bool {
 		return false
 	}
 	switch *p.ReconciliationReason {
-	case "amount_mismatch", "charge_mismatch", "owner_mismatch", "charge_reused":
+	case ReasonAmountMismatch, ReasonChargeMismatch, ReasonOwnerMismatch, ReasonChargeReused:
 		return true
-	case "owner_unverified":
+	case ReasonOwnerUnverified:
 		return p.ownerTG != nil && *p.ownerTG > 0
 	default:
 		return false
@@ -503,9 +543,9 @@ func (s *Service) originalOwnerUnverifiedEvent(ctx context.Context, q queryRower
 	var identity webhookIdentity
 	err := q.QueryRow(ctx, `SELECT owner_tg_id, telegram_charge_id, provider_charge_id
 		FROM payment_webhook_events
-		WHERE payment_id=$1 AND reason='owner_unverified'
+		WHERE payment_id=$1 AND reason=$2
 		ORDER BY created_at ASC, id ASC
-		LIMIT 1`, paymentID).Scan(&identity.ownerTG, &identity.telegramCharge, &identity.providerCharge)
+		LIMIT 1`, paymentID, ReasonOwnerUnverified).Scan(&identity.ownerTG, &identity.telegramCharge, &identity.providerCharge)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return webhookIdentity{}, false, nil
 	}
@@ -561,11 +601,12 @@ func (s *Service) markWebhookMismatch(ctx context.Context, tx pgx.Tx, p webhookP
 	if reconcile {
 		_, err = tx.Exec(ctx, `UPDATE payments
 			SET reconciliation_reason=CASE
-					WHEN status='reconciliation' AND reconciliation_reason='owner_unverified' AND $2<>'charge_reused' THEN reconciliation_reason
+					WHEN status='reconciliation' AND reconciliation_reason=$4 AND $2<>$5 THEN reconciliation_reason
 					ELSE $2
 				END,
 				note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN $3 ELSE note || ' ' || $3 END
-			WHERE id=$1 AND status IN ('pending','expired','reconciliation')`, p.ID, reason, "payment-reconciliation:"+reason)
+			WHERE id=$1 AND status IN ('pending','expired','reconciliation')`,
+			p.ID, reason, "payment-reconciliation:"+reason, ReasonOwnerUnverified, ReasonChargeReused)
 		return err
 	}
 	_, err = tx.Exec(ctx, `UPDATE payments
@@ -579,7 +620,7 @@ func (s *Service) markWebhookMismatch(ctx context.Context, tx pgx.Tx, p webhookP
 }
 
 func (s *Service) markOwnerUnverifiedReconciliation(ctx context.Context, tx pgx.Tx, p webhookPayment, sp successfulPayment, ownerTG int64, stateReason string, storeCharge bool) error {
-	inserted, err := s.recordWebhookEvent(ctx, tx, p, sp, ownerTG, "owner_unverified")
+	inserted, err := s.recordWebhookEvent(ctx, tx, p, sp, ownerTG, ReasonOwnerUnverified)
 	if err != nil {
 		return err
 	}
@@ -608,15 +649,29 @@ func (s *Service) grantPaymentEntitlements(ctx context.Context, tx pgx.Tx, p sto
 			VALUES ($1,'any',$2) ON CONFLICT (payment_id) DO NOTHING`, p.UserID, p.ID)
 		return err
 	}
+	// Продление подписки — read-modify-write по MAX(valid_until). Два вебхука по
+	// разным платежам одного юзера блокируют разные строки payments, поэтому
+	// безuser-скопа они читают один и тот же MAX и оба считают прибавку от него:
+	// два месяца за два платежа дают 30 дней. Блокируем юзера на всё время
+	// транзакции — тот же паттерн, что в readings.go:317 / ai.go:581 / link.go:158.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "subscriptions:"+p.UserID); err != nil {
+		return err
+	}
 	days := 30
 	if p.Duration != nil && *p.Duration > 0 {
 		days = *p.Duration
 	}
+	// ON CONFLICT — страховка от повторной обработки одного платежа: уникальный
+	// индекс idx_sub_payment_uniq (миграция 035) делает второй INSERT no-op,
+	// а не падением. Разные платезы одного юзера конфликта не дают.
+	// WHERE в ON CONFLICT обязателен: индекс частичный, и без того же предиката
+	// PostgreSQL не может его выбрать (42P10).
 	_, err := tx.Exec(ctx, `INSERT INTO subscriptions
 		(user_id, plan_id, plan_code, price_rub_snapshot, valid_until, payment_id, source_type)
 		SELECT $1,$2,$3,$4,
 			GREATEST(COALESCE(MAX(valid_until), now()), now()) + make_interval(days => $6), $5, 'payment'
-		FROM subscriptions WHERE user_id=$1 AND status='active'`,
+		FROM subscriptions WHERE user_id=$1 AND status='active'
+		ON CONFLICT (payment_id) WHERE payment_id IS NOT NULL DO NOTHING`,
 		p.UserID, p.PlanID, p.PlanCode, p.Price, p.ID, days)
 	return err
 }
@@ -684,7 +739,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		ownerMismatch := p.ownerTG != nil && *p.ownerTG != ownerTG
 		amountMismatch := sp.TotalAmount != p.Stars
 		if chargeMismatch || ownerMismatch || amountMismatch {
-			reason := "duplicate_charge"
+			reason := ReasonDuplicateCharge
 			if !chargeMismatch && ownerMismatch && amountMismatch {
 				reason = "duplicate_owner_amount_mismatch"
 			} else if !chargeMismatch && ownerMismatch {
@@ -700,7 +755,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p.Status == "refunding" || (p.Status == "reconciliation" && !webhookReconciliationCanProceed(p)) {
-		reason := "refunding_payment"
+		reason := ReasonRefundingPay
 		if p.Status == "reconciliation" {
 			reason = "reconciliation_blocked"
 		}
@@ -725,7 +780,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			originalOwnerEvent = &identity
 		}
 	}
-	if p.ReconciliationReason != nil && *p.ReconciliationReason == "owner_unverified" && originalOwnerEvent == nil {
+	if p.ReconciliationReason != nil && *p.ReconciliationReason == ReasonOwnerUnverified && originalOwnerEvent == nil {
 		if !commitMismatch("reconciliation_blocked", false) {
 			return
 		}
@@ -751,12 +806,12 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			reason := "charge_mismatch"
+			reason := ReasonChargeMismatch
 			if ownerTG != originalOwnerEvent.ownerTG {
-				reason = "owner_mismatch"
+				reason = ReasonOwnerMismatch
 			}
 			if reused || ownerRecoveryReused {
-				reason = "charge_reused"
+				reason = ReasonChargeReused
 			}
 			if !commitMismatch(reason, true) {
 				return
@@ -770,7 +825,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if reused || ownerRecoveryReused {
-			if !commitMismatch("charge_reused", true) {
+			if !commitMismatch(ReasonChargeReused, true) {
 				return
 			}
 			writeWebhookReconciliation(w)
@@ -782,7 +837,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		if (knownTelegramCharge != "" && knownTelegramCharge != sp.TelegramPaymentCharge) ||
 			(p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge) ||
 			(p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge) {
-			if !commitMismatch("charge_mismatch", true) {
+			if !commitMismatch(ReasonChargeMismatch, true) {
 				return
 			}
 		} else {
@@ -791,9 +846,9 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 				return
 			}
-			stateReason := "owner_unverified"
+			stateReason := ReasonOwnerUnverified
 			if reused {
-				stateReason = "charge_reused"
+				stateReason = ReasonChargeReused
 			}
 			if err := s.markOwnerUnverifiedReconciliation(ctx, tx, p, *sp, ownerTG, stateReason, !reused); err != nil {
 				apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
@@ -809,14 +864,14 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if (p.TelegramCharge != nil && *p.TelegramCharge != sp.TelegramPaymentCharge) ||
 		(p.ProviderCharge != nil && *p.ProviderCharge != sp.ProviderPaymentCharge) {
-		if !commitMismatch("charge_mismatch", true) {
+		if !commitMismatch(ReasonChargeMismatch, true) {
 			return
 		}
 		writeWebhookReconciliation(w)
 		return
 	}
 	if ownerTG != *p.ownerTG {
-		if !commitMismatch("owner_mismatch", true) {
+		if !commitMismatch(ReasonOwnerMismatch, true) {
 			return
 		}
 		writeWebhookReconciliation(w)
@@ -835,7 +890,7 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if reused {
-		if !commitMismatch("charge_reused", true) {
+		if !commitMismatch(ReasonChargeReused, true) {
 			return
 		}
 		writeWebhookReconciliation(w)
@@ -855,10 +910,11 @@ func (s *Service) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			note=CASE WHEN NULLIF(btrim(note), '') IS NULL THEN NULLIF($5,'')
 				WHEN $5='' THEN note ELSE note || ' ' || $5 END
 		WHERE id=$1 AND status IN ('pending','expired','reconciliation')
-		  AND (reconciliation_reason IS NULL OR reconciliation_reason IN ('owner_unverified','amount_mismatch','charge_mismatch','owner_mismatch','charge_reused'))
+		  AND (reconciliation_reason IS NULL OR reconciliation_reason = ANY($6))
 		  AND (telegram_payment_charge_id IS NULL OR telegram_payment_charge_id=$2)
 		  AND (provider_payment_charge_id IS NULL OR provider_payment_charge_id=$3)
-		RETURNING true`, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, sp.TotalAmount, note).Scan(&updated)
+		RETURNING true`, p.ID, sp.TelegramPaymentCharge, sp.ProviderPaymentCharge, sp.TotalAmount, note,
+		[]string{ReasonOwnerUnverified, ReasonAmountMismatch, ReasonChargeMismatch, ReasonOwnerMismatch, ReasonChargeReused}).Scan(&updated)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Ошибка")
 		return
@@ -952,6 +1008,45 @@ func (s *Service) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// HandleAdminWebhookAudit — GET /v1/admin/payments/audit?since=&limit=&all=1
+// События расхождений вебхуков, сгруппированные по платежу (A09/F-09). Таблица
+// payment_webhook_events писалась всегда, но до этого её не читал никто.
+// По умолчанию — последние 24 часа; ?all=1 отдаёт всю историю.
+func (s *Service) HandleAdminWebhookAudit(w http.ResponseWriter, r *http.Request) {
+	since := time.Now().Add(-24 * time.Hour)
+	if r.URL.Query().Get("all") == "1" {
+		since = time.Unix(0, 0).UTC()
+	} else if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный since (нужен RFC3339)")
+			return
+		}
+		since = parsed
+	}
+	limit := 200
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 1000 {
+		limit = n
+	}
+	items, err := ReconcileWebhookEvents(r.Context(), s.pg, since, limit)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить")
+		return
+	}
+	attention, byReason := WebhookEventSummary(items)
+	if items == nil {
+		items = []WebhookMismatch{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"since":           since.UTC().Format(time.RFC3339),
+		"rows":            len(items),
+		"needs_attention": attention,
+		"by_reason":       byReason,
+		"items":           items,
+	})
 }
 
 func (s *Service) ExpirePending(ctx context.Context) (int64, error) {

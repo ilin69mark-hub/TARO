@@ -10,7 +10,7 @@
 | Paywall sheet | `spring damping 28 stiffness 300` |
 | Тап | `whileTap scale .97` |
 | Частицы (звезды) | canvas ≤40 частиц, только на результате, off при low-battery/reduced-motion |
-| Ultra: letterbox-интро | полосы 8vh сверху/снизу, въезд .6с, skippable тапом, `ease [0.22,1,0.36,1]`; reduced-motion → off |
+| Letterbox-интро (расклад + главная) | полосы 8vh сверху/снизу, **1.2с** суммарно (въезд .3с / удержание .6с / выезд .3с), skippable тапом **по самим полосам**, `ease [0.22,1,0.36,1]`; reduced-motion → off |
 | Ultra: камера R3F | dolly 4.5→3.2, fov 45, `maath damp .8с`, pointer-параллакс ×0.03 desktop; gyro только desktop pointer:fine + тогл |
 | Ultra: foil-переворот | `rotateY 0→180 .7с` + chromaticAberration .0012 (300мс) + вспышка пыли (12 спрайтов) |
 | Premium акт 1 Arrival | камера (0,2.2,4.5)→(0,1.6,3.2) 2с, `maath damp .8`, fov 45 |

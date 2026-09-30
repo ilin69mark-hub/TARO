@@ -34,6 +34,153 @@ body {
   animation: ca-flip 0.3s ease-out;
 }
 
+/* ── Заставка главной (LandingIntro, см. 05-design/08-ultra-cinematic.md §1) ──
+   Намеренно CSS, а не Framer: фаза заставки решается в эффекте (нужен
+   sessionStorage), а `initial` у Framer читается только при монтировании.
+   Из-за этого текст с `initial={false}` НИКОГДА не появлялся. CSS-класс же
+   применяется с первого paint серверного HTML — без «появилось → прыгнуло
+   назад → поехало».
+   Бонус: prefers-reduced-motion ниже гасит всё это одним правилом. */
+@keyframes intro-rise {
+  0% {
+    transform: translateY(14px);
+    text-shadow: 0 0 0 rgba(124, 92, 255, 0);
+  }
+  100% {
+    transform: translateY(0);
+    text-shadow: 0 0 40px rgba(124, 92, 255, 0.18);
+  }
+}
+
+/* Проявление ИЗ СВЕТА: буквы проступают из точки над алтарём и раскрываются
+   наружу, как проступают из тумана. Реализовано radial-gradient маской, а не
+   opacity — текст остаётся видимым с первого кадра, поэтому LCP не сдвигается.
+   Точка раскрытия смещена вверх от центра, к источнику света. */
+@keyframes intro-emerge {
+  0% {
+    -webkit-mask-image: radial-gradient(
+      circle 12% at 50% 78%,
+      #000 0%,
+      rgba(0, 0, 0, 0.85) 30%,
+      transparent 62%
+    );
+    mask-image: radial-gradient(
+      circle 12% at 50% 78%,
+      #000 0%,
+      rgba(0, 0, 0, 0.85) 30%,
+      transparent 62%
+    );
+  }
+  100% {
+    -webkit-mask-image: radial-gradient(circle 150% at 50% 78%, #000 0%, #000 100%);
+    mask-image: radial-gradient(circle 150% at 50% 78%, #000 0%, #000 100%);
+  }
+}
+
+.intro-emerge {
+  animation:
+    intro-rise 0.9s cubic-bezier(0.22, 1, 0.36, 1) both,
+    intro-emerge 1.5s cubic-bezier(0.22, 1, 0.36, 1) 0.15s both;
+}
+
+/* Только transform и text-shadow: opacity на заголовке трогать нельзя — это
+   LCP-элемент, и его исчезновение на первом кадре сдвинуло бы LCP. */
+.intro-rise {
+  animation: intro-rise 0.9s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes intro-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.intro-sub {
+  animation: intro-fade 0.7s cubic-bezier(0.22, 1, 0.36, 1) 0.15s both;
+}
+
+@keyframes intro-eyebrow {
+  0% {
+    opacity: 0;
+    letter-spacing: 0.6em;
+    text-shadow: 0 0 0 rgba(212, 175, 55, 0);
+  }
+  100% {
+    opacity: 1;
+    letter-spacing: 0.2em;
+    text-shadow: 0 0 24px rgba(212, 175, 55, 0.3);
+  }
+}
+
+/* Надпись на LCP не влияет, ей исчезновение разрешено — в отличие от h1. */
+.intro-eyebrow {
+  animation: intro-eyebrow 0.9s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Медленный дрейф подсветки и «дыхание» тёплого ядра. Обе — transform/opacity,
+   поэтому не вызывают layout и не трогают LCP. */
+@keyframes intro-drift {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    transform: translate(-50%, -50%) scale(1.06);
+  }
+}
+
+.intro-drift {
+  animation: intro-drift 18s ease-in-out infinite;
+}
+
+@keyframes intro-breathe {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: translate(-50%, -50%) scale(1.1);
+    opacity: 1;
+  }
+}
+
+.intro-breathe {
+  animation: intro-breathe 7s ease-in-out infinite;
+}
+
+/* «Магия» вытягивания: рубашки расходятся веером (см. 05-animations.md).
+   Угол на каждую карту приходит из --draw-deg, задержка — из style. */
+@keyframes draw-magic {
+  0% {
+    transform: translate(-50%, -50%) rotate(0deg) scale(0.55);
+    opacity: 0;
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-50%, -50%) rotate(var(--draw-deg, 0deg)) scale(1);
+    opacity: 0.95;
+  }
+}
+
+.draw-magic-card {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 6rem;
+  transform: translate(-50%, -50%);
+  border-radius: 0.75rem;
+  opacity: 0.95;
+  animation: draw-magic 1100ms ease-out forwards;
+}
+
 /* Спокойный режим + reduced-motion: гасим анимации (см. 04-a11y.md, T20).
    Полный маппинг R3F/CA/shake — в T28. */
 @media (prefers-reduced-motion: reduce) {

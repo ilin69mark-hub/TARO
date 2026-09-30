@@ -32,6 +32,11 @@ import (
 	"taro/api/internal/store"
 )
 
+// referralReconcileTick — период подбора зависших referrals.status='pending'.
+// Чаще 5 минут незачем: pending становится «зависшим» только через 10 минут
+// (referral.pendingStaleAfter), то есть быстрее одного тика он всё равно не виден.
+const referralReconcileTick = 5 * time.Minute
+
 func validateOriginEnv(name string) error {
 	value := os.Getenv(name)
 	if value == "" {
@@ -71,23 +76,39 @@ func main() {
 	rd := store.ConnectRedis()
 	defer func() { _ = rd.Close() }()
 
+	// A17/F-43: bulk-кэш ответов AI получает СВОЮ роль и бюджет памяти.
+	// Отсутствие REDIS_AI_ADDR — это деградация (кэш делит инстанс с лимитами и
+	// сессиями), поэтому она громкая, а не молчаливая.
+	cacheRd, cacheShared, cacheErr := store.ConnectRedisAI()
+	if cacheErr != nil {
+		log.Printf("WARN: %v — кэш ответов AI переключён на общий инстанс (A17/F-43)", cacheErr)
+		cacheRd, cacheShared = rd, true
+	}
+	if cacheRd != rd {
+		defer func() { _ = cacheRd.Close() }()
+	} else if cacheShared {
+		log.Printf("WARN: REDIS_AI_ADDR не задан — кэш ответов AI живёт на инстансе ключей лимитов и сессий; задайте REDIS_AI_ADDR (A17/F-43)")
+	}
+
 	sp := spreads.New(pg, rd)
 	au := auth.New(pg, rd)
 	en := entitlements.New(pg, rd)
-	gw := ai.New(pg, rd)
+	gw := ai.NewWithCache(pg, rd, cacheRd)
 	rf := referral.New(pg, en)
 	rd_ := readings.New(pg, en, gw, rf)
 	mv := me.New(pg, rd)
 	py := payments.New(pg, mv)
 	pu := push.New(pg)
 	dy := diary.New(pg)
-
 	// worker дописывания pending_fallback (см. ai/worker.go, T12/T13)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	shutdownSignalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
-	gw.StartWorker(workerCtx, pg, 30*time.Second)
+	// Тик воркера настраивается (AI_WORKER_TICK_SECONDS, по умолчанию 2 с) —
+	// раньше здесь стояло жёсткое 30*time.Second вместе с batch=1, и вместе они
+	// давали потолок 2.00 readings/min: одно чтение за 30 секунд (A15/F-06).
+	gw.StartWorker(workerCtx, pg, ai.WorkerTick())
 	// тик протухания pending-платежей 15м (см. T29)
 	go func() {
 		defer apierr.Recover() // S06
@@ -103,6 +124,32 @@ func main() {
 					ctx, cancel := context.WithTimeout(workerCtx, 30*time.Second)
 					defer cancel()
 					_, _ = py.ExpirePending(ctx)
+				}()
+			}
+		}
+	}()
+	// Reconciler рефералки. Хук CompleteOnFirstReading — горутина с таймаутом,
+	// поэтому рестарт/деплой оставлял referrals.status='pending' навсегда, а
+	// referee_id UNIQUE не давал применить код заново: бонус терялся безвозвратно.
+	// Этот проход — единственный путь возврата таких строк в оборот.
+	go func() {
+		defer apierr.Recover() // S06
+		t := time.NewTicker(referralReconcileTick)
+		defer t.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-t.C:
+				func() {
+					defer apierr.Recover() // S06
+					ctx, cancel := context.WithTimeout(workerCtx, 60*time.Second)
+					defer cancel()
+					if n, err := rf.ReconcilePending(ctx); err != nil {
+						log.Printf("WARN: reconciler рефералки: %v", err)
+					} else if n > 0 {
+						log.Printf("reconciler рефералки: завершено %d", n)
+					}
 				}()
 			}
 		}
@@ -139,6 +186,7 @@ func main() {
 	r.Post("/v1/auth/telegram", au.HandleTelegram)
 	r.Post("/v1/auth/anon", au.HandleAnon)
 	r.With(au.RequireAuth).Post("/v1/auth/link", au.HandleLink)
+	r.With(au.RequireAuth).Post("/v1/auth/handoff", au.HandleHandoff) // перенос покупки в TG (за флагом)
 	r.With(au.RequireAuth).Post("/v1/auth/refresh", au.HandleRefresh)
 	r.With(au.RequireAuth).Post("/v1/auth/logout", au.HandleLogout)
 	r.Get("/v1/spreads", sp.HandleList)
@@ -154,6 +202,7 @@ func main() {
 	r.Get("/v1/share/{token}", rd_.HandleGetShare) // публично, превью без толкования
 	r.With(au.RequireAuth).Get("/v1/referral/me", rf.HandleMe)
 	r.With(au.RequireAuth).Post("/v1/referral/apply", rf.HandleApply)
+	r.With(au.RequireAuth).Get("/v1/me", mv.HandleGet) // личность сессии: user_id, tg-привязка, has_payment
 	r.With(au.RequireAuth).Delete("/v1/me", mv.HandleDelete)
 	r.With(au.RequireAuth).Post("/v1/me/age", mv.HandleAge)
 	r.With(au.RequireAuth).Post("/v1/payments/stars/invoice", py.HandleInvoice)
@@ -167,7 +216,6 @@ func main() {
 	r.With(au.RequireAuth).Post("/v1/push/prefs", pu.HandleSetPrefs)
 	r.With(au.RequireAuth).Post("/v1/diary", dy.HandleCreate)
 	r.With(au.RequireAuth).Get("/v1/diary", dy.HandleList)
-	r.With(au.RequireAuth).Post("/v1/diary/export", dy.HandleExport) // POST+CSRF: GET-ссылкой триггерился скачивание (см. аудит B)
 	r.With(au.RequireAuth).Get("/v1/diary/{id}", dy.HandleGet)
 	r.With(au.RequireAuth).Put("/v1/diary/{id}", dy.HandleUpdate)
 	r.With(au.RequireAuth).Delete("/v1/diary/{id}", dy.HandleDelete)

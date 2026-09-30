@@ -47,4 +47,5 @@ export const events = {
   trialStart: "trial_start",
   deleteMe: "delete_me",
   shareDone: "share_done", // U14: шеры (конверсия в регистрации — по рефереру ссылки)
+  referralApplied: "referral_applied", // код применён (дип-линк /r/<code> или вручную)
 } as const;

@@ -18,6 +18,8 @@
 ## Открытые по этой серии
 _Нет — все T01–T30 закрыты. Открытые — в `BACKLOG_GROWTH.md` (U), `BACKLOG_V46.md` (V), `BACKLOG_SEC.md` (повторный аудит — по запросу), `BACKLOG_OWNER.md` (E01–E24, владелец)._
 
+> ⚠️ **Активная серия: `BACKLOG_AUDIT_1217DA4.md` (A01–A57)** — forensic-аудит 2026-09-25 на HEAD `1217da4`, 57 находок (2 CRITICAL · 18 HIGH · 27 MEDIUM · 8 LOW · 2 INFO). Источник — `docs/audit/FINAL-VERDICT-1217DA4.md`. Берём по одной задаче, строго сверху вниз: W0 разблокировать шиппинг (A01–A06) → W1 целостность денег (A07–A14) → W2 ёмкость/кэш (A15–A19) → W3 web-контракты (A20–A30) → W4 инфра/наблюдаемость (A31–A37) → W5 гигиена (A38–A57). Старт с **A01**.
+
 ## Остатки для прода (только с живыми ключами/железом, не код)
 - OPENROUTER_API_KEY → живой AI-тест; TG_BOT_TOKEN + Stars → живой платеж
 - VPS: UFW/ss-check, cron backup, замер FPS на iPhone 12 + Moto G54

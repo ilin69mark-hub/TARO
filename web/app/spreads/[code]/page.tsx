@@ -1,18 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { postReadingSSE, api, Spread } from "@/lib/api";
 import { ensureAuth } from "@/lib/auth";
 import { track, events } from "@/lib/analytics";
 import { bumpReadingCount } from "@/components/PWA";
 import PaywallSheet, { Plan } from "@/components/PaywallSheet";
+import DrawMagic from "@/components/DrawMagic";
 
-// Экран расклада: вопрос → SSE-стрим → результат (см. 02-functional/03, T16).
+// Экран расклада: вопрос → «магия» → сразу страница с картами (см. 02-functional/03, T16).
 // 3D и анимации вытягивания — T21–T28; здесь Lite-флоу ≤3 клика.
 export default function SpreadDetail() {
   const params = useParams<{ code: string }>();
+  const router = useRouter();
   const code = params.code;
   const [question, setQuestion] = useState("");
   const [text, setText] = useState("");
@@ -26,6 +28,15 @@ export default function SpreadDetail() {
   // Новый ключ — только явным сбросом (newAttempt после успеха/провала с paywall).
   const [attemptKey, setAttemptKey] = useState("");
   const [spreadName, setSpreadName] = useState(code);
+  const [jumped, setJumped] = useState(false);
+
+  // Переход на карты: id получен — идём. Повторный вызов (финальный кадр
+  // дублирует id) блокируем флагом, иначе router.push дёрнется дважды.
+  function jumpToReading(id: string) {
+    if (jumped || !id) return;
+    setJumped(true);
+    router.push(`/reading/${id}`);
+  }
 
   useEffect(() => {
     track(events.spreadOpen, { spread_code: code });
@@ -61,11 +72,16 @@ export default function SpreadDetail() {
       // retry тем же ключом (идемпотентность сервера), новая попытка — новым
       const key = isRetry && attemptKey ? attemptKey : crypto.randomUUID();
       setAttemptKey(key);
+      // id приходит первым кадром: переходим на страницу с картами сразу,
+      // не дожидаясь генерации толкования (владелец: «сразу переходить»).
+      // Если id не придёт (старый кэш API, JSON-ответ) — останемся здесь.
       const res = await postReadingSSE(
         { spread_code: code, question: question || undefined, idempotency_key: key },
-        (t) => setText((prev) => prev + t)
+        (t) => setText((prev) => prev + t),
+        (id) => jumpToReading(id)
       );
       setReadingId(res.reading_id);
+      if (!res.reading_id) setError("Расклад не создался. Попробуй ещё раз.");
       setAttemptKey(""); // успех — ключ отработан
       bumpReadingCount(); // install-промпт после 2-го (см. T19)
     } catch (e: unknown) {
@@ -81,10 +97,15 @@ export default function SpreadDetail() {
 
   return (
     <main className="mx-auto max-w-md px-4 pt-8">
-      <Link href="/spreads" className="text-sm text-mist">
-        ← Все расклады
+      {/* «Все расклады» — на прежнем месте (слева вверху), но теперь это
+      заметная кнопка, а не безымянная ссылка. */}
+      <Link
+        href="/spreads"
+        className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-card/60 px-4 py-2 text-sm text-mist backdrop-blur-xl"
+      >
+        <span aria-hidden="true">←</span> Все расклады
       </Link>
-      <h1 className="mt-2 text-3xl font-semibold text-paper">{spreadName}</h1>
+      <h1 className="mt-4 text-center text-3xl font-semibold text-paper">{spreadName}</h1>
       <label htmlFor="reading-question" className="mt-6 block text-sm text-mist">
         Твой вопрос
       </label>
@@ -107,6 +128,11 @@ export default function SpreadDetail() {
         {busy ? "Тянем карты…" : "Вытянуть карты"}
       </button>
       {paywall && <PaywallSheet plans={plans} abPrice={abPrice} onClose={() => setPaywall(false)} />}
+      {/* Оверлей живёт ровно пока идёт запрос: busy гаснет в finally на любом
+          исходе. Раньше magic ставился в true по клику и не сбрасывался —
+          при 402 пейволл открывался ПОД залипшим затемнением, и страница
+          выглядела замороженной. */}
+      {busy && !jumped && !paywall && <DrawMagic />}
       {error && (
         <>
           <p role="alert" className="mt-6 text-base text-mist">
@@ -125,11 +151,15 @@ export default function SpreadDetail() {
           )}
         </>
       )}
+      {/* Фолбэк: толкование стримится сюда только если id не пришёл и переход
+          не состоялся (старый кэш API, JSON-ответ). При обычном ходе сюда
+          не успевают — пользователь уже на странице с картами. */}
       {text && (
         <div
           aria-live="polite"
           className="mt-6 rounded-2xl border border-white/10 bg-card/60 p-5 backdrop-blur-xl"
-        >  <p className="whitespace-pre-wrap text-base leading-relaxed text-paper">{text}</p>
+        >
+          <p className="whitespace-pre-wrap text-base leading-relaxed text-paper">{text}</p>
           {readingId && (
             <Link href={`/reading/${readingId}`} className="mt-3 inline-block text-sm text-gold">
               Открыть расклад →

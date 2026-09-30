@@ -557,6 +557,15 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
+	// Расклад и карты к этому моменту УЖЕ созданы (prepareReading), а толкование
+	// ещё только генерируется. Отдаём id первым же кадром, чтобы веб мог сразу
+	// открыть страницу с картами и не держать пользователя на пустом экране.
+	// Итоговый кадр done с reading_id+status по контракту остаётся последним.
+	fl, _ := w.(http.Flusher)
+	fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"reading_id": id, "status": "pending"}))
+	if fl != nil {
+		fl.Flush()
+	}
 	if !complete {
 		persistCtx, persistCancel := independentPersistenceContext()
 		s.persistTerminalFallback(persistCtx, id, s.fallbackText(persistCtx, spreadCode, cards))
@@ -565,7 +574,6 @@ func (s *Service) streamLive(w http.ResponseWriter, r *http.Request, id, spreadC
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"done": true, "reading_id": id, "status": "done"}))
 		return
 	}
-	fl, _ := w.(http.Flusher)
 	ch := make(chan string, 256)
 	type res struct {
 		text  string
@@ -843,17 +851,25 @@ func (s *Service) streamReading(w http.ResponseWriter, r *http.Request, uid, id 
 		text = ai.SafeReplacement
 		status = "filtered"
 	}
-	if strings.TrimSpace(text) == "" && (status == "pending" || status == "pending_fallback") {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("X-Accel-Buffering", "no")
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"pending": true, "reading_id": id, "status": status}))
-		return
-	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	// Ранний кадр с id — как в streamLive. Сюда веб попадает, когда AI-шлюз
+	// выключен (стенд, часть деплоев): без него переход на страницу с картами
+	// ждал бы конца стрима. Флаг pending сохраняем — по нему клиент (и тесты)
+	// отличают «толкование ещё не готово» от готового расклада.
+	early := map[string]any{"reading_id": id, "status": "pending"}
+	if isPendingStatus(status) {
+		early["pending"] = true
+	}
+	fmt.Fprintf(w, "data: %s\n\n", mustJSON(early))
+	if fl != nil {
+		fl.Flush()
+	}
+	if strings.TrimSpace(text) == "" && isPendingStatus(status) {
+		return
+	}
 	for _, word := range strings.Split(text, " ") {
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]string{"token": word + " "}))
 		if fl != nil {
@@ -861,6 +877,12 @@ func (s *Service) streamReading(w http.ResponseWriter, r *http.Request, uid, id 
 		}
 	}
 	fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"done": true, "reading_id": id, "status": status}))
+}
+
+// isPendingStatus — толкование ещё не готово. Значение повторялось в нескольких
+// местах; при расхождении ветвей клиент получал неожиданный кадр.
+func isPendingStatus(status string) bool {
+	return status == "pending" || status == "pending_fallback"
 }
 
 func mustJSON(v any) string {
@@ -917,6 +939,34 @@ func (s *Service) writePaywall(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleList — GET /v1/readings?limit&offset&q (q только premium, иначе 403).
+const (
+	// historyPreviewRunes — длина превью в истории (символы, не байты).
+	historyPreviewRunes = 160
+	// historyPreviewFetchRunes — сколько символов толкования просит база. ×4 от
+	// превью: запас нужен защитной проверке стоп-слов и безопасной обрезке по
+	// границе руны (A19/F-48).
+	historyPreviewFetchRunes = historyPreviewRunes * 4
+)
+
+// truncateRunes режет строку по границе символа. Прежняя обрезка `s[:160]`
+// резала по БАЙТАМ и могла разорвать многобайтовый UTF-8 символ (кириллица —
+// 2 байта): клиент получал в конце превью битый символ, который json кодировал
+// как U+FFFD. PostgreSQL `left()`, кстати, тоже режет по символам — то есть
+// границы расходились в обе стороны.
+func truncateRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	count := 0
+	for i := range s {
+		if count == limit {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
 func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
 	ctx := r.Context()
@@ -949,12 +999,21 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A19/F-48: превью в истории — это 160 символов, а запрос тянул
+	// left(interpretation, 131073) СИМВОЛОВ на строку. Замер на 50 строках
+	// (потолок limit) с толкованиями по 128 КБ: 8 100 000 байт из PostgreSQL
+	// против 56 500 байт у нового выражения — перебор 143x ради ~8 КБ ответа.
+	//
+	// Запас ×4 (не ровно 160) нужен для двух вещей: проверка стоп-слов идёт по
+	// привезённому окну, и резать превью надо по границе руны, а не байта.
+	// Модерация при этом НЕ слабеет: стоп-слова отсекаются на записи
+	// (ai.Stream → SafeReplacement), здесь проверка защитная.
 	rows, err := s.pg.Query(ctx, `
 		SELECT id, spread_code, question,
 		       CASE WHEN quota_state='allowed' THEN COALESCE(left(interpretation, $5), '') ELSE '' END,
 		       created_at
 		  FROM readings WHERE user_id=$1 AND status NOT IN ('cancelled','failed') AND ($3='' OR question ILIKE '%'||$3||'%' ESCAPE '\\')
-		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, q, offset, ai.MaxOutputBytes+1)
+		 ORDER BY created_at DESC LIMIT $2 OFFSET $4`, uid, limit, q, offset, historyPreviewFetchRunes)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось загрузить историю")
 		return
@@ -984,9 +1043,7 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 		if ai.ContainsStopWords(it.Preview) {
 			it.Preview = ai.SafeReplacement
 		}
-		if len(it.Preview) > 160 {
-			it.Preview = it.Preview[:160]
-		}
+		it.Preview = truncateRunes(it.Preview, historyPreviewRunes)
 		it.CreatedAt = ts.Format(time.RFC3339)
 		out = append(out, it)
 	}
@@ -1002,12 +1059,17 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	var spread, question, interp, status, quotaState string
 	var cards json.RawMessage
 	var created time.Time
+	// A12/F-12: причина терминального провала отдаётся клиенту, чтобы UI мог
+	// объяснить провал и предложить бесплатный ретрай (слот уже возвращён).
+	var failureReason *string
+	var failedAt *time.Time
 	// Аудит B: владелец фильтруется в SQL, чужая строка не читается вообще.
 	err := s.pg.QueryRow(ctx, `
 		SELECT spread_code, question, cards,
 		       CASE WHEN quota_state='allowed' THEN COALESCE(left(interpretation, $3), '') ELSE '' END,
-		       status, quota_state, created_at
-		  FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(&spread, &question, &cards, &interp, &status, &quotaState, &created)
+		       status, quota_state, created_at, failure_reason, failed_at
+		  FROM readings WHERE id=$1 AND user_id=$2`, id, uid, ai.MaxOutputBytes+1).Scan(
+		&spread, &question, &cards, &interp, &status, &quotaState, &created, &failureReason, &failedAt)
 	if err != nil {
 		apierr.Write(w, http.StatusNotFound, apierr.CodeNotFound, "Расклад не найден")
 		return
@@ -1030,16 +1092,30 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 		`SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id=$1 AND status='active' AND valid_until > now())`,
 		uid).Scan(&premium)
 	locked := false
-	if !premium && !sameMSKDay(created, time.Now()) {
+	if !premium && !SameMSKDay(created, time.Now()) {
 		interp = ""
 		locked = true
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	payload := map[string]any{
 		"id": id, "spread": spread, "question": question, "cards": cards,
 		"interpretation": interp, "locked": locked, "status": status,
 		"created_at": created.Format(time.RFC3339),
-	})
+	}
+	// A12/F-12: поля появляются только у терминально упавшего чтения, чтобы не
+	// менять контракт для успешных.
+	if status == "failed" {
+		reason := ""
+		if failureReason != nil {
+			reason = *failureReason
+		}
+		payload["failure_reason"] = reason
+		if failedAt != nil {
+			payload["failed_at"] = failedAt.Format(time.RFC3339)
+		}
+		payload["retry_free"] = true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // enrichCards добавляет name_ru к каждой карте (N≤10, точечные SELECT).
@@ -1126,7 +1202,11 @@ func msk() *time.Location {
 }
 
 // sameMSKDay — один ли календарный день МСК.
-func sameMSKDay(a, b time.Time) bool {
+// SameMSKDay — один календарный день по Москве. Экспортировано для дневника:
+// снимок расклада в записи обязан блокироваться по ТОЙ ЖЕ логике, что и
+// GET /v1/readings, иначе дневник станет обходом подписки. Дублировать правило
+// нельзя — разъедутся при первом же изменении условий доступа.
+func SameMSKDay(a, b time.Time) bool {
 	msk, _ := time.LoadLocation("Europe/Moscow")
 	if msk == nil {
 		msk = time.FixedZone("MSK", 3*3600)

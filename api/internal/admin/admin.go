@@ -352,15 +352,16 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	writeAdminCookie(w, tok, int(AdminTTL.Seconds()))
+	writeAdminCookie(w, r, tok, int(AdminTTL.Seconds()))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-func writeAdminCookie(w http.ResponseWriter, token string, maxAge int) {
+func writeAdminCookie(w http.ResponseWriter, r *http.Request, token string, maxAge int) {
+	secure, _ := auth.CookieFlags(r)
 	http.SetCookie(w, &http.Cookie{
 		Name: AdminCookie, Value: token, Path: "/", MaxAge: maxAge,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -389,7 +390,7 @@ func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	writeAdminCookie(w, "", -1)
+	writeAdminCookie(w, r, "", -1)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -690,7 +691,7 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 		}
 		return true
 	case "referral":
-		m, ok := configObject(v, "enabled", "bonus_days", "monthly_cap")
+		m, ok := configObject(v, "enabled", "bonus_days", "monthly_cap", "lifetime_cap_days", "antifarm_fp", "antifarm_ip", "fingerprint_cluster_limit", "ip_cluster_limit")
 		if !ok {
 			return false
 		}
@@ -701,6 +702,24 @@ func validateConfigValue(k string, v json.RawMessage) bool {
 			return false
 		}
 		if value, exists := m["monthly_cap"]; exists && !configInt(value, 1, 10000) {
+			return false
+		}
+		// 0 = без потолка (осознанный выбор владельца, а не «забыли»).
+		if value, exists := m["lifetime_cap_days"]; exists && !configInt(value, 0, 100000) {
+			return false
+		}
+		if value, exists := m["antifarm_fp"]; exists && !configBool(value) {
+			return false
+		}
+		if value, exists := m["antifarm_ip"]; exists && !configBool(value) {
+			return false
+		}
+		// 0 = отключить кластерную проверку. Порог по fingerprint: сколько
+		// аккаунтов могут делить один браузер (семья за ноутбуком проходит).
+		if value, exists := m["fingerprint_cluster_limit"]; exists && !configInt(value, 0, 1000) {
+			return false
+		}
+		if value, exists := m["ip_cluster_limit"]; exists && !configInt(value, 0, 10000) {
 			return false
 		}
 		return true

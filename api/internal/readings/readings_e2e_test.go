@@ -31,6 +31,12 @@ func testClient(t *testing.T) (func(method, path, body string, headers map[strin
 	ctx, pg, rd := testutil.Live(t)
 	en := entitlements.New(pg, rd)
 	gw := ai.New(pg, rd) // без ключа → fallback
+	// Изоляция пакета: уникальная модель на тест. Модель входит и в ключ
+	// AI-кэша, и в ключ breaker'а, поэтому тест получает холодный кэш и не видит
+	// чужих отказов провайдера (F-18.3: тесты делили состояние с пакетом ai, и
+	// открытый кем-то breaker ронял «живые» SSE-тесты на 5 минут).
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
 	rf := referral.New(pg, en)
 	svc := New(pg, en, gw, rf)
 	au := auth.New(pg, rd)
@@ -131,8 +137,8 @@ func TestE2ECrisisNoConsume(t *testing.T) {
 
 func TestE2ESSEReplay(t *testing.T) {
 	do, _ := testClient(t)
-	rec := do("POST", "/v1/readings", `{"spread_code":"daily"}`,
-		map[string]string{"Idempotency-Key": "sse-1", "Accept": "text/event-stream"})
+	rec := do("POST", "/v1/readings", `{"spread_code":"daily","question":"`+uniqQuestion(t)+`"}`,
+		map[string]string{"Idempotency-Key": "sse-" + uniqQuestion(t), "Accept": "text/event-stream"})
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, `"done":true`) || !strings.Contains(body, "data:") {
 		t.Fatalf("SSE broken: %d %q", rec.Code, body[:min(120, len(body))])
@@ -152,11 +158,16 @@ func TestE2EStreamLive(t *testing.T) {
 	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
 	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
 	do, _ := testClient(t)
-	rec := do("POST", "/v1/readings", `{"spread_code":"daily"}`,
-		map[string]string{"Idempotency-Key": "live-1", "Accept": "text/event-stream"})
+	rec := do("POST", "/v1/readings", `{"spread_code":"daily","question":"`+uniqQuestion(t)+`"}`,
+		map[string]string{"Idempotency-Key": "live-" + uniqQuestion(t), "Accept": "text/event-stream"})
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, "Живой") || !strings.Contains(body, `"done":true`) {
-		t.Fatalf("live SSE: %d %q", rec.Code, body[:min(160, len(body))])
+		ctx2, pg2, _ := testutil.Live(t)
+		var lastErr *string
+		_ = pg2.QueryRow(ctx2, `SELECT last_error FROM ai_logs WHERE reading_id=(
+			SELECT id FROM readings WHERE id::text = $1) ORDER BY created_at DESC LIMIT 1`,
+			extractReadingID(body)).Scan(&lastErr)
+		t.Fatalf("live SSE: %d %q ai_log_err=%v", rec.Code, body[:min(160, len(body))], lastErr)
 	}
 }
 
@@ -170,14 +181,18 @@ func TestE2ETruncatedProviderIsNotPersistedDone(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("OPENROUTER_BASE_URL", srv.URL)
 	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	cards := draw(17, 1)
 	cardsJSON, _ := json.Marshal(cards)
 	var id string
 	if err := pg.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state, worker_lease_until)
-		VALUES ($1,'daily','',$2,1,'pending','','allowed',now()+interval '2 minutes') RETURNING id`, uid, cardsJSON).Scan(&id); err != nil {
+		VALUES ($1,'daily',$3,$2,1,'pending','','allowed',now()+interval '2 minutes') RETURNING id`,
+		uid, cardsJSON, "truncated-"+uniqQuestion(t)).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/readings", nil)
@@ -217,6 +232,8 @@ func TestE2EStreamCancellationPersistsFallback(t *testing.T) {
 	t.Setenv("OPENROUTER_ALLOW_CUSTOM_BASE", "1")
 	en := entitlements.New(pg, rd)
 	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
 	svc := New(pg, en, gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	question := fmt.Sprintf("cancel-%d", time.Now().UnixNano())
@@ -225,7 +242,7 @@ func TestE2EStreamCancellationPersistsFallback(t *testing.T) {
 	var id string
 	if err := pg.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state, worker_lease_until)
-		VALUES ($1,'daily','',$2,1,'pending','','allowed',now()+interval '2 minutes') RETURNING id`, uid, cardsJSON).Scan(&id); err != nil {
+		VALUES ($1,'daily',$3,$2,1,'pending','','allowed',now()+interval '2 minutes') RETURNING id`, uid, cardsJSON, question).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/readings", nil)
@@ -303,7 +320,10 @@ func TestE2EPrepareReadingWithMaxConnsOne(t *testing.T) {
 	}
 	t.Cleanup(pg.Close)
 	uid := testutil.NewUser(t, ctx, pg)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	req := httptest.NewRequest(http.MethodPost, "/v1/readings", nil)
 	rec := httptest.NewRecorder()
 	id, _, _, ok := svc.prepareReading(rec, req, uid, "max-one", createRequest{SpreadCode: "daily", Question: "one connection"})
@@ -321,7 +341,10 @@ func TestE2EPrepareReadingWithMaxConnsOne(t *testing.T) {
 
 func TestE2EFailedSingleReadingRetryReusesEntitlement(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	for _, status := range []string{"failed", "cancelled"} {
 		t.Run(status, func(t *testing.T) {
 			uid := testutil.NewUser(t, ctx, pg)
@@ -397,7 +420,10 @@ func TestE2EFailedSingleReadingRetryReusesEntitlement(t *testing.T) {
 
 func TestE2EWorkerFailureRetryKeepsFreeReceipt(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	key := "free-worker-retry"
 	req := httptest.NewRequest(http.MethodPost, "/v1/readings", nil)
@@ -428,7 +454,10 @@ func TestE2EWorkerFailureRetryKeepsFreeReceipt(t *testing.T) {
 
 func TestE2EAuthorizeReadingErrorMarksUncheckedFailed(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	var paymentID string
 	if err := pg.QueryRow(ctx, `
@@ -475,7 +504,10 @@ func TestE2EAuthorizeReadingErrorMarksUncheckedFailed(t *testing.T) {
 
 func TestE2EPendingUncheckedReadingDoesNotReturnAccepted(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	cardsJSON, _ := json.Marshal(draw(31, 1))
 	var readingID string
@@ -495,7 +527,10 @@ func TestE2EPendingUncheckedReadingDoesNotReturnAccepted(t *testing.T) {
 
 func TestE2EAiInputsRejectsIncompleteContext(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	cards := draw(11, 1)
 	if _, _, _, complete := svc.aiInputsChecked(ctx, "daily", cards); !complete {
 		t.Fatal("complete context rejected")
@@ -522,7 +557,10 @@ func TestE2ECrisisObfuscationDoesNotConsume(t *testing.T) {
 
 func TestE2ETerminalRetryRejectsChangedQuestion(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	cardsJSON, _ := json.Marshal(draw(41, 1))
 	var readingID string
@@ -578,7 +616,10 @@ func TestE2ETerminalQuotaGuardRejectsMixedWorkerUpdate(t *testing.T) {
 
 func TestE2EChangedSpreadRetryUsesStoredCards(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	var oldPositions json.RawMessage
 	var oldActive bool
@@ -645,12 +686,19 @@ func TestE2ESameKeyConcurrentRequestsGenerateOnce(t *testing.T) {
 	if err := rd.Set(ctx, "sess:"+uid, "x", auth.UserTTL).Err(); err != nil {
 		t.Fatal(err)
 	}
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	r := chi.NewRouter()
 	r.With(au.RequireAuth).Post("/v1/readings", svc.HandleCreate)
 
 	const workers = 4
 	key := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
+	// Один и тот же вопрос на всех воркеров (иначе это не проверка идемпотентности,
+	// а 4 разных запроса: сервер вернёт 409 IDEMPOTENCY_CONFLICT) и уникальный на
+	// прогон (иначе -count=2 попадёт в кэш и провайдер не будет вызван вовсе).
+	question := uniqQuestion(t)
 	start := make(chan struct{})
 	codes := make([]int, workers)
 	ids := make([]string, workers)
@@ -661,7 +709,7 @@ func TestE2ESameKeyConcurrentRequestsGenerateOnce(t *testing.T) {
 			defer wg.Done()
 			<-start
 			req := httptest.NewRequest(http.MethodPost, "/v1/readings",
-				strings.NewReader(`{"spread_code":"daily","question":"барьер"}`))
+				strings.NewReader(`{"spread_code":"daily","question":"`+question+`"}`))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Idempotency-Key", key)
 			req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: tok})
@@ -696,6 +744,12 @@ func TestE2ESameKeyConcurrentRequestsGenerateOnce(t *testing.T) {
 	if err := pg.QueryRow(ctx, `SELECT free_used_today FROM entitlements WHERE user_id=$1`, uid).Scan(&used); err != nil {
 		t.Fatal(err)
 	}
+	// Генерация асинхронна: ждём терминального статуса, иначе проверка
+	// provider_calls — гонка (тест проходил только на холодном кэше).
+	status, interpretation = waitTerminal(t, ctx, pg, storedID)
+	if interpretation == "" {
+		t.Fatalf("reading must end with an interpretation, status=%s", status)
+	}
 	if readings != 1 || receipts != 1 || used != 1 || calls.Load() != 1 {
 		t.Fatalf("readings=%d receipts=%d used=%d provider_calls=%d", readings, receipts, used, calls.Load())
 	}
@@ -724,7 +778,10 @@ func TestE2EGenerateInactiveSpreadPersistsTerminalFallback(t *testing.T) {
 	if _, err := pg.Exec(ctx, `UPDATE spreads SET is_active=false WHERE code='newyear'`); err != nil {
 		t.Fatal(err)
 	}
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	cards := draw(77, 5)
 	cardsJSON, _ := json.Marshal(cards)
@@ -746,7 +803,10 @@ func TestE2EGenerateInactiveSpreadPersistsTerminalFallback(t *testing.T) {
 
 func TestE2ERefundedSingleEntitlementReplayIsPaywall(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	uid := testutil.NewUser(t, ctx, pg)
 	var paymentID string
 	if err := pg.QueryRow(ctx, `
@@ -814,7 +874,10 @@ func TestE2EPendingUncheckedReplayDoesNotGenerate(t *testing.T) {
 	if err := rd.Set(ctx, "sess:"+uid, "x", auth.UserTTL).Err(); err != nil {
 		t.Fatal(err)
 	}
-	svc := New(pg, entitlements.New(pg, rd), ai.New(pg, rd), nil)
+	gw := ai.New(pg, rd)
+	model := "test/readings-" + testutil.UUID(t)
+	gw.SetConfigOverride(&ai.Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000})
+	svc := New(pg, entitlements.New(pg, rd), gw, nil)
 	r := chi.NewRouter()
 	r.With(au.RequireAuth).Post("/v1/readings", svc.HandleCreate)
 
@@ -869,4 +932,50 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// uniqQuestion — уникальный вопрос на каждый вызов теста. В question входит
+// promptHash, а значит и ключ AI-кэша: такой вопрос даёт ХОЛОДНЫЙ провайдер
+// без затирания чужого состояния. Раньше ради этого тесты вытирали весь «ai:*»
+// через SCAN+DEL и ломали соседние пакеты (F-18.3); с -count=2 общий кэш вообще
+// делал «живой» стрим без вызова провайдера.
+func uniqQuestion(t *testing.T) string {
+	t.Helper()
+	return "q-" + testutil.UUID(t)
+}
+
+// waitTerminal ждёт, пока чтение перестанет быть pending. Генерация идёт
+// асинхронно, поэтому проверять счётчик вызовов провайдера сразу после ответа
+// — гонка: раньше тест проходил только потому, что кэш был холодный и попадал в
+// узкое окно (F-18: тест написан на реализацию, а не на инвариант).
+func waitTerminal(t *testing.T, ctx context.Context, pg *pgxpool.Pool, id string) (string, string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var status, interpretation string
+		if err := pg.QueryRow(ctx, `SELECT status, interpretation FROM readings WHERE id=$1`, id).
+			Scan(&status, &interpretation); err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" && status != "pending_fallback" {
+			return status, interpretation
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reading %s stuck in %s", id, status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func extractReadingID(sseBody string) string {
+	for _, part := range strings.Split(sseBody, "\n\n") {
+		var payload map[string]any
+		if strings.HasPrefix(strings.TrimSpace(part), "data:") &&
+			json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "data:"))), &payload) == nil {
+			if id, ok := payload["reading_id"].(string); ok {
+				return id
+			}
+		}
+	}
+	return ""
 }

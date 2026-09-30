@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useScrollLock } from "@/lib/useScrollLock";
 
 // E11-режим «честный»: 18+ enforced только на оплате (сервер, age_confirmed_at).
 // Эта модалка — НЕ гейт и НЕ проверка возраста, а разовое напоминание (см. OWNER E11).
@@ -24,6 +25,9 @@ export default function AgeGate() {
     }
     setShow(false);
   }
+
+  // Хук до раннего return: иначе порядок хуков ломается между рендерами.
+  useScrollLock(show);
 
   if (!show) return null;
   return (

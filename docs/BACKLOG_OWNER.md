@@ -24,7 +24,7 @@
 
 ## E4 — Контент и юрлица
 - [ ] E13 22 арта вручную (батчи по 10, брак-чеклист) + домасть 78 — связь: `05-design/08`
-- [ ] E14 Лицензия commercial use — владелец вписывает: см. `docs/OWNER_TODO.md` (2 маркера `/// ⛔`) — связь: `05-design/08`
+- [x] E14 Лицензия commercial use — ✅ 2026-09-28: ChatGPT (OpenAI), тариф ChatGPT Go, commercial use по Terms of Use effective 2026-01-01 («you own the Output»), 2 маркера `/// ⛔` сняты. Открыто: маркировка ИИ по 420-ФЗ ст. 13 — связь: `05-design/08`
 - [ ] E15 Оферта + privacy: тексты и 2 ссылки в футер до запуска 50 друзей — связь: `08-risks/02`
 - [ ] E16 Crisis-номер УБРАН из кода — владелец вписывает сам: см. `docs/OWNER_TODO.md` (3 маркера `/// ⛔`) — связь: `08-risks/02`
 - [ ] E17 Вычитка дисклеймеров 18+ везде — связь: `08-risks/02`
@@ -49,3 +49,11 @@
 - [x] D5 UI-мелочи + a11y — done: префиксы убраны, цена онбординга из plans, spread name, aria-labels, focus-gold, aria-live/alert, Escape в модалках; e2e имя на странице
 - [x] D6 шрифты + иконки + Stars-кнопка — done: next/font Cormorant+Inter cyrillic self-host, SVG-иконки таб-бара, pay() через прокси (TG openInvoice/новая вкладка); e2e invoice-proxy 403-gate, иконки и font-display в HTML
 - [x] D7 хореография — done: Fan stagger .08 из колоды, letterbox 1.2с skippable, CA-flip 300мс на картах, maath-damp камера (Arrival→Reading топ-даун), gyro-gate (fine 0.03/touch 0.01, без пермишна), лестница гарда 1→2→3 + Lite, FM-spring paywall, lenis-лендинг; e2e home 200, ca-flip в HTML
+- [ ] D8 `ip_cluster_limit` рефералки — **решить, включать ли (пока 0 = выкл)**. Правки антифермы закрыты (миграции 037/038/039, `docs/project-book/02-functional/06-referral.md`): парные проверки fingerprint/IP + кластер fingerprint (`fingerprint_cluster_limit=3`, дефолт выбран мной — тоже стоит подтвердить). Остался один осознанно нерешённый размен:
+  - **За включение:** ловит ферму «чужой код + 10 tg-аккаунтов с одного IP с чистыми fingerprint'ами». Red-team: без порога 10/10 completions, с `ip_cluster_limit=4` → 3/10.
+  - **Против:** CGNAT мобильных операторов сажает десятки честных пользователей за один адрес.
+  - ⛔ **Блокер, найденный при рестарте:** `antifarm_ip` и `ip_cluster_limit` нельзя включать **до настройки real_ip в nginx**. В `deploy/nginx.conf` нет `set_real_ip_from`, IP берётся из `$remote_addr`. Стоит поставить Cloudflare (E04) — `$remote_addr` станет edge-IP Cloudflare, одинаковым для всех, и проверка по IP начнёт отклонять почти все легитимные рефералки. Поэтому миграция 039 выключает `antifarm_ip` по умолчанию. **Шаги:** (1) `set_real_ip_from` со списком диапазонов Cloudflare + `real_ip_header CF-Connecting-IP` в `deploy/nginx.conf` и `nginx-tls.conf`; (2) проверить, что `X-Real-IP` = реальный адрес клиента; (3) тогда включать `antifarm_ip=true` и подбирать `ip_cluster_limit`.
+  - **Метрика для решения:** `SELECT count(*), count(DISTINCT referee_ip) FROM referrals WHERE status='completed' AND created_at > now() - interval '7 days'` — если max по нормальным дням ≤3, порог 5 безопасен. Связь: `02-functional/06`
+- [ ] D9 **real_ip в nginx (блокер для IP-лимитов и антифермы)** — тот же корень, что D8, но шире и независим от рефералки. Тот же `$remote_addr` попадает в ключ `ratelimit` для `byUser=false` (`/v1/auth/`, `/v1/spreads`, `/v1/share`): без Cloudflare все анонимные посетители делят **один** бакет (60/мин на всех), с Cloudflare — IP станет edge-адресом. Нужно: `set_real_ip_from` (Cloudflare + свои прокси, если есть) + `real_ip_header` в обоих конфигах. Проверка после — зайти с разных адресов и убедиться, что `/v1/spreads` не отдаёт 429 общим бакетом. Связь: `04-architecture/06`
+- [ ] D10 Подтвердить дефолты `fingerprint_cluster_limit=3` и `lifetime_cap_days=300` — выбраны мной как продуктовый размен, не по требованиям. `fingerprint_cluster_limit` — НЕ граница безопасности (сервер одинаково видит семью за ноутбуком и ферму из одного браузера); настоящие границы ущерба — месячный кэп 30 дней + цена tg-аккаунта. `lifetime_cap_days=300` = 100 рефералов за жизнь. Связь: `02-functional/06`
+

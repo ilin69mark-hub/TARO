@@ -8,3 +8,14 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Рантайм-состояние и бэкапы — вне git. deploy.yml:84 отвергает любой
+# untracked-файл, поэтому бэкап внутри worktree блокирует релиз (A01/F-01).
+backups/
+taro-backups/
+*.sql.gz
+*.sql.gz.gpg
+
+# Кэш инкрементальной сборки TypeScript: меняется при каждой сборке,
+# в историю ему не место (и он уже был закоммичен — пора перестать).
+web/tsconfig.tsbuildinfo

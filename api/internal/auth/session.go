@@ -107,16 +107,19 @@ func (s *Service) sessionMarkerOK(ctx context.Context, claims tokenClaims) (bool
 	return fingerprintsEqual(marker, claims.SID), nil
 }
 
-func ExpireAuthCookies(w http.ResponseWriter) {
+func ExpireAuthCookies(w http.ResponseWriter, r *http.Request) {
+	secure, sameSite := CookieFlags(r)
 	for _, name := range []string{CookieName, FpCookie, "taro_csrf"} {
+		// Флаги удаления обязаны совпадать с флагами постановки, иначе
+		// браузер не сопоставит cookie при очистке и оставит её жить.
 		http.SetCookie(w, &http.Cookie{
 			Name: name, Value: "", Path: "/", MaxAge: -1,
-			HttpOnly: name != "taro_csrf", Secure: true, SameSite: http.SameSiteNoneMode,
+			HttpOnly: name != "taro_csrf", Secure: secure, SameSite: sameSite,
 		})
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "taro_admin", Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -145,7 +148,7 @@ func (s *Service) RequireCSRF(next http.Handler) http.Handler {
 					return
 				}
 				if !ok {
-					ExpireAuthCookies(w)
+					ExpireAuthCookies(w, r)
 					apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 					return
 				}
@@ -155,7 +158,7 @@ func (s *Service) RequireCSRF(next http.Handler) http.Handler {
 					return
 				}
 				if regenerated {
-					setCSRFCookie(w, want)
+					setCSRFCookie(w, r, want)
 				}
 				if r.Header.Get("X-CSRF") == "" || r.Header.Get("X-CSRF") != want {
 					apierr.Write(w, http.StatusForbidden, apierr.CodeForbidden, "Неверный CSRF-токен")
@@ -238,19 +241,20 @@ func (s *Service) csrfForState(ctx context.Context, uid string) (string, bool, e
 }
 
 // issueCSRF выдает токен в читаемую cookie taro_csrf + поле ответа (см. S07).
-func (s *Service) issueCSRF(w http.ResponseWriter, ctx context.Context, uid string) (string, error) {
+func (s *Service) issueCSRF(w http.ResponseWriter, r *http.Request, ctx context.Context, uid string) (string, error) {
 	v, _, err := s.csrfForState(ctx, uid)
 	if err != nil {
 		return "", err
 	}
-	setCSRFCookie(w, v)
+	setCSRFCookie(w, r, v)
 	return v, nil
 }
 
-func setCSRFCookie(w http.ResponseWriter, value string) {
+func setCSRFCookie(w http.ResponseWriter, r *http.Request, value string) {
+	secure, sameSite := CookieFlags(r)
 	http.SetCookie(w, &http.Cookie{
 		Name: "taro_csrf", Value: value, Path: "/", MaxAge: int(UserTTL.Seconds()),
-		Secure: true, SameSite: http.SameSiteNoneMode,
+		Secure: secure, SameSite: sameSite,
 	})
 }
 
@@ -281,7 +285,7 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	uid := UserID(r.Context())
 	claims, ok := sessionClaims(r.Context())
 	if uid == "" || !ok {
-		ExpireAuthCookies(w)
+		ExpireAuthCookies(w, r)
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Нужен вход")
 		return
 	}
@@ -294,7 +298,7 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !ok {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 			return
 		}
@@ -307,7 +311,7 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if err == errSessionRotated {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 			return
 		}
@@ -319,7 +323,7 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.CodeInternal, "Не удалось создать сессию")
 		return
 	}
-	writeCookie(w, tok, UserTTL)
+	writeCookie(w, r, tok, UserTTL)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -336,7 +340,7 @@ func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ExpireAuthCookies(w)
+	ExpireAuthCookies(w, r)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }

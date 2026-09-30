@@ -21,6 +21,14 @@ import (
 
 const testAdminPassword = "correct horse battery staple 2026!"
 
+// anonReqWithIP — запрос с заданным адресом сокета: по нему выводятся ключи
+// лимита входа, поэтому он должен совпадать с тем, что уйдёт в handler.
+func anonReqWithIP(ip string) *http.Request {
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8081/v1/admin/login", nil)
+	req.RemoteAddr = ip + ":4321"
+	return req
+}
+
 func adminSetup(t *testing.T) (*chi.Mux, string, *pgxpool.Pool, string) {
 	t.Helper()
 	t.Setenv("ADMIN_ORIGIN", defaultAdminOrigin)
@@ -32,6 +40,7 @@ func adminSetup(t *testing.T) (*chi.Mux, string, *pgxpool.Pool, string) {
 	r.With(svc.RequireAdmin).Get("/v1/admin/config", svc.HandleGetConfig)
 	r.With(svc.RequireAdmin).Post("/v1/admin/config/publish", svc.HandlePublish)
 	r.With(svc.RequireAdmin).Post("/v1/admin/rotate-seasonal", svc.HandleRotateSeasonal)
+	svc.RegisterAccessRoutes(r) // тот же код, что и в cmd/admin — иначе роуты разъезжаются
 
 	var uid string
 	if err := pg.QueryRow(ctx, `INSERT INTO users (role) VALUES ('admin') RETURNING id`).Scan(&uid); err != nil {
@@ -86,8 +95,15 @@ func adminSetup(t *testing.T) (*chi.Mux, string, *pgxpool.Pool, string) {
 	return r, tok, pg, username
 }
 
-func acallWithHeaders(r *chi.Mux, tok, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+// acallWithHeaders ставит X-Real-IP, если вызывающий его не задал: вход админа
+// ограничен по IP и по username в Redis с окном в минуты, поэтому фиксированный
+// htttest-IP (192.0.2.1) копил попытки по всему пакету и по всем прогонам подряд
+// и возвращал 429 вместо 401 (F-18.4).
+func acallWithHeaders(t *testing.T, r *chi.Mux, tok, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if headers == nil || headers["X-Real-IP"] == "" {
+		req.Header.Set("X-Real-IP", testutil.UniqueIP(t))
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if tok != "" {
 		req.AddCookie(&http.Cookie{Name: AdminCookie, Value: tok})
@@ -100,8 +116,8 @@ func acallWithHeaders(r *chi.Mux, tok, method, path, body string, headers map[st
 	return rec
 }
 
-func acall(r *chi.Mux, tok, method, path, body string) *httptest.ResponseRecorder {
-	return acallWithHeaders(r, tok, method, path, body, nil)
+func acall(t *testing.T, r *chi.Mux, tok, method, path, body string) *httptest.ResponseRecorder {
+	return acallWithHeaders(t, r, tok, method, path, body, nil)
 }
 
 func loginBody(username, password string) string {
@@ -111,13 +127,13 @@ func loginBody(username, password string) string {
 
 func TestE2EAdminAuth(t *testing.T) {
 	r, tok, _, _ := adminSetup(t)
-	if rec := acall(r, "", "GET", "/v1/admin/config", ""); rec.Code != 403 {
+	if rec := acall(t, r, "", "GET", "/v1/admin/config", ""); rec.Code != 403 {
 		t.Fatalf("no cookie: want 403 got %d", rec.Code)
 	}
-	if rec := acall(r, "junk", "GET", "/v1/admin/config", ""); rec.Code != 403 {
+	if rec := acall(t, r, "junk", "GET", "/v1/admin/config", ""); rec.Code != 403 {
 		t.Fatalf("junk token: want 403 got %d", rec.Code)
 	}
-	rec := acall(r, tok, "GET", "/v1/admin/config", "")
+	rec := acall(t, r, tok, "GET", "/v1/admin/config", "")
 	if rec.Code != 200 {
 		t.Fatalf("config: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -134,11 +150,17 @@ func TestE2EAdminAuth(t *testing.T) {
 
 func TestE2EAdminLogin(t *testing.T) {
 	r, _, _, username := adminSetup(t)
-	headers := map[string]string{"X-Real-IP": "198.51.100.41", "Origin": defaultAdminOrigin}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, "wrong-password"), headers); rec.Code != 401 {
+	// X-Real-IP уникален на прогон: /v1/admin/login ограничен по IP, и фиксированный
+	// адрес переживал `go test -count=2` (второй прогон получал 429 вместо 401).
+	headers := map[string]string{
+		"X-Real-IP":         testutil.UniqueIP(t),
+		"Origin":            defaultAdminOrigin,
+		"X-Forwarded-Proto": "https",
+	}
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, "wrong-password"), headers); rec.Code != 401 {
 		t.Fatalf("bad password: want 401 got %d: %s", rec.Code, rec.Body.String())
 	}
-	rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(strings.ToUpper(username), testAdminPassword), headers)
+	rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(strings.ToUpper(username), testAdminPassword), headers)
 	if rec.Code != 200 {
 		t.Fatalf("login: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -148,30 +170,32 @@ func TestE2EAdminLogin(t *testing.T) {
 			adminCookie = cookie
 		}
 	}
+	// Cookie флаг scheme-aware (auth.CookieFlags): на https — Secure обязателен,
+	// на plain http Secure снимается, иначе cookie не сохранится (см. cookie_flags_test.go).
+	// Здесь X-Forwarded-Proto=https, то есть проверяем ПРОД-конфигурацию.
 	if adminCookie == nil || adminCookie.Value == "" || !adminCookie.HttpOnly || !adminCookie.Secure || adminCookie.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("invalid admin cookie: %#v", adminCookie)
 	}
-	cfg := acallWithHeaders(r, adminCookie.Value, "GET", "/v1/admin/config", "", nil)
+	cfg := acallWithHeaders(t, r, adminCookie.Value, "GET", "/v1/admin/config", "", nil)
 	if cfg.Code != 200 {
 		t.Fatalf("authenticated config: %d %s", cfg.Code, cfg.Body.String())
 	}
-	logout := acallWithHeaders(r, adminCookie.Value, "POST", "/v1/admin/logout", `{}`, map[string]string{"Origin": defaultAdminOrigin})
+	logout := acallWithHeaders(t, r, adminCookie.Value, "POST", "/v1/admin/logout", `{}`, map[string]string{"Origin": defaultAdminOrigin})
 	if logout.Code != 200 {
 		t.Fatalf("logout: %d %s", logout.Code, logout.Body.String())
 	}
-	if cfg = acallWithHeaders(r, adminCookie.Value, "GET", "/v1/admin/config", "", nil); cfg.Code != 403 {
+	if cfg = acallWithHeaders(t, r, adminCookie.Value, "GET", "/v1/admin/config", "", nil); cfg.Code != 403 {
 		t.Fatalf("revoked session: want 403 got %d", cfg.Code)
 	}
 }
 
 func TestE2EAdminLogoutLoginRejectsOldToken(t *testing.T) {
 	r, _, _, username := adminSetup(t)
-	n := time.Now().UnixNano()
 	headers := map[string]string{
 		"Origin":    defaultAdminOrigin,
-		"X-Real-IP": fmt.Sprintf("198.18.%d.%d", (n>>8)&0xff, n&0xff),
+		"X-Real-IP": testutil.UniqueIP(t),
 	}
-	first := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), headers)
+	first := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), headers)
 	if first.Code != 200 {
 		t.Fatalf("first login: %d %s", first.Code, first.Body.String())
 	}
@@ -184,10 +208,10 @@ func TestE2EAdminLogoutLoginRejectsOldToken(t *testing.T) {
 	if oldCookie == nil || oldCookie.Value == "" {
 		t.Fatal("first admin cookie missing")
 	}
-	if rec := acallWithHeaders(r, oldCookie.Value, "POST", "/v1/admin/logout", `{}`, headers); rec.Code != 200 {
+	if rec := acallWithHeaders(t, r, oldCookie.Value, "POST", "/v1/admin/logout", `{}`, headers); rec.Code != 200 {
 		t.Fatalf("logout: %d %s", rec.Code, rec.Body.String())
 	}
-	second := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), headers)
+	second := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), headers)
 	if second.Code != 200 {
 		t.Fatalf("second login: %d %s", second.Code, second.Body.String())
 	}
@@ -200,10 +224,10 @@ func TestE2EAdminLogoutLoginRejectsOldToken(t *testing.T) {
 	if newCookie == nil || newCookie.Value == "" {
 		t.Fatal("new admin cookie missing")
 	}
-	if old := acall(r, oldCookie.Value, "GET", "/v1/admin/config", ""); old.Code != 403 {
+	if old := acall(t, r, oldCookie.Value, "GET", "/v1/admin/config", ""); old.Code != 403 {
 		t.Fatalf("old token accepted after relogin: %d %s", old.Code, old.Body.String())
 	}
-	if current := acall(r, newCookie.Value, "GET", "/v1/admin/config", ""); current.Code != 200 {
+	if current := acall(t, r, newCookie.Value, "GET", "/v1/admin/config", ""); current.Code != 200 {
 		t.Fatalf("new token rejected: %d %s", current.Code, current.Body.String())
 	}
 }
@@ -239,35 +263,39 @@ func TestE2EAdminLogoutRedisFailure(t *testing.T) {
 func TestE2EAdminLoginSecurity(t *testing.T) {
 	r, _, pg, username := adminSetup(t)
 	unique := fmt.Sprintf("unknown-%d", time.Now().UnixNano())
-	headers := map[string]string{"X-Real-IP": "198.51.100.52"}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(unique, "wrong-password"), headers); rec.Code != 401 {
+	headers := map[string]string{"X-Real-IP": testutil.UniqueIP(t)}
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(unique, "wrong-password"), headers); rec.Code != 401 {
 		t.Fatalf("unknown user: want 401 got %d", rec.Code)
 	}
+	// Невалидные username делаем уникальными на прогон: allowLogin ключует счётчик
+	// по username (rl:admin-login:user:<sha256>), 10 попыток на 15 минут. Фиксированный
+	// "invalid username" копил попытки между прогонами и ронял тест на 429 (F-18.4).
+	invalidName := "invalid username " + testutil.UUID(t)
 	for name, credentials := range map[string]loginRequest{
-		"invalid username":  {Username: "invalid username", Password: dummyAdminPassword},
+		"invalid username":  {Username: invalidName, Password: dummyAdminPassword},
 		"password too long": {Username: username, Password: testAdminPassword + "x"},
 	} {
-		if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(credentials.Username, credentials.Password), headers); rec.Code != http.StatusUnauthorized {
+		if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(credentials.Username, credentials.Password), headers); rec.Code != http.StatusUnauthorized {
 			t.Fatalf("%s: want 401 got %d: %s", name, rec.Code, rec.Body.String())
 		}
 	}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", `{"initData":"telegram-data"}`, headers); rec.Code != 422 {
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", `{"initData":"telegram-data"}`, headers); rec.Code != 422 {
 		t.Fatalf("legacy initData: want 422 got %d", rec.Code)
 	}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), map[string]string{"Origin": "https://evil.example"}); rec.Code != 403 {
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), map[string]string{"Origin": "https://evil.example"}); rec.Code != 403 {
 		t.Fatalf("external origin: want 403 got %d", rec.Code)
 	}
 	if _, err := pg.Exec(context.Background(), `UPDATE admin_accounts SET is_active=false WHERE username=$1`, username); err != nil {
 		t.Fatal(err)
 	}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), map[string]string{"X-Real-IP": "198.51.100.53"}); rec.Code != 401 {
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), map[string]string{"X-Real-IP": testutil.UniqueIP(t)}); rec.Code != 401 {
 		t.Fatalf("inactive account: want 401 got %d", rec.Code)
 	}
 }
 
 func TestE2EAdminOriginGate(t *testing.T) {
 	r, tok, _, username := adminSetup(t)
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), nil); rec.Code != http.StatusOK {
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, testAdminPassword), nil); rec.Code != http.StatusOK {
 		t.Fatalf("login without origin: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
 	cases := []struct {
@@ -281,13 +309,13 @@ func TestE2EAdminOriginGate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := acallWithHeaders(r, tok, "POST", "/v1/admin/logout", `{}`, tc.headers)
+			rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/logout", `{}`, tc.headers)
 			if rec.Code != http.StatusForbidden {
 				t.Fatalf("origin: want 403 got %d: %s", rec.Code, rec.Body.String())
 			}
 		})
 	}
-	rec := acallWithHeaders(r, tok, "POST", "/v1/admin/logout", `{}`, map[string]string{"Origin": defaultAdminOrigin})
+	rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/logout", `{}`, map[string]string{"Origin": defaultAdminOrigin})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("configured origin: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -305,10 +333,10 @@ func TestE2EAdminSessionVersionRejectsRotatedCredential(t *testing.T) {
 		WHERE username=$2`, newHash, username); err != nil {
 		t.Fatal(err)
 	}
-	if rec := acall(r, tok, "GET", "/v1/admin/config", ""); rec.Code != http.StatusForbidden {
+	if rec := acall(t, r, tok, "GET", "/v1/admin/config", ""); rec.Code != http.StatusForbidden {
 		t.Fatalf("rotated session: want 403 got %d: %s", rec.Code, rec.Body.String())
 	}
-	rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(username, "new correct horse battery staple 2026!"), map[string]string{"Origin": defaultAdminOrigin})
+	rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(username, "new correct horse battery staple 2026!"), map[string]string{"Origin": defaultAdminOrigin})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("new login: want 200 got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -343,16 +371,33 @@ func TestAdminOriginConfiguration(t *testing.T) {
 
 func TestE2EAdminLoginRateLimit(t *testing.T) {
 	r, _, _, _ := adminSetup(t)
-	n := time.Now().UnixNano()
-	ip := fmt.Sprintf("198.18.%d.%d", (n>>8)&0xff, n&0xff)
-	rateUsername := fmt.Sprintf("rate-%d", n)
+	// Свой клиент только ради чистки собственных ключей лимита: adminSetup
+	// отдаёт пул PG, а нужен Redis.
+	_, _, rd := testutil.Live(t)
+	// Один IP на весь тест — это и есть смысл: лимит по IP, 10 попыток.
+	ip := testutil.UniqueIP(t)
+	rateUsername := fmt.Sprintf("rate-%d", time.Now().UnixNano())
 	headers := map[string]string{"X-Real-IP": ip}
+	// Тест — владелец ЭТИХ двух ключей (они выведены из его же IP и username),
+	// поэтому чистит их перед стартом. Иначе прогон зависел от того, гоняли ли
+	// его в предыдущие 15 минут: счётчик админского входа живёт 15 минут, и
+	// один заход с тем же IP (даже из другого процесса) давал 429 на первой
+	// попытке вместо 401 (A17/F-43, регресс).
+	ownKeys := adminLoginRateKeys(anonReqWithIP(ip), rateUsername)
+	for _, key := range ownKeys {
+		_ = rd.Del(context.Background(), key).Err()
+	}
+	t.Cleanup(func() {
+		for _, key := range ownKeys {
+			_ = rd.Del(context.Background(), key).Err()
+		}
+	})
 	for i := 0; i < adminLoginRateMax; i++ {
-		if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(rateUsername, "wrong-password"), headers); rec.Code != 401 {
+		if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(rateUsername, "wrong-password"), headers); rec.Code != 401 {
 			t.Fatalf("attempt %d: want 401 got %d", i+1, rec.Code)
 		}
 	}
-	if rec := acallWithHeaders(r, "", "POST", "/v1/admin/login", loginBody(rateUsername, "wrong-password"), headers); rec.Code != 429 {
+	if rec := acallWithHeaders(t, r, "", "POST", "/v1/admin/login", loginBody(rateUsername, "wrong-password"), headers); rec.Code != 429 {
 		t.Fatalf("rate limit: want 429 got %d", rec.Code)
 	}
 }
@@ -362,7 +407,7 @@ func TestE2EAdminLoginRateWindowIsFixed(t *testing.T) {
 	ctx, _, rd := testutil.Live(t)
 	svc := New(nil, rd)
 	req := httptest.NewRequest("POST", "http://127.0.0.1:8081/v1/admin/login", nil)
-	req.RemoteAddr = "198.19.7.21:4321"
+	req.RemoteAddr = testutil.UniqueIP(t) + ":4321"
 	username := fmt.Sprintf("window-%d", time.Now().UnixNano())
 	keys := adminLoginRateKeys(req, username)
 	t.Cleanup(func() {
@@ -527,10 +572,10 @@ func TestE2EAdminctlCredentialAudit(t *testing.T) {
 
 func TestE2EPublishAudit(t *testing.T) {
 	r, tok, pg, _ := adminSetup(t)
-	if rec := acallWithHeaders(r, tok, "POST", "/v1/admin/config/publish", `{"app_config":{"nope":1}}`, map[string]string{"Origin": defaultAdminOrigin}); rec.Code != 422 {
+	if rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/config/publish", `{"app_config":{"nope":1}}`, map[string]string{"Origin": defaultAdminOrigin}); rec.Code != 422 {
 		t.Fatalf("bad key: want 422 got %d", rec.Code)
 	}
-	rec := acallWithHeaders(r, tok, "POST", "/v1/admin/config/publish",
+	rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/config/publish",
 		`{"app_config":{"copy.paywall_cta":"E2E"},"spreads":[{"code":"daily","sort_order":11}]}`,
 		map[string]string{"Origin": defaultAdminOrigin})
 	if rec.Code != 200 {
@@ -594,7 +639,7 @@ func TestE2ERotateSeasonal(t *testing.T) {
 	}
 	defer pg.Exec(context.Background(), `DELETE FROM app_config WHERE key='spreads.seasonal'`)
 	defer pg.Exec(context.Background(), `UPDATE spreads SET is_active=false WHERE code='fullmoon'`)
-	rec := acallWithHeaders(r, tok, "POST", "/v1/admin/rotate-seasonal", `{}`, map[string]string{"Origin": defaultAdminOrigin})
+	rec := acallWithHeaders(t, r, tok, "POST", "/v1/admin/rotate-seasonal", `{}`, map[string]string{"Origin": defaultAdminOrigin})
 	var out map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if rec.Code != 200 || out["ok"] != true {

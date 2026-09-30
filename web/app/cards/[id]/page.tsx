@@ -1,4 +1,5 @@
 import { Metadata } from "next";
+import CardArt from "@/components/CardArt";
 
 // U16: 78 страниц значений карт из БД, SSR (см. 03-nonfunctional/05).
 // force-dynamic: build-time Go недоступен, рендерим при запросе (HTML полный для curl).
@@ -50,6 +51,12 @@ export default async function CardPage({ params }: { params: Promise<{ id: strin
     <main className="mx-auto max-w-md px-4 pt-8">
       <p className="text-sm uppercase tracking-[0.2em] text-gold">Значение карты</p>
       <h1 className="mt-2 text-3xl font-display font-semibold text-paper">{c.name_ru}</h1>
+      {/* Арт карты. Раньше страница рендерила только текст: image_key из БД не
+          использовался, поэтому /cards/[id] оставалась единственной страницей
+          каталога без картинки (CardArt жил только в /reading/[id]). */}
+      <div className="ca-flip mt-6 flex justify-center">
+        <CardArt name={c.name_ru} imageKey={c.image_key} width={200} />
+      </div>
       <section className="mt-6 rounded-2xl border border-white/10 bg-card p-5">
         <p className="text-sm uppercase tracking-wider text-mist">Прямая</p>
         <p className="mt-1 text-base leading-relaxed text-paper">{c.upright_ru}</p>

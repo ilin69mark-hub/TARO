@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
 import { GO } from "@/lib/server";
+import { relayJSON } from "@/lib/proxy";
 
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 
@@ -15,9 +16,5 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ toke
   const res = await fetch(`${GO}/v1/share/${encodeURIComponent(token)}`, {
     cache: "no-store",
   });
-  const body = await res.arrayBuffer();
-  return new NextResponse(body, {
-    status: res.status,
-    headers: { "Content-Type": "application/json" },
-  });
+  return relayJSON(res);
 }

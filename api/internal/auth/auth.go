@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -221,18 +222,43 @@ func ParseJWT(token string) (string, error) {
 	return claims.Subject, nil
 }
 
-// writeCookie кладет JWT в cookie: HttpOnly; Secure; SameSite=None; Path=/.
-// SameSite=None обязателен — иначе TG WebApp iframe режет cookie (см. 03-nonfunctional/02).
+// CookieFlags — согласованная пара (Secure, SameSite) для всех cookie проекта.
+//
+// Флаги нельзя выбирать независимо, иначе cookie просто не сохранится:
+//   - `SameSite=None` БЕЗ `Secure` браузеры отвергают полностью (требование спецификации);
+//   - `Secure` cookie браузер НЕ сохраняет на не-secure origin (http).
+//
+// Поэтому на HTTPS (прод, TLS терминируется на nginx) — Secure + SameSite=None,
+// как было раньше: None обязателен, иначе TG WebApp iframe режет cookie
+// (см. 03-nonfunctional/02). На plain HTTP (локальный стенд) — Lax без Secure:
+// иначе fingerprint-cookie теряется, клиент не может его восстановить и вход
+// anon упирается в 403 FP_REQUIRED.
+//
+// Схему берём из X-Forwarded-Proto, который nginx переписывает в $scheme и
+// подделать не даёт; api-public наружу не публикуется (только expose), так что
+// подделать схему извне нельзя.
+func CookieFlags(r *http.Request) (bool, http.SameSite) {
+	if r == nil {
+		return true, http.SameSiteNoneMode
+	}
+	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		return true, http.SameSiteNoneMode
+	}
+	return false, http.SameSiteLaxMode
+}
+
+// writeCookie кладет JWT в cookie: HttpOnly; Path=/; флаги — CookieFlags.
 // CSRF: все POST требуют заголовок X-CSRF (проверка — T10 middleware; TODO).
-func writeCookie(w http.ResponseWriter, token string, ttl time.Duration) {
+func writeCookie(w http.ResponseWriter, r *http.Request, token string, ttl time.Duration) {
+	secure, sameSite := CookieFlags(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
 		Path:     "/",
 		MaxAge:   int(ttl.Seconds()),
 		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 }
 
@@ -242,19 +268,44 @@ func writeCookie(w http.ResponseWriter, token string, ttl time.Duration) {
 const FpCookie = "taro_fp"
 
 // writeFpCookie кладет fingerprint в httpOnly cookie (флаги как у сессии — TG iframe).
-func writeFpCookie(w http.ResponseWriter, fp string) {
+func writeFpCookie(w http.ResponseWriter, r *http.Request, fp string) {
 	if fp == "" {
 		return
 	}
+	secure, sameSite := CookieFlags(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     FpCookie,
 		Value:    fp,
 		Path:     "/",
 		MaxAge:   int(UserTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
+		Secure:   secure,
+		SameSite: sameSite,
 	})
+}
+
+// clientIP — IP клиента для антифермы регистраций. Раньше здесь читался ТОЛЬКО
+// X-Real-IP, а при его отсутствии подставлялся литерал "unknown": прямой
+// доступ к :8080 (без nginx) схлопывал ВСЕХ анонимных клиентов в один бакет
+// 20 регистраций в час на весь интернет. Тот же middleware rate-limiter
+// (internal/ratelimit.keyPart) давно делает fallback на RemoteAddr — здесь
+// логика была продублирована и разошлась. Единая функция убирает расхождение.
+func clientIP(r *http.Request) string {
+	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
+		if parsed := net.ParseIP(ip); parsed != nil {
+			return parsed.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		if parsed := net.ParseIP(host); parsed != nil {
+			return parsed.String()
+		}
+	}
+	if parsed := net.ParseIP(strings.Trim(r.RemoteAddr, "[]")); parsed != nil {
+		return parsed.String()
+	}
+	return "unknown"
 }
 
 func fpOf(r *http.Request, bodyFp string) string {
@@ -310,17 +361,17 @@ func (s *Service) HandleTelegram(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	csrf, err := s.issueCSRF(w, r.Context(), id)
+	csrf, err := s.issueCSRF(w, r, r.Context(), id)
 	if err != nil {
 		if s.rd != nil {
 			_ = s.rd.Del(r.Context(), sessKey(id), "csrf:"+id).Err()
 		}
-		ExpireAuthCookies(w)
+		ExpireAuthCookies(w, r)
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	writeCookie(w, tok, UserTTL)
-	writeFpCookie(w, fpOf(r, req.Fingerprint))
+	writeCookie(w, r, tok, UserTTL)
+	writeFpCookie(w, r, fpOf(r, req.Fingerprint))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "is_new": isNew, "trial_days": trialDays, "csrf_token": csrf})
 }
@@ -345,10 +396,7 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный fingerprint")
 		return
 	}
-	ip := r.Header.Get("X-Real-IP")
-	if ip == "" {
-		ip = "unknown"
-	}
+	ip := clientIP(r)
 	id, err := s.AnonLogin(r.Context(), req.UUID, fp, ip)
 	if err != nil {
 		if err.Error() == "rate_limited" {
@@ -371,17 +419,17 @@ func (s *Service) HandleAnon(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	csrf, err := s.issueCSRF(w, r.Context(), id)
+	csrf, err := s.issueCSRF(w, r, r.Context(), id)
 	if err != nil {
 		if s.rd != nil {
 			_ = s.rd.Del(r.Context(), sessKey(id), "csrf:"+id).Err()
 		}
-		ExpireAuthCookies(w)
+		ExpireAuthCookies(w, r)
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	writeCookie(w, tok, UserTTL)
-	writeFpCookie(w, fpOf(r, req.Fingerprint))
+	writeCookie(w, r, tok, UserTTL)
+	writeFpCookie(w, r, fpOf(r, req.Fingerprint))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"user_id": id, "csrf_token": csrf})
 }

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { useScrollLock } from "@/lib/useScrollLock";
 import type { Plan } from "@/components/PaywallSheet";
 
 // Онбординг новичка 3 шага (см. U23): вопрос → карта → честный paywall.
@@ -60,6 +61,9 @@ export default function Onboarding() {
     }
     setStep(-1);
   }
+
+  // Хук до раннего return (правило хуков), блокирует скролл под окном.
+  useScrollLock(step >= 0);
 
   if (step < 0) return null;
   const all = steps(monthPrice);

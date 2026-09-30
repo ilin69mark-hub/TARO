@@ -40,8 +40,16 @@ func testRouter(t *testing.T) (*chi.Mux, func(uid string) string) {
 }
 
 func callWith(r *chi.Mux, tok, method, path, body string) *httptest.ResponseRecorder {
+	return callWithIP(r, tok, method, path, body, "")
+}
+
+// callWithIP добавляет X-Real-IP — источник адреса для антифермы рефералки.
+func callWithIP(r *chi.Mux, tok, method, path, body, ip string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if ip != "" {
+		req.Header.Set("X-Real-IP", ip)
+	}
 	req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: tok})
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -52,8 +60,11 @@ func TestE2EReferralAntifraud(t *testing.T) {
 	ctx, pg, _ := testutil.Live(t)
 	r, login := testRouter(t)
 
-	tokA := login(testutil.NewUser(t, ctx, pg))
-	tokB := login(testutil.NewUser(t, ctx, pg))
+	uidA := testutil.NewUser(t, ctx, pg)
+	tokA := login(uidA)
+	userA := uidA
+	userB := testutil.NewUser(t, ctx, pg)
+	tokB := login(userB)
 
 	// A берет код
 	rec := callWith(r, tokA, "GET", "/v1/referral/me", "")
@@ -79,16 +90,30 @@ func TestE2EReferralAntifraud(t *testing.T) {
 	}
 	t.Logf("apply body: %s", recApply.Body.String())
 
-	// повторный apply того же B → 200 (ON CONFLICT DO NOTHING), дубля нет
+	// Повторный apply → 409 ALREADY_REFERRED. Раньше тут был 200: ON CONFLICT
+	// DO NOTHING проглатывал запрос, юзер получал «applied: pending», а
+	// привязка оставалась к первому коду. Теперь это 409 по спеке
+	// docs/project-book/02-functional/06 — второй код у рефера не принимается.
 	recApply2 := callWith(r, tokB, "POST", "/v1/referral/apply", `{"code":"`+code+`"}`)
-	if recApply2.Code != 200 {
-		t.Fatalf("re-apply: want 200 got %d", recApply2.Code)
+	if recApply2.Code != http.StatusConflict {
+		t.Fatalf("re-apply: want 409 got %d: %s", recApply2.Code, recApply2.Body.String())
 	}
+	// Считаем ТОЛЬКО строки этого реферала, а не всю таблицу: глобальный
+	// COUNT(*) зависит от мусора, оставшегося от других прогонов/пакетов, и
+	// ронял `go test -count=2` (A14/F-18). Инвариант, который тут важен:
+	// повторный apply не создаёт вторую строку для того же реферера.
 	var n int
 	_ = pg.QueryRow(ctx,
-		`SELECT COUNT(*) FROM referrals`).Scan(&n)
+		`SELECT COUNT(*) FROM referrals WHERE referee_id=$1`, userB).Scan(&n)
 	if n != 1 {
-		t.Fatalf("want exactly 1 referral row, got %d", n)
+		t.Fatalf("want exactly 1 referral row for the referee, got %d", n)
+	}
+	// Привязка осталась к ПЕРВОМУ коду: 409 не должен молча переписать реферера.
+	var boundA int
+	_ = pg.QueryRow(ctx,
+		`SELECT COUNT(*) FROM referrals WHERE referee_id=$1 AND referrer_id=$2`, userB, userA).Scan(&boundA)
+	if boundA != 1 {
+		t.Fatalf("409 must not rebind referee, got %d rows to referrer A", boundA)
 	}
 }
 

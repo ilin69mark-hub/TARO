@@ -58,6 +58,9 @@ jobs:
     env:
       DATABASE_URL: postgres://taro:ci-only@localhost:5432/taro?sslmode=disable
       REDIS_ADDR: localhost:6379
+      # A17/F-43: роль ai_cache в тестах — отдельная БД того же Redis. Именно так
+      # проверяется, что записи кэша не попадают в пространство ключей лимитов.
+      REDIS_AI_ADDR: localhost:6379/1
       JWT_SECRET: ci-only-secret-0123456789abcdef0123456789
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -135,6 +138,99 @@ jobs:
             test -x "$script"
           done
       - run: |
+          mkdir -p backups && : > backups/probe
+          git check-ignore -q backups/probe || { printf '%s\n' 'backups/ must be gitignored (A01/F-01)' >&2; exit 1; }
+          dirty="$(git status --porcelain --untracked-files=all)"
+          test -z "$dirty" || { printf '%s\n' 'untracked files would abort deploy.yml:84:' >&2; printf '%s\n' "$dirty" >&2; exit 1; }
+      - run: |
+          ! grep -q '/opt/taro/backups' deploy/backup.sh
+          if BACKUP_DIR="$PWD/backups" deploy/backup.sh >/dev/null 2>&1; then
+            printf '%s\n' 'backup.sh must refuse a BACKUP_DIR inside the worktree (A01/F-01)' >&2
+            exit 1
+          fi
+      - run: |
+          ! grep -q 'network_mode: service:api-admin' docker-compose.yml
+          grep -Fq '"127.0.0.1:${ADMIN_HOST_PORT:-8081}:8082"' docker-compose.yml
+          ! grep -rq 'port api-admin 8082' deploy .github/workflows
+          grep -Fq 'resolver 127.0.0.11' deploy/admin-proxy.conf
+          grep -Fq 'set $admin_api api-admin:8081' deploy/admin-proxy.conf
+          ! grep -q 'proxy_pass http://127.0.0.1:8081' deploy/admin-proxy.conf
+          test "$(grep -c 'proxy_pass http://\$admin_api\$request_uri;' deploy/admin-proxy.conf)" = 3
+          ! grep -q 'const addr = "127.0.0.1:8081"' api/cmd/admin/main.go
+      - run: |
+          # Каталог кэша next/image принадлежит пользователю рантайма (A03/F-03).
+          # Полный smoke-тест образа (сборка + запросы /_next/image) — в A33,
+          # где web-образ собирается в CI.
+          grep -Fq 'COPY --from=build --chown=node:node /app/.next ./.next' web/Dockerfile
+          ! grep -Eq '^COPY --from=build /app/\.next ' web/Dockerfile
+          grep -Fq 'chown -R node:node /app/.next' web/Dockerfile
+      - run: |
+          # Шаблон .env.example обязан покрывать prod-контракт: список 15 ключей
+          # выводится из compose-файлов, поэтому новый ${VAR:?} нельзя «забыть»
+          # в шаблоне (A06/F-32). Полный `compose config` для prod+tls — в A33.
+          deploy/check-env.sh --keys-only .env.example
+      - run: |
+          # CSP: edge отключает proxy_hide_header и отдаёт свою копию, поэтому
+          # политика приложения обязана посимвольно совпадать с nginx (A04/F-14).
+          python3 - <<'EOF'
+          import re
+          import sys
+
+          def app_csp():
+              lines = open("web/next.config.js", encoding="utf-8").read().split("\n")
+              for i, line in enumerate(lines):
+                  if 'key: "Content-Security-Policy"' in line:
+                      for nxt in lines[i + 1:]:
+                          t = nxt.strip()
+                          if t.startswith('"') and t.endswith('",'):
+                              return t[1:-2]
+              return ""
+
+          def nginx_csp(path):
+              m = re.search(r'add_header Content-Security-Policy "([^"]+)"', open(path, encoding="utf-8").read())
+              return m.group(1) if m else ""
+
+          app = app_csp()
+          plain = nginx_csp("deploy/nginx.conf")
+          tls = nginx_csp("deploy/nginx-tls.conf")
+          if not app or not plain or not tls:
+              print("CSP not found in one of the three files"); sys.exit(1)
+          if not (app == plain == tls):
+              print("CSP policies diverged")
+              for name, value in (("app", app), ("nginx.conf", plain), ("nginx-tls.conf", tls)):
+                  print("  %-15s %s" % (name, value))
+              sys.exit(1)
+          if "frame-ancestors 'self' https://web.telegram.org" not in app:
+              print("frame-ancestors must allow the Telegram Web origin"); sys.exit(1)
+          if "X-Frame-Options" in open("web/next.config.js", encoding="utf-8").read().split('key: "Content-Security-Policy"')[0]:
+              print("app must not declare X-Frame-Options: it has no allow-list form"); sys.exit(1)
+          print("CSP aligned across app/nginx/nginx-tls: %d chars" % len(app))
+          EOF
+      - run: |
+          python3 - <<'EOF'
+          import sys
+          import yaml
+          d = yaml.safe_load(open("docker-compose.yml"))
+          admin = d["services"]["api-admin"]
+          access = d["services"]["admin-access"]
+          if admin.get("ports"):
+              print("api-admin must not publish host ports"); sys.exit(1)
+          if admin.get("network_mode"):
+              print("api-admin must not share a network namespace"); sys.exit(1)
+          if "admin" not in (admin.get("networks") or []):
+              print("api-admin must join the admin network"); sys.exit(1)
+          if access.get("networks") != ["admin"]:
+              print("admin-access must be on the admin network only: %r" % (access.get("networks"),)); sys.exit(1)
+          ports = access.get("ports") or []
+          if len(ports) != 1 or "8082" not in str(ports[0]) or "127.0.0.1" not in str(ports[0]):
+              print("admin-access must publish 127.0.0.1:8082 only: %r" % (ports,)); sys.exit(1)
+          for name, svc in d["services"].items():
+              if name in ("api-admin", "admin-access"):
+                  continue
+              if "admin" in (svc.get("networks") or []):
+                  print("service %s must not join the admin network" % name); sys.exit(1)
+          EOF
+      - run: |
           grep -Fq 'location = /readyz' deploy/nginx-tls.conf
           grep -Fq 'docker-compose.tls.yml' .github/workflows/deploy.yml
           grep -Fq 'workflows: ["ci"]' .github/workflows/deploy.yml
@@ -159,7 +255,11 @@ jobs:
             api/migrations/033_payment_webhook_audit.up.sql \
             api/migrations/033_payment_webhook_audit.down.sql \
             api/migrations/034_reading_quota_guard.up.sql \
-            api/migrations/034_reading_quota_guard.down.sql; do
+            api/migrations/034_reading_quota_guard.down.sql \
+            api/migrations/035_subscription_payment_uniqueness.up.sql \
+            api/migrations/035_subscription_payment_uniqueness.down.sql \
+            api/migrations/036_authorization_release.up.sql \
+            api/migrations/036_authorization_release.down.sql; do
             git ls-files --error-unmatch -- "$path" >/dev/null || {
               printf 'required release file is not tracked: %s\n' "$path" >&2
               exit 1

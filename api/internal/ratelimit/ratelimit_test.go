@@ -17,9 +17,12 @@ func TestE2ERateLimit(t *testing.T) {
 	})
 	h := l.Middleware(ok)
 
+	// Уникальный IP на прогон: лимитер ключует по IP, и жёсткий 9.9.9.9 ломал
+	// `go test -count=2` — второй прогон получал 429 там, где ждал 200 (F-18.4).
+	ip := testutil.UniqueIP(t)
 	fire := func(path string) int {
 		req := httptest.NewRequest("POST", path, nil)
-		req.RemoteAddr = "9.9.9.9:1234"
+		req.RemoteAddr = ip + ":1234"
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec.Code

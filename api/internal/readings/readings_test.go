@@ -59,10 +59,10 @@ func TestSameMSKDay(t *testing.T) {
 	msk, _ := time.LoadLocation("Europe/Moscow")
 	a := time.Date(2026, 9, 23, 23, 50, 0, 0, msk)
 	b := time.Date(2026, 9, 24, 0, 5, 0, 0, msk) // 15 мин позже, уже другой день
-	if sameMSKDay(a, b) {
+	if SameMSKDay(a, b) {
 		t.Fatal("different MSK days equal")
 	}
-	if !sameMSKDay(a, a) {
+	if !SameMSKDay(a, a) {
 		t.Fatal("same day differs")
 	}
 }

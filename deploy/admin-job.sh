@@ -48,7 +48,7 @@ case "${DEPLOY_ENV:-local}" in
 esac
 
 if command -v curl >/dev/null 2>&1; then
-  admin_endpoint="$(docker compose "$@" port api-admin 8082)"
+  admin_endpoint="$(docker compose "$@" port admin-access 8082)"
   case "$admin_endpoint" in
     127.0.0.1:*) ;;
     *)

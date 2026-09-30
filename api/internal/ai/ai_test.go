@@ -178,12 +178,50 @@ func TestStreamRejectsTruncatedProviderOutput(t *testing.T) {
 	}
 }
 
+// TestWorkerLeaseCoversClaimedBatch — инвариант из A15/F-06 с поправкой на
+// параллельную обработку: лиза должна перекрывать обработку ОДНОГО чтения
+// (workerProcessingTimeout), потому что батч теперь обрабатывается конкурентно.
+// Раньше батч был 1, и та же проверка была тривиальной.
 func TestWorkerLeaseCoversClaimedBatch(t *testing.T) {
-	if workerBatchSize != 1 {
-		t.Fatalf("worker batch size=%d", workerBatchSize)
+	t.Setenv("AI_WORKER_BATCH_SIZE", "")
+	if got := loadWorkerPolicy().batchSize; got != defaultWorkerBatchSize {
+		t.Fatalf("default worker batch size=%d, want %d", got, defaultWorkerBatchSize)
 	}
 	if workerLeaseDuration <= workerProcessingTimeout {
-		t.Fatalf("worker lease=%s", workerLeaseDuration)
+		t.Fatalf("worker lease=%s must exceed per-job processing timeout=%s", workerLeaseDuration, workerProcessingTimeout)
+	}
+}
+
+// TestWorkerPolicyIsConfigurable — DoD A15 («сделать конфигурируемым»):
+// расписание воркера обязано читаться из env, а мусорные значения —
+// отбрасываться, а не тихо превращаться в потолок или в нулевой тик.
+func TestWorkerPolicyIsConfigurable(t *testing.T) {
+	cases := []struct {
+		name      string
+		batchEnv  string
+		tickEnv   string
+		wantBatch int
+		wantTick  time.Duration
+	}{
+		{name: "defaults", batchEnv: "", tickEnv: "", wantBatch: defaultWorkerBatchSize, wantTick: defaultWorkerTick},
+		{name: "smaller", batchEnv: "3", tickEnv: "5", wantBatch: 3, wantTick: 5 * time.Second},
+		{name: "batch clamped to max", batchEnv: "9999", tickEnv: "", wantBatch: 50, wantTick: defaultWorkerTick},
+		{name: "tick clamped to max", batchEnv: "", tickEnv: "9999", wantBatch: defaultWorkerBatchSize, wantTick: maxWorkerTick},
+		{name: "batch zero falls back", batchEnv: "0", tickEnv: "", wantBatch: defaultWorkerBatchSize, wantTick: defaultWorkerTick},
+		{name: "tick zero falls back", batchEnv: "", tickEnv: "0", wantBatch: defaultWorkerBatchSize, wantTick: defaultWorkerTick},
+		{name: "garbage falls back", batchEnv: "many", tickEnv: "soon", wantBatch: defaultWorkerBatchSize, wantTick: defaultWorkerTick},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AI_WORKER_BATCH_SIZE", tc.batchEnv)
+			t.Setenv("AI_WORKER_TICK_SECONDS", tc.tickEnv)
+			if got := loadWorkerPolicy().batchSize; got != tc.wantBatch {
+				t.Fatalf("batchSize=%d, want %d", got, tc.wantBatch)
+			}
+			if got := workerTick(); got != tc.wantTick {
+				t.Fatalf("tick=%s, want %s", got, tc.wantTick)
+			}
+		})
 	}
 }
 

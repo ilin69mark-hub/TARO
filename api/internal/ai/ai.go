@@ -24,7 +24,16 @@ import (
 )
 
 const (
-	RequestTimeout     = 8 * time.Second
+	// RequestTimeout — бюджет TTFT: сколько ждём первых байт ответа. Это НЕ
+	// бюджет генерации: раньше один и тот же 8-секундный таймаут стоял и
+	// здесь, и на всю попытку, поэтому healthy-поток длиннее 8 с (медленный,
+	// но живой провайдер) обрывался и засчитывался провайдеру как провал
+	// (A13/F-11).
+	RequestTimeout = 8 * time.Second
+	// GenerationTimeout — общий дедлайн попытки: TTFT + полная генерация
+	// (max_tokens до 2000). Обрывать попытку раньше бессмысленно, но и держать
+	// её бесконечно нельзя — иначе воркер копит зависшие соединения.
+	GenerationTimeout  = 60 * time.Second
 	BreakerThreshold   = 5
 	BreakerOpen        = 5 * time.Minute
 	CacheTTL           = 7 * 24 * time.Hour
@@ -54,9 +63,29 @@ type Config struct {
 type Gateway struct {
 	pg      *pgxpool.Pool
 	rd      *redis.Client
+	cacheRd *redis.Client
 	http    *http.Client
 	apiKey  string
 	apiKey2 string
+	// cfgOverride — фиксирует конфиг (в т.ч. имя модели) в обход app_config.
+	// В проде всегда nil, конфиг берётся из БД. Нужен потому, что `go test ./...`
+	// гоняет пакеты параллельно по общей БД/Redis: подмена app_config видна
+	// соседним пакетом, а имя модели входит и в ключ AI-кэша, и в ключ breaker'а,
+	// поэтому без него тесты делят кэш и счётчики отказов (F-18.3).
+	cfgOverride *Config
+}
+
+// SetConfigOverride — тестовый шов (см. cfgOverride). В проде не используется.
+func (g *Gateway) SetConfigOverride(cfg *Config) { g.cfgOverride = cfg }
+
+// cacheClient — клиент для bulk-кэша ответов. A17/F-43: отдельная роль с
+// отдельным бюджетом памяти; nil = кэш выключен (провайдер зовётся на каждый
+// промпт), но НИКОГДА не «тот же самый, что и лимиты» по умолчанию.
+func (g *Gateway) cacheClient() *redis.Client {
+	if g.cacheRd != nil {
+		return g.cacheRd
+	}
+	return nil
 }
 
 type providerUsage struct {
@@ -106,12 +135,22 @@ type usageWire struct {
 	TotalCost        json.RawMessage `json:"total_cost"`
 }
 
+// New — конструктор с кэшем на ОБЩЕМ инстансе. Только для тестов и для
+// запусков без раздельного кэша: в проде используйте NewWithCache, иначе кэш
+// снова делит память с ключами лимитов и сессий (A17/F-43).
 func New(pg *pgxpool.Pool, rd *redis.Client) *Gateway {
+	return NewWithCache(pg, rd, rd)
+}
+
+// NewWithCache — конструктор с раздельной ролью кэша (A17/F-43). cacheRd может
+// быть nil: тогда кэш выключен, но breaker и остальное продолжают работать на rd.
+func NewWithCache(pg *pgxpool.Pool, rd, cacheRd *redis.Client) *Gateway {
 	return &Gateway{
-		pg: pg,
-		rd: rd,
+		pg:      pg,
+		rd:      rd,
+		cacheRd: cacheRd,
 		http: &http.Client{Transport: &http.Transport{
-			ResponseHeaderTimeout: RequestTimeout,
+			ResponseHeaderTimeout: ttftBudget(),
 		}},
 		apiKey:  os.Getenv("OPENROUTER_API_KEY"),
 		apiKey2: os.Getenv("OPENROUTER_API_KEY_2"),
@@ -123,6 +162,9 @@ func (g *Gateway) Enabled() bool {
 }
 
 func (g *Gateway) LoadConfig(ctx context.Context) Config {
+	if g.cfgOverride != nil {
+		return *g.cfgOverride
+	}
 	cfg := Config{Model: "openai/gpt-4o-mini", Fallback: "anthropic/claude-3-haiku", MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 5000}
 	if g.pg == nil {
 		return cfg
@@ -252,7 +294,7 @@ func PromptHash(model, spread string, cards []CardValue, question string) string
 }
 
 func cacheKey(model, spread string, positions []Position, cards []CardValue, question string, cfg Config) string {
-	return "ai:cache:v3:" + model + ":" + spread + ":" + promptHash(model, spread, positions, cards, question, cfg)
+	return cacheKeyPrefix + model + ":" + spread + ":" + promptHash(model, spread, positions, cards, question, cfg)
 }
 
 func CacheKey(model, spread string, cards []CardValue, question string) string {
@@ -653,7 +695,8 @@ func emitText(ctx context.Context, out chan<- string, text string) error {
 }
 
 func (g *Gateway) cacheText(key, text string) {
-	if g.rd == nil {
+	rd := g.cacheClient()
+	if rd == nil {
 		return
 	}
 	sealed, err := sealCache(text)
@@ -662,7 +705,12 @@ func (g *Gateway) cacheText(key, text string) {
 	}
 	ctx, cancel := persistenceContext()
 	defer cancel()
-	_ = g.rd.Set(ctx, key, sealed, CacheTTL).Err()
+	if err := rd.Set(ctx, key, sealed, CacheTTL).Err(); err != nil {
+		return
+	}
+	// A16/F-05: без бюджета bulk-кэш на 200 МБ maxmemory вытеснял rl:*/sess:*
+	// (allkeys-lru) и окно rate-limit сбрасывалось молча.
+	g.noteCacheEntry(ctx)
 }
 
 func (g *Gateway) logBestEffort(readingID, model, hash string, in, out int, latency time.Duration, status, errText string, stats streamStats) {
@@ -672,15 +720,16 @@ func (g *Gateway) logBestEffort(readingID, model, hash string, in, out int, late
 }
 
 func (g *Gateway) readCached(ctx context.Context, key string) (string, bool) {
-	if g.rd == nil {
+	rd := g.cacheClient()
+	if rd == nil {
 		return "", false
 	}
-	raw, err := g.rd.Get(ctx, key).Result()
+	raw, err := rd.Get(ctx, key).Result()
 	if err != nil || raw == "" {
 		return "", false
 	}
 	if len(raw) > MaxCacheValueBytes {
-		_ = g.rd.Del(ctx, key).Err()
+		_ = rd.Del(ctx, key).Err()
 		return "", false
 	}
 	cached, err := openCache(raw)
@@ -739,7 +788,7 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 		if i > 0 && g.apiKey2 != "" {
 			apiKey = g.apiKey2
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, g.generationBudget())
 		inner := make(chan string, 64)
 		type attemptResult struct {
 			stats streamStats
@@ -761,6 +810,10 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 			builder.WriteString(token)
 		}
 		result := <-done
+		// Состояние бюджета снимаем ДО cancel(): после отмены attemptCtx всегда
+		// выглядит завершённым, и собственный таймаут генерации перестал бы
+		// отличаться от отмены по нашей воле (A13/F-11).
+		budgetExpired := attemptCtx.Err() != nil
 		cancel()
 		totalStats.add(result.stats)
 		g.finishBudget(reservation, result.stats)
@@ -776,7 +829,7 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 				g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "failed", result.err.Error(), result.stats)
 				break
 			}
-			if isServerError(result.err) {
+			if isServerError(result.err) && !ourBudgetExpired(budgetExpired, result.err) {
 				g.breakerFail(ctx, model)
 			}
 			g.logBestEffort(readingID, model, hash, result.stats.usage.PromptTokens, result.stats.events, time.Since(start), "failed", result.err.Error(), result.stats)
@@ -816,6 +869,47 @@ func (g *Gateway) Stream(ctx context.Context, readingID, spread string, position
 	return "", "", false, lastErr
 }
 
+// ttftBudget — сколько ждём первых байт ответа (A13/F-11). Раньше это был тот
+// же 8-секундный таймаут, что и на всю попытку, и «медленный TTFT» был
+// неотличим от «провайдер не отвечает». Провайдер, который за 8 с не прислал
+// заголовки, действительно нездоров, и его таймаут честно идёт в breaker.
+func ttftBudget() time.Duration {
+	return durationFromEnv("AI_TTFT_TIMEOUT", RequestTimeout)
+}
+
+func durationFromEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return fallback
+}
+
+// generationBudget — общий дедлайн попытки (TTFT + генерация). Значение можно
+// подкрутить без пересборки: у провайдера своя скорость, и 60 с для одного и того
+// же бюджета слишком туго или слишком щедро.
+func (g *Gateway) generationBudget() time.Duration {
+	return durationFromEnv("AI_GENERATION_TIMEOUT", GenerationTimeout)
+}
+
+// ourBudgetExpired сообщает, что ошибку вызвал НАШ собственный дедлайн
+// генерации (или отмена контекста), а не поломка провайдера (A13/F-11).
+// budgetExpired снят до cancel(): если бюджет не истёк, то
+// context.DeadlineExceeded пришёл из transport'а (TTFT-таймаут) и это настоящий
+// провайдерский провал.
+func ourBudgetExpired(budgetExpired bool, err error) bool {
+	if !budgetExpired {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
 func isServerError(err error) bool {
 	if err == nil {
 		return false
@@ -827,6 +921,11 @@ func isServerError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		// Таймаут по классу — провайдерский (в т.ч. ResponseHeaderTimeout, который
+		// net/http тоже возвращает как context.DeadlineExceeded). Наш собственный
+		// дедлайн генерации отсекается отдельно, см. ourBudgetExpired: иначе не
+		// отличить «провайдер не прислал заголовки за 8 с» от «мы не дождались
+		// длинной, но здоровой генерации».
 		return true
 	}
 	var netErr net.Error

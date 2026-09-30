@@ -27,7 +27,7 @@ export default function PushPrefs() {
   }
 
   return (
-    <div className="mt-2 flex items-center gap-2">
+    <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
       <label className="text-sm text-mist">
         Час{" "}
         <select

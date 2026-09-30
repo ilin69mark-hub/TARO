@@ -37,8 +37,12 @@ self.addEventListener("fetch", (e) => {
     );
     return;
   }
-  // арты карт — CacheFirst on-demand (см. T24: 22 majors + shell precache)
-  if (url.pathname.startsWith("/cards/")) {
+  // арты карт — CacheFirst on-demand (см. T24: 22 majors + shell precache).
+  // ТОЛЬКО картинки: /cards/<file>.webp неизменяемы и адресованы по содержимому.
+  // HTML-страница /cards/<id> сюда попадать не должна — её значение меняется
+  // вместе с текстом карты в БД, а CacheFirst отдал бы устаревшую версию
+  // навсегда (кеш живёт до bump VERSION, который делается вручную).
+  if (url.pathname.startsWith("/cards/") && url.pathname.endsWith(".webp")) {
     e.respondWith(
       caches.open(VERSION).then(async (c) => {
         const cached = await c.match(e.request);

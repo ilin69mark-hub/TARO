@@ -33,11 +33,45 @@ Production override требует настоящие значения и не �
 - `TLS_CERT_DIR` для tag deployment с native TLS;
 - `NEXT_PUBLIC_BASE_URL`.
 
+Полный список не хранится вручную: он выводится из самих compose-файлов (`${VAR:?…}`) скриптом `deploy/check-env.sh`, который вызывается в префлайте `deploy.yml` **до** первого `docker compose`. Без этого compose сообщает об одной отсутствующей переменной за прогон, и нехватка ключа всплывает сырой ошибкой интерполяции посреди деплоя.
+
+```sh
+deploy/check-env.sh                      # проверить .env (значения + отсев шаблонных)
+deploy/check-env.sh --keys-only .env.example   # только наличие ключей (так проверяет CI)
+deploy/check-env.sh /path/to/other.env    # другой файл
+```
+
+Скрипт отличает «не задано» от «осталось шаблонным»: значения `CHANGE_ME*`, `dev-only-*` и `taro_dev_only` не считаются заданными, поэтому копия `.env.example` без правок не пройдёт префлайн. Полный `compose config` для prod+tls в CI — задача A33.
+
 `ADMIN_ORIGIN` не является секретом: это точное origin браузера для mutation-запросов панели. Production override требует его явно. В локальном Compose значение по умолчанию `http://127.0.0.1:${ADMIN_HOST_PORT:-8081}`, поэтому кастомный loopback-порт остаётся согласованным. Для отдельного production-домена или защищённого endpoint задайте `ADMIN_ORIGIN` явно.
 
-`api-public` принимает `AI_WORKER_MAX_ATTEMPTS` (1–20, по умолчанию 5), `AI_WORKER_BACKOFF_SECONDS` (1–3600, по умолчанию 30) и `AI_WORKER_MAX_BACKOFF_SECONDS` (1–86400, по умолчанию 900). `CRISIS_PATTERNS_JSON` ожидает JSON-массив строк, а `CRISIS_RESOURCE_TEXT` — текст ресурса; пустые значения оставляют DB/default policy. Эти переменные не содержат секретов, но production override передаёт их отдельно от `api-admin`.
+`api-public` принимает `AI_WORKER_MAX_ATTEMPTS` (1–20, по умолчанию 5), `AI_WORKER_BACKOFF_SECONDS` (1–3600, по умолчанию 30), `AI_WORKER_MAX_BACKOFF_SECONDS` (1–86400, по умолчанию 900), `AI_WORKER_TICK_SECONDS` (1–60, по умолчанию 2) и `AI_WORKER_BATCH_SIZE` (1–50, по умолчанию 10). `CRISIS_PATTERNS_JSON` ожидает JSON-массив строк, а `CRISIS_RESOURCE_TEXT` — текст ресурса; пустые значения оставляют DB/default policy. Эти переменные не содержат секретов, но production override передаёт их отдельно от `api-admin`.
+
+`AI_WORKER_TICK_SECONDS` — период ожидания **пустой** очереди, а не темп обработки: при непустой очереди воркер дренирует её немедленно, поэтому первое чтение после простоя ждёт не больше тика. `AI_WORKER_BATCH_SIZE` — сколько чтений захватывается за один drain, и он же ограничивает параллелизм генерации. До A15/F-06 обе величины были жёстко зашиты (`batch=1`, `tick=30s`) и давали потолок **2.00 readings/min** — одно чтение за 30 секунд, независимо от состояния очереди. Одно осознанное следствие: `AI_WORKER_BATCH_SIZE` умножается на число одновременных запросов к OpenRouter (по умолчанию до 10). При ограниченном rate-limit провайдера снижайте batch, а не увеличивайте тик.
+
 
 `DATABASE_URL` не должен указывать на `localhost` внутри контейнеров. Если пароль содержит специальные символы, используйте URL-encoding. Файл `.env` должен иметь режим `600`; не помещайте его в git или backup-архив.
+
+## Redis: почему `maxmemory-policy noeviction`
+
+Инстанс `cache` общий для ключей лимитов (`rl:*`), сессий (`sess:*`, `csrf:*`), entitlement-счётчиков (`ent:*`) и bulk-кэша ответов AI (`ai:cache:*`, TTL 7 суток). Политика `allkeys-lru` при достижении `maxmemory` вытесняла **любой** ключ, включая `rl:*`: окно rate-limit молча обнулялось, и клиент получал новый бюджет запросов. Это подтверждено замером — после ballast-заливки до `maxmemory` ключ `rl:/v1/spreads:ip:…` исчезал (`EXISTS` → 0).
+
+Поэтому политика инстанса — `noeviction`, а источник давления памяти ограничен: `AI_CACHE_MAX_ENTRIES` (по умолчанию 5000 записей) и обрезка самых старых записей при превышении. Следствие `noeviction` — при нехватке памяти запись возвращает OOM-ошибку, а не вытесняет ключи: `failClosed`-маршруты (`/v1/auth/*`, `/v1/readings`, `/v1/admin/*`, `/v1/referral/*`, `/v1/payments/*`, `/v1/diary`, `/v1/push/*`, `/v1/me`) отдают 503, и это осознанный размен «лимиты важнее доступности».
+
+## Redis: две роли (A17/F-43)
+
+| роль | инстанс | что лежит | `maxmemory` | политика | пароль |
+| --- | --- | --- | --- | --- | --- |
+| `critical` | `cache` | `rl:*`, `sess:*`, `csrf:*`, `ent:*` | 200 МБ (`mem_limit` 384m) | `noeviction` | `REDIS_PASSWORD` |
+| `ai_cache` | `cache-ai` | `ai:cache:*` (TTL 7 суток) | 128 МБ (`mem_limit` 192m) | `volatile-ttl` | `REDIS_AI_PASSWORD` |
+
+`api-public` и `api-admin` получают обе роли через `REDIS_AI_ADDR` / `REDIS_AI_PASSWORD`. Если `REDIS_AI_ADDR` не задан, API печатает предупреждение на старте и кэш делит инстанс `critical` — деградация заметная, а не тихая. Формат `REDIS_AI_ADDR` допускает и отдельную БД того же инстанса (`host:6379/1`) — этим пользуются тесты, чтобы разделение ключей было проверяемо, а не только задумано.
+
+`cache-ai` намеренно не публикует портов и подключён только к сети `internal`: наружу торчит лишь `admin-access`/`nginx`.
+
+Наблюдение за ролями: `GET /v1/admin/cache` (за `RequireAdmin`) отдаёт `cache_bytes{role}` в единственной форме, которую этот проект может себе позволить без prometheus — число ключей (точное) и байты (выборочная оценка через `MEMORY USAGE ... SAMPLES 1`, поле `approx`). Роли считаются раздельно: `ai_cache` и `critical`.
+
+Расчёт бюджета: 5000 записей × ~2 КБ ≈ 10 МБ при бюджете инстанса 128 МБ, поэтому до вытеснения дело не доходит. TTL 7 суток при потолке воркера 10 чтений / 2 с (до 300 чтений/мин) означает, что **связывает именно бюджет, а не TTL**: без обрезки кэш рос бы неделями. Обрезка срабатывает при превышении и оставляет 9/10 бюджета, поэтому случается не на каждой записи.
 
 При ротации VAPID меняйте пару `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` одновременно, пересоздавайте API-контейнеры и просите клиентов повторно opt-in push; старые подписки нельзя считать валидными после смены applicationServerKey.
 
@@ -101,7 +135,14 @@ ALLOW_REPAIR=1 BACKUP_FILE=/secure/path/taro-before-repair.dump ./deploy/recover
 
 `web` подключён только к `edge` и не имеет доступа к `db` или `cache`. В dev БД и Redis доступны хосту только через `127.0.0.1`; отдельная `dev-access` сеть не выдаётся web-контейнеру. Production override убирает host-порты БД и Redis. Старая сеть `internal` сохраняет совместимость при upgrade и не меняет membership-check; полная изоляция web обеспечивается именно отсутствием web в этой сети.
 
-`api-admin` слушает `127.0.0.1:8081` внутри контейнера. `admin-access` использует тот же network namespace, слушает `8082`, а host-порт проксирует только на `127.0.0.1:${ADMIN_HOST_PORT:-8081}`. Канонический origin панели по умолчанию — `http://127.0.0.1:8081` и автоматически следует за `ADMIN_HOST_PORT`; при другом origin задайте `ADMIN_ORIGIN`. Поэтому работают без публичного доступа:
+Admin-сегмент изолирован в собственной сети `admin` (`docker-compose.yml`): в ней ровно два участника — `api-admin` и `admin-access`. `api-admin` слушает `ADMIN_LISTEN_ADDR` (по умолчанию `0.0.0.0:8081`), **не публикует ни одного host-порта** и доступен только из `admin`; `api-public` в этой сети не состоит, поэтому достучаться до admin-API по сети нельзя. `admin-access` — отдельный контейнер: его nginx слушает `8082`, публикует host-порт только на `127.0.0.1:${ADMIN_HOST_PORT:-8081}` и ходит в апстрим по DNS-имени `api-admin:8081`.
+
+Два свойства, которые нельзя откатывать:
+
+* **Общего network namespace больше нет.** При `network_mode: service:api-admin` пересоздание `api-admin` (деплой, краш, `compose up -d`) оставляло `admin-access` в осиротевшем namespace без `eth0` — админка и все четыре cron-задачи (`admin-job.sh`) умирали до ручного пересоздания. Обратно не возвращать: инвариант проверяется в `ci.yml`.
+* **nginx резолвит апстрим на каждый запрос** (`resolver 127.0.0.11 valid=10s` + `proxy_pass http://$admin_api$request_uri`). Со статическим `proxy_pass http://api-admin:8081` адрес резолвится один раз на старте, и после пересоздания `api-admin` с новым IP `admin-access` отдаёт 502 до ручного рестарта — та же по симптому поломка. Из-за переменной в `proxy_pass` исходный URI нужно передавать явно через `$request_uri`.
+
+Канонический origin панели по умолчанию — `http://127.0.0.1:8081` и автоматически следует за `ADMIN_HOST_PORT`; при другом origin задайте `ADMIN_ORIGIN`. Поэтому работают без публичного доступа:
 
 ```sh
 curl --fail http://127.0.0.1:8081/healthz
@@ -125,7 +166,7 @@ SCHEMA_READINESS_MODE=deploy DEPLOY_ENV=prod ./deploy/migrate.sh verify
 Команда читает пароль из stdin, хеширует его bcrypt и связывает аккаунт с seed-пользователем-администратором. Для другого пользователя передайте его UUID через `-user-id`.
 
 ```sh
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml port api-admin 8082
+docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml port admin-access 8082
 ss -ltn
 ```
 
@@ -145,9 +186,38 @@ Cron не должен получать токен из неэкспортиро
 
 `admin-job.sh` разрешает только четыре утверждённых endpoint-а и использует `flock`.
 
+### Аудит вебхуков (A09/F-09)
+
+`payment_webhook_events` писалась всегда, но читателей не было: дубликаты списаний и расхождения вебхуков фиксировались и оставались незамеченными. Теперь их читают CLI, админ-API и панель.
+
+```sh
+# читать вручную
+printf '%s' "$ADMIN_API_TOKEN" | docker compose run --rm --no-deps -T -e ADMIN_API_TOKEN api-admin \
+  payments reconcile --since 24h
+# варианты: --all (вся история), --json (для мониторинга), --limit N
+```
+
+Код возврата: `0` — расхождений нет, `1` — ошибка запуска, `2` — есть записи, требующие внимания (`owner_unverified` считается нормой: это первый вебхук без привязанного Telegram). На этом строится алерт, пока в проекте нет метрик (F-20):
+
+```cron
+*/30 * * * * cd /opt/taro && printf '%s' "$ADMIN_API_TOKEN" | docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml run --rm --no-deps -T -e ADMIN_API_TOKEN api-admin payments reconcile --since 1h >>/var/log/taro-webhook-audit.log 2>&1; [ $? -ne 2 ] || printf '%s\n' "webhook audit: records need review" | mail -s "TARO webhook audit" ops@example.com
+```
+
+Тот же отчёт доступен админ-API `GET /v1/admin/payments/audit?since=&limit=&all=1` (за `RequireAdmin`) и в панели Taro Control, раздел «Платежи» → «Аудит вебхуков».
+
 ## Backup
 
 `backup.sh` executable, использует `flock`, временный приватный plaintext-файл, проверяет gzip и ротирует `.gz`/`.gpg`. В production `BACKUP_GPG_KEY` обязателен; при ошибке шифрования plaintext удаляется. Скрипт снимает дамп с Compose-сервиса `db`; для внешней БД нужен отдельный проверенный backup-процесс. На локальной машине отсутствие GPG-ключа только печатает предупреждение.
+
+`BACKUP_DIR` по умолчанию — соседняя с checkout директория `../taro-backups` (при checkout в `/opt/taro` это `/opt/taro-backups`). Скрипт **отказывается работать**, если `BACKUP_DIR` оказался внутри worktree: `deploy.yml` отвергает релиз, если в дереве есть любой untracked-файл, поэтому бэкап внутри репозитория блокирует все дальнейшие деплои. Каталог должен существовать и быть writable для пользователя cron, иначе скрипт завершится с ошибкой на `mkdir`:
+
+```sh
+mkdir -p /opt/taro-backups && chown deploy:deploy /opt/taro-backups && chmod 700 /opt/taro-backups
+# либо задать свой путь в crontab:
+# 0 4 * * * DEPLOY_ENV=prod BACKUP_DIR=/var/backups/taro /opt/taro/deploy/backup.sh >>/var/log/taro-backup.log 2>&1
+```
+
+В `.gitignore` также добавлены `backups/`, `taro-backups/`, `*.sql.gz`, `*.sql.gz.gpg` — это вторая линия защиты, если оператор всё же переопределит `BACKUP_DIR` внутрь репозитория в обход проверки.
 
 ## TLS и reverse proxy
 
@@ -163,6 +233,8 @@ TLS_CERT_DIR=/etc/letsencrypt/live/example.com \
 `deploy/nginx-tls.conf` включает TLS 1.2/1.3, HSTS, безопасные proxy headers и проксирует как `/healthz`, так и `/readyz` на public API. Сертификаты неизвестны этому репозиторию, поэтому native TLS не включается автоматически локальной/dev-командой. Если TLS завершает LB, используйте только base+prod override; LB должен быть единственным доверенным источником `X-Forwarded-Proto: https`; blindly trusting this header from the public port недопустимо. Перед production необходимо проверить реальный LB, `Secure` cookies и trusted proxy IP list.
 
 Nginx limits now apply to both `/v1/*` and the actual Next.js `/api/*` routes. If an external LB is used, configure `real_ip` only for its fixed CIDRs; otherwise `$binary_remote_addr` can collapse all users into one bucket. SSE reading routes `/v1/readings` and the browser-facing `/api/readings` use HTTP/1.1, disabled buffering and bounded timeouts. The CSP allows framing only from the known Telegram Web origin `https://web.telegram.org`; `X-Frame-Options: DENY` is intentionally absent because it would override that allowance. The native Telegram WebView origin was not independently verifiable here and must be checked before broadening the allowlist.
+
+**CSP не дублируется, а совпадает.** Edge делает `proxy_hide_header Content-Security-Policy` и отдаёт свою копию, поэтому политика в `web/next.config.js`, `deploy/nginx.conf` и `deploy/nginx-tls.conf` обязана быть **посимвольно одинаковой** — иначе правка в приложении молча исчезает в проде, а правка на edge расходится с dev. Равенство проверяет шаг `ci.yml` (job `security`): он сравнивает все три строки, требует `frame-ancestors 'self' https://web.telegram.org` и запрещает объявлять `X-Frame-Options` в приложении — у него нет allow-list формы, и `DENY`/`SAMEORIGIN` заломали бы фрейминг Telegram WebView. Правьте все три места вместе.
 
 ## Релиз и CI
 

@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { GO } from "@/lib/server";
-import { fwdHeaders, passThrough, bodyTooLarge, tooLarge } from "@/lib/proxy";
+import { fwdHeaders, realIP, bodyTooLarge, tooLarge, relay } from "@/lib/proxy";
 
 // Прокси к Go: только runtime, без prerender (Go недоступен при build, см. CI).
 export const dynamic = "force-dynamic";
@@ -9,10 +9,11 @@ export async function POST(req: NextRequest) {
   if (bodyTooLarge(req)) return tooLarge();
   const body = await req.text();
   const h = fwdHeaders(req);
-  // Аудит B: первый элемент X-Forwarded-For подделывается клиентом (nginx дописывает
-  // реальный IP в конец). Доверяем только X-Real-IP от nginx; иначе — unknown (лимит по IP слабее, но не обходится подменой).
-  const real = req.headers.get("x-real-ip");
-  h["X-Real-IP"] = real ? real.split(",")[0].trim() : "unknown";
+  // fwdHeaders уже ставит X-Real-IP из nginx; дублируем явно, потому что
+  // анонимная регистрация — место, где IP решает (лимит по IP + изоляция
+  // фермы), и полагаться на общий хелпер здесь не хочется.
+  h["X-Real-IP"] = realIP(req);
   const res = await fetch(`${GO}/v1/auth/anon`, { method: "POST", headers: h, body });
-  return passThrough(res);
+  return relay(res);
 }
+

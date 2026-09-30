@@ -11,10 +11,14 @@ import { csrf } from "@/lib/api";
 export default function ShareButtons({
   spread,
   readingId,
+  compact = false,
 }: {
   question: string;
   spread: string;
   readingId: string;
+  // compact — узкая колонка действий на раскладе: кнопки в столбик, мелкий
+  // кегль, без заливки, чтобы не перетягивали внимание с карт.
+  compact?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [token, setToken] = useState("");
@@ -67,6 +71,28 @@ export default function ShareButtons({
 
   // Нет токена — нечем делиться без утечки PII: ничего не рендерим.
   if (!token) return null;
+
+  if (compact) {
+    return (
+      <div className="flex flex-col items-start gap-1.5">
+        <a
+          href={tg}
+          target="_blank"
+          rel="noopener"
+          onClick={done}
+          className="rounded-lg border border-gold/40 px-3 py-1.5 text-xs text-gold"
+        >
+          Поделиться в TG
+        </a>
+        <button
+          onClick={copy}
+          className="rounded-lg border border-white/10 px-3 py-1.5 text-left text-xs text-paper"
+        >
+          {copied ? "Скопировано" : "Скопировать ссылку"}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="mt-4 flex gap-2">

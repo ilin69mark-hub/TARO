@@ -75,10 +75,14 @@ jobs:
             test -f .env
             test "$(stat -c '%a' .env)" = "600"
             grep -Eq '^BACKUP_GPG_KEY=.+$' .env
-            grep -Eq '^TLS_CERT_DIR=.+$' .env
+            test -x deploy/check-env.sh
             test -x deploy/migrate.sh
             test -x deploy/backup.sh
             test -x deploy/admin-job.sh
+            # Полный список обязательных prod-переменных — до первого вызова
+            # docker compose, иначе нехватка ключа всплывает сырой ошибкой
+            # интерполяции посреди деплоя (A06/F-32).
+            deploy/check-env.sh
             git diff --quiet
             git diff --cached --quiet
             test -z "$(git status --porcelain --untracked-files=all)"
@@ -111,7 +115,7 @@ jobs:
             curl --insecure --fail --silent --show-error --max-time 10 https://127.0.0.1/v1/spreads >/dev/null
             admin_id="$(compose ps -q api-admin)"
             test -n "$admin_id"
-            admin_endpoint="$(compose port api-admin 8082)"
+            admin_endpoint="$(compose port admin-access 8082)"
             case "$admin_endpoint" in
               127.0.0.1:*) ;;
               *) printf '%s\n' 'admin port is not loopback' >&2; exit 1 ;;

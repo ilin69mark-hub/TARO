@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,12 +41,19 @@ func testGateway(t *testing.T) (context.Context, *pgxpool.Pool, *redis.Client, *
 	t.Helper()
 	ctx, pg, rd := testutil.Live(t)
 	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
-	// e2e-тесты делят dev-Redis: чистим AI-ключи чтобы не ловить чужой кэш/breaker
-	iter := rd.Scan(ctx, 0, "ai:*", 100).Iterator()
-	for iter.Next(ctx) {
-		_ = rd.Del(ctx, iter.Val()).Err()
-	}
+	// Больше НИКАКОГО SCAN+DEL по «ai:*»: это затирало чужое состояние и ломало
+	// соседние тесты (F-18.3, счётчик breaker'а в A13/F-11). Изоляция вместо
+	// затирания — уникальный вопрос на тест: promptHash входит в ключ кэша,
+	// поэтому тест, которому нужен холодный провайдер, теперь просто спрашивает
+	// своё.
 	gw := New(pg, rd)
+	// Изоляция по идентичности вместо затирания (F-18.3): уникальная модель на
+	// каждый вызов теста. Модель входит и в promptHash (значит, в ключ кэша), и
+	// в ключ breaker'а — поэтому тест получает ХОЛОДНЫЙ кэш и НУЛЕВОЙ счётчик
+	// провайдерских отказов, не трогая состояние соседей. Раньше ради того же
+	// тесты делали SCAN+DEL по «ai:*», то есть затирали чужое.
+	model := "test/ai-" + testutil.UUID(t)
+	gw.cfgOverride = &Config{Model: model, Fallback: model, MaxTokens: 900, Temperature: 0.7, MonthlyCalls: 1000000}
 	return ctx, pg, rd, gw
 }
 
@@ -131,7 +139,7 @@ func TestE2EWorkerDrain(t *testing.T) {
 		RETURNING id`, uid).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
-	gw.drainOnce(ctx, pg)
+	drainOwn(t, ctx, pg, gw, rid)
 	var status, interp string
 	_ = pg.QueryRow(ctx, `SELECT status, interpretation FROM readings WHERE id=$1`, rid).Scan(&status, &interp)
 	if status != "done" || interp == "" {
@@ -165,6 +173,11 @@ func TestE2EStreamPanicChannelOwnership(t *testing.T) {
 	if _, err := pg.Exec(ctx, `UPDATE app_config SET value=$1 WHERE key='ai'`, value); err != nil {
 		t.Fatal(err)
 	}
+	// Конфиг задаёт сам тест — изоляция пакета (уникальная модель) снимается.
+	gw.cfgOverride = nil
+	// Тест сам конфигурирует модель через app_config — снимаем изоляцию пакета,
+	// иначе подмена из testGateway затенит его конфиг.
+	gw.cfgOverride = nil
 	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `UPDATE app_config SET value=$1 WHERE key='ai'`, old) })
 	gw.http = &http.Client{Transport: regressionPanicTransport{}}
 	ch := make(chan string, 4)
@@ -272,9 +285,12 @@ func TestE2EBudgetReservationRace(t *testing.T) {
 	if _, err := pg.Exec(ctx, `UPDATE app_config SET value=$1 WHERE key='ai'`, value); err != nil {
 		t.Fatal(err)
 	}
+	// Конфиг задаёт сам тест — изоляция пакета (уникальная модель) снимается.
+	gw.cfgOverride = nil
 	t.Cleanup(func() {
 		_, _ = pg.Exec(context.Background(), `DELETE FROM ai_budget_ledger WHERE model=$1`, model)
 		_, _ = pg.Exec(context.Background(), `UPDATE app_config SET value=$1 WHERE key='ai'`, old)
+		gw.cfgOverride = nil
 	})
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,9 +330,9 @@ func TestE2EBudgetReservationRace(t *testing.T) {
 
 func TestE2EWorkerClaimIsIdempotent(t *testing.T) {
 	ctx, pg, _, gw := testGateway(t)
-	var calls atomic.Int32
+	own := newOwnCallCounter(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		own.track(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"worker"}}]}`)
 		fmt.Fprintln(w, `data: [DONE]`)
@@ -332,8 +348,8 @@ func TestE2EWorkerClaimIsIdempotent(t *testing.T) {
 	var rid string
 	if err := pg.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
-		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
-		RETURNING id`, uid).Scan(&rid); err != nil {
+		VALUES ($1,'daily',$2, '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
+		RETURNING id`, uid, own.marker).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -350,8 +366,8 @@ func TestE2EWorkerClaimIsIdempotent(t *testing.T) {
 	if err := pg.QueryRow(ctx, `SELECT status, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if status != "done" || attempts != 1 || calls.Load() != 1 {
-		t.Fatalf("status=%s attempts=%d calls=%d", status, attempts, calls.Load())
+	if status != "done" || attempts != 1 || own.load() != 1 {
+		t.Fatalf("status=%s attempts=%d calls=%d", status, attempts, own.load())
 	}
 }
 
@@ -372,15 +388,23 @@ func TestE2EWorkerClaimsBoundedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pg.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, uid) })
-	ids := make([]string, 2)
-	for i := range ids {
+	// A15/F-06: батч больше не 1, поэтому контракт теста — «один drain НЕ
+	// превышает batchSize и каждое чтение захватывается ровно один раз».
+	// Вставляем batchSize+1: иначе при batch=10 «проверка границы» ничего не
+	// проверяла (2 строки влезали в батч целиком).
+	batch := loadWorkerPolicy().batchSize
+	ids := make([]string, 0, batch+1)
+	for i := 0; i <= batch; i++ {
+		var id string
 		if err := pg.QueryRow(ctx, `
 			INSERT INTO readings (user_id, spread_code, question, cards, seed, status, quota_state, updated_at)
-			VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','allowed',now()-interval '100 years')
-			RETURNING id`, uid).Scan(&ids[i]); err != nil {
+			VALUES ($1,'daily',$2, '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','allowed',now()-interval '100 years')
+			RETURNING id`, uid, uniqueQuestion(t)).Scan(&id); err != nil {
 			t.Fatal(err)
 		}
+		ids = append(ids, id)
 	}
+	// Ровно ОДИН drain: смысл теста — граница батча, поэтому повторять тут нельзя.
 	gw.drainOnce(ctx, pg)
 	var done, pending, attempts int
 	if err := pg.QueryRow(ctx, `
@@ -390,12 +414,12 @@ func TestE2EWorkerClaimsBoundedBatch(t *testing.T) {
 		  FROM readings WHERE id=ANY($1)`, ids).Scan(&done, &pending, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if done != 1 || pending != 1 || attempts != 1 || calls.Load() < 1 {
-		t.Fatalf("done=%d pending=%d attempts=%d calls=%d", done, pending, attempts, calls.Load())
+	if done != batch || pending != 1 || attempts != batch || calls.Load() < int32(batch) {
+		t.Fatalf("batch=%d: done=%d pending=%d attempts=%d calls=%d", batch, done, pending, attempts, calls.Load())
 	}
 }
 
-func setAIConfig(t *testing.T, ctx context.Context, pg *pgxpool.Pool, model, fallback string, monthly int) {
+func setAIConfig(t *testing.T, ctx context.Context, pg *pgxpool.Pool, gw *Gateway, model, fallback string, monthly int) {
 	t.Helper()
 	var old json.RawMessage
 	if err := pg.QueryRow(ctx, `SELECT value FROM app_config WHERE key='ai'`).Scan(&old); err != nil {
@@ -408,6 +432,12 @@ func setAIConfig(t *testing.T, ctx context.Context, pg *pgxpool.Pool, model, fal
 	if _, err := pg.Exec(ctx, `UPDATE app_config SET value=$1 WHERE key='ai'`, value); err != nil {
 		t.Fatal(err)
 	}
+	// Конфиг задаёт сам тест — изоляция пакета (уникальная модель) снимается.
+	gw.cfgOverride = nil
+	// Тест конфигурирует модель сам — изоляция пакета ему мешает.
+	if gw != nil {
+		gw.cfgOverride = nil
+	}
 	t.Cleanup(func() {
 		_, _ = pg.Exec(context.Background(), `DELETE FROM ai_budget_ledger WHERE model=$1 OR model=$2`, model, fallback)
 		_, _ = pg.Exec(context.Background(), `UPDATE app_config SET value=$1 WHERE key='ai'`, old)
@@ -418,7 +448,7 @@ func TestE2EFallbackCacheUsesFallbackIdentity(t *testing.T) {
 	ctx, pg, rd, gw := testGateway(t)
 	primary := fmt.Sprintf("test/primary-%d", time.Now().UnixNano())
 	fallback := fmt.Sprintf("test/fallback-%d", time.Now().UnixNano())
-	setAIConfig(t, ctx, pg, primary, fallback, 1000000)
+	setAIConfig(t, ctx, pg, gw, primary, fallback, 1000000)
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -458,7 +488,7 @@ func TestE2EFallbackCacheUsesFallbackIdentity(t *testing.T) {
 func TestE2EOpenBreakerDoesNotReserveBudget(t *testing.T) {
 	ctx, pg, rd, gw := testGateway(t)
 	model := fmt.Sprintf("test/breaker-%d", time.Now().UnixNano())
-	setAIConfig(t, ctx, pg, model, model, 1000000)
+	setAIConfig(t, ctx, pg, gw, model, model, 1000000)
 	if err := rd.Set(ctx, breakerKey(model), "open", time.Minute).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -487,6 +517,7 @@ func TestE2EOpenBreakerDoesNotReserveBudget(t *testing.T) {
 
 func TestE2EWorkerSkipsUnverifiedQuotaAndBoundsRetries(t *testing.T) {
 	ctx, pg, _, gw := testGateway(t)
+	own := newOwnCallCounter(t)
 	var uid string
 	if err := pg.QueryRow(ctx, `INSERT INTO users (anon_uuid) VALUES (gen_random_uuid()) RETURNING id`).Scan(&uid); err != nil {
 		t.Fatal(err)
@@ -499,9 +530,8 @@ func TestE2EWorkerSkipsUnverifiedQuotaAndBoundsRetries(t *testing.T) {
 		RETURNING id`, uid).Scan(&unverified); err != nil {
 		t.Fatal(err)
 	}
-	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		own.track(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"partial"}}]}`)
 	}))
@@ -514,31 +544,31 @@ func TestE2EWorkerSkipsUnverifiedQuotaAndBoundsRetries(t *testing.T) {
 	if err := pg.QueryRow(ctx, `SELECT status, quota_state, worker_attempts FROM readings WHERE id=$1`, unverified).Scan(&status, &quota, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if status != "pending" || quota != "error" || attempts != 0 || calls.Load() != 0 {
-		t.Fatalf("unverified row status=%s quota=%s attempts=%d calls=%d", status, quota, attempts, calls.Load())
+	if status != "pending" || quota != "error" || attempts != 0 || own.load() != 0 {
+		t.Fatalf("unverified row status=%s quota=%s attempts=%d calls=%d", status, quota, attempts, own.load())
 	}
 	model := fmt.Sprintf("test/retry-%d", time.Now().UnixNano())
-	setAIConfig(t, ctx, pg, model, model, 1000000)
+	setAIConfig(t, ctx, pg, gw, model, model, 1000000)
 	t.Setenv("AI_WORKER_MAX_ATTEMPTS", "2")
 	t.Setenv("AI_WORKER_BACKOFF_SECONDS", "1")
 	t.Setenv("AI_WORKER_MAX_BACKOFF_SECONDS", "1")
 	var rid string
 	if err := pg.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
-		VALUES ($1,'daily','retry','[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
-		RETURNING id`, uid).Scan(&rid); err != nil {
+		VALUES ($1,'daily',$2,'[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
+		RETURNING id`, uid, own.marker).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
-	gw.drainOnce(ctx, pg)
+	drainOwn(t, ctx, pg, gw, rid)
 	if _, err := pg.Exec(ctx, `UPDATE readings SET worker_lease_until=now()-interval '1 second' WHERE id=$1`, rid); err != nil {
 		t.Fatal(err)
 	}
-	gw.drainOnce(ctx, pg)
+	drainOwn(t, ctx, pg, gw, rid)
 	if err := pg.QueryRow(ctx, `SELECT status, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if status != "failed" || attempts != 2 || calls.Load() != 2 {
-		t.Fatalf("retry row status=%s attempts=%d calls=%d", status, attempts, calls.Load())
+	if status != "failed" || attempts != 2 || own.load() != 2 {
+		t.Fatalf("retry row status=%s attempts=%d calls=%d (only this test's calls count)", status, attempts, own.load())
 	}
 }
 
@@ -549,9 +579,11 @@ func TestE2EWorkerPersistsTerminalFallbackWithoutAI(t *testing.T) {
 	if gw.Enabled() {
 		t.Fatal("gateway must be disabled")
 	}
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+	// Провайдер звать нельзя, и глобальный счётчик вызовов тут бесполезен: он
+	// считает ещё и чужие чтения, забранные тем же батчем воркера (A15). Проверка
+	// делается по СОДЕРЖИМОМУ толкования: если бы провайдер позвали, в нём был бы
+	// маркер мока.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"disabled"}}]}`)
 		fmt.Fprintln(w, `data: [DONE]`)
@@ -567,18 +599,21 @@ func TestE2EWorkerPersistsTerminalFallbackWithoutAI(t *testing.T) {
 	var rid string
 	if err := pg.QueryRow(ctx, `
 		INSERT INTO readings (user_id, spread_code, question, cards, seed, status, interpretation, quota_state)
-		VALUES ($1,'daily','', '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
-		RETURNING id`, uid).Scan(&rid); err != nil {
+		VALUES ($1,'daily',$2, '[{"card_id":1,"reversed":false,"position":0}]',1,'pending','','allowed')
+		RETURNING id`, uid, uniqueQuestion(t)).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
-	gw.drainOnce(ctx, pg)
+	drainOwn(t, ctx, pg, gw, rid)
 	var status, interpretation string
 	var attempts int
 	if err := pg.QueryRow(ctx, `SELECT status, interpretation, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &interpretation, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if status != "done" || interpretation == "" || attempts != 1 || calls.Load() != 0 {
-		t.Fatalf("status=%s interpretation=%q attempts=%d calls=%d", status, interpretation, attempts, calls.Load())
+	if status != "done" || interpretation == "" || attempts != 1 {
+		t.Fatalf("status=%s interpretation=%q attempts=%d", status, interpretation, attempts)
+	}
+	if strings.Contains(interpretation, "disabled") {
+		t.Fatalf("provider must not be called when the gateway is disabled, got %q", interpretation)
 	}
 }
 
@@ -586,9 +621,9 @@ func TestE2EWorkerPersistsTerminalFallbackForIncompleteContext(t *testing.T) {
 	ctx, pg, rd := testutil.Live(t)
 	gw := New(pg, rd)
 	t.Setenv("OPENROUTER_API_KEY", "test-key-0123456789abcdef")
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+	// Как и в предыдущем тесте: «провайдер не звали» проверяется по толкованию,
+	// а не по глобальному счётчику вызовов (он ловит чужие чтения батча, A15).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"incomplete"}}]}`)
 		fmt.Fprintln(w, `data: [DONE]`)
@@ -610,14 +645,17 @@ func TestE2EWorkerPersistsTerminalFallbackForIncompleteContext(t *testing.T) {
 		RETURNING id`, uid).Scan(&rid); err != nil {
 		t.Fatal(err)
 	}
-	gw.drainOnce(ctx, pg)
+	drainOwn(t, ctx, pg, gw, rid)
 	var status, interpretation string
 	var attempts int
 	if err := pg.QueryRow(ctx, `SELECT status, interpretation, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &interpretation, &attempts); err != nil {
 		t.Fatal(err)
 	}
-	if status != "done" || interpretation == "" || attempts != 1 || calls.Load() != 0 {
-		t.Fatalf("status=%s interpretation=%q attempts=%d calls=%d", status, interpretation, attempts, calls.Load())
+	if status != "done" || interpretation == "" || attempts != 1 {
+		t.Fatalf("status=%s interpretation=%q attempts=%d", status, interpretation, attempts)
+	}
+	if strings.Contains(interpretation, "incomplete") {
+		t.Fatalf("provider must not be called for an incomplete context, got %q", interpretation)
 	}
 	gw.drainOnce(ctx, pg)
 	if err := pg.QueryRow(ctx, `SELECT status, worker_attempts FROM readings WHERE id=$1`, rid).Scan(&status, &attempts); err != nil {
@@ -675,5 +713,97 @@ func TestE2EWorkerReclaimsOnlyExpiredClaims(t *testing.T) {
 	}
 	if expiredStatus != "done" || expiredAttempts != 2 || expiredTokenAfter != "" {
 		t.Fatalf("expired claim status=%s attempts=%d token=%s", expiredStatus, expiredAttempts, expiredTokenAfter)
+	}
+}
+
+// ownCallCounter — счётчик вызовов провайдера, принадлежащих ТОЛЬКО этому
+// тесту. A15 поднял батч воркера с 1 до 10, и обычные счётчики начали ловить
+// вызовы для ЧУЖИХ чтений, забранных тем же drain (F-58): тест проигрывал по
+// чужому чтению, а не по своей ошибке. Фильтр — маркер в вопросе: вопрос входит
+// в prompt, поэтому попадание точное.
+type ownCallCounter struct {
+	marker  string
+	counter atomic.Int32
+}
+
+func newOwnCallCounter(t *testing.T) *ownCallCounter {
+	return &ownCallCounter{marker: "q-" + testutil.UUID(t)}
+}
+
+// track считает вызов и сообщает, принадлежит ли он этому тесту.
+func (c *ownCallCounter) track(r *http.Request) bool {
+	if c == nil {
+		return true
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return true
+	}
+	if !strings.Contains(string(body), c.marker) {
+		return false
+	}
+	c.counter.Add(1)
+	return true
+}
+
+func (c *ownCallCounter) load() int32 {
+	if c == nil {
+		return 0
+	}
+	return c.counter.Load()
+}
+
+// uniqueQuestion — уникальный вопрос на каждый вызов теста. promptHash входит в
+// ключ AI-кэша, поэтому такой вопрос даёт ПРОВУ (холодный кэш) без затирания
+// чужого состояния: раньше ради этого тесты вытирали весь «ai:*» через SCAN+DEL
+// и ломали соседей (F-18.3).
+func uniqueQuestion(t *testing.T) string {
+	t.Helper()
+	return "q-" + testutil.UUID(t)
+}
+
+// drainOwn повторяет drainUntilClaimed: F-58 — drainOnce забирает ЛЮБОЕ
+// подходящее чтение (workerBatchSize=1), поэтому при параллельной работе пакетов
+// тест может увидеть «своё» чтение нетронутым. Здесь мы не чиним прод-claim
+// (это отдельная карточка F-58), а делаем тест терпимым: повторяем drain, пока
+// не обработаем именно своё чтение.
+func drainOwn(t *testing.T, ctx context.Context, pg *pgxpool.Pool, gw *Gateway, readingID string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		gw.drainOnce(ctx, pg)
+		var status string
+		if err := pg.QueryRow(ctx, `SELECT status FROM readings WHERE id=$1`, readingID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" && status != "pending_fallback" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("чтение %s не обработано воркером (status=%s)", readingID, status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// drainOwnAny — то же для набора чтений: ждём, пока все они выйдут из pending.
+func drainOwnAny(t *testing.T, ctx context.Context, pg *pgxpool.Pool, gw *Gateway, ids []string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		gw.drainOnce(ctx, pg)
+		var left int
+		if err := pg.QueryRow(ctx,
+			`SELECT count(*) FROM readings WHERE id = ANY($1) AND status IN ('pending','pending_fallback')`,
+			ids).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("воркер не обработал чтения %v (pending=%d)", ids, left)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

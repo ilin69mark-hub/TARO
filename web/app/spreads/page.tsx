@@ -30,26 +30,58 @@ async function load(): Promise<Spread[]> {
 
 export default async function SpreadsPage() {
   const spreads = await load();
-  return (
-    <main className="mx-auto max-w-md px-4 pt-8">
-      <h1 className="text-3xl font-display font-semibold text-paper">Расклады</h1>
-      <StreakBadge />
-      <p className="mt-2 text-sm text-mist">Выбери ритуал на сегодня</p>
-      {spreads.length === 0 && (
-        <p className="mt-6 text-base text-mist">Каталог недоступен — загляни позже.</p>
-      )}
-      <ul className="mt-6 space-y-4">
-        {spreads.map((s) => (
-          <li key={s.code} className="rounded-2xl border border-white/10 bg-card p-5">
-            <Link href={`/spreads/${s.code}`} className="block">
-              <p className="text-lg text-paper">{s.name}</p>
-              <p className="mt-1 text-sm text-gold">
-                {s.is_premium ? "premium" : "free"}
+  // FREE слева, PREMIUM справа (владелец). Каталог без скролла: 100dvh +
+  // overflow hidden, колонки делят высоту поровну. Если раскладов станет больше,
+  // чем влезает, колонки сожмут карточки, но полосы прокрутки не будет.
+  const free = spreads.filter((s) => !s.is_premium);
+  const premium = spreads.filter((s) => s.is_premium);
+  const column = (items: Spread[], title: string, tone: "free" | "premium") => (
+    <section className="flex h-fit min-h-0 max-h-full flex-col">
+      {/* Заголовок стоит НАД карточками, а не в самом верху экрана: колонки
+          тянутся на всю высоту, и «шапка экрана» отрывалась от своего списка.
+          content-start (не center) выравнивает верхние карточки обеих колонок
+          по одной линии — при разном числе раскладов center разносил их. */}
+      <h2
+        className={`shrink-0 border-b border-white/10 pb-2 text-center text-sm uppercase tracking-[0.2em] ${
+          tone === "premium" ? "text-gold" : "text-mist"
+        }`}
+      >
+        {title}
+      </h2>
+      <ul className="mt-3 grid min-h-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto">
+        {items.map((s) => (
+          <li key={s.code} className="rounded-2xl border border-white/10 bg-card p-4">
+            <Link href={`/spreads/${s.code}`} className="block text-center">
+              <p className="text-base leading-snug text-paper">{s.name}</p>
+              <p className={`mt-0.5 text-xs ${tone === "premium" ? "text-gold" : "text-mist"}`}>
+                {tone === "premium" ? "премиум" : "бесплатно"}
               </p>
             </Link>
           </li>
         ))}
       </ul>
+    </section>
+  );
+  return (
+    <main className="px-4 pt-6">
+      <div className="mx-auto flex h-[100dvh] max-w-3xl flex-col pb-20">
+        <header className="shrink-0 text-center">
+          <h1 className="font-display text-2xl font-semibold text-paper">Расклады</h1>
+          <StreakBadge />
+        </header>
+        {spreads.length === 0 ? (
+          <p className="mt-8 text-center text-base text-mist">Каталог недоступен — загляни позже.</p>
+        ) : (
+          // content-center центрирует БЛОК колонок по вертикали (владелец:
+          // «не сверху, а по центру»). Внутри колонок остаётся content-start —
+          // иначе верхние карточки FREE и PREMIUM снова разъедутся по вертикали,
+          // ведь раскладов в колонках разное количество.
+          <div className="mt-4 grid min-h-0 flex-1 auto-rows-min content-center grid-cols-1 gap-4 sm:grid-cols-2 sm:auto-rows-auto">
+            {column(free, "Бесплатные", "free")}
+            {column(premium, "Премиум", "premium")}
+          </div>
+        )}
+      </div>
     </main>
   );
 }

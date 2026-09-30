@@ -38,10 +38,35 @@ function proxyOrigin(): string {
   );
 }
 
+/**
+ * realIP — адрес клиента от nginx.
+ *
+ * Доверяем ТОЛЬКО `X-Real-IP`, который ставит nginx (`$remote_addr`). Первый
+ * элемент `X-Forwarded-For` клиент подделывает сам (nginx дописывает реальный
+ * адрес в конец), поэтому XFF не используем.
+ *
+ * Раньше это правило было продублировано ровно в одном роуте (`auth/anon`),
+ * а `fwdHeaders` его не пробрасывал. Последствия были неочевидны:
+ *   - антиферма рефералки получала пустой IP — IP-сигнал и кластерный
+ *     IP-счётчик молча работали вхолостую (юнит-тесты зелёные, т.к. звали
+ *     Go-хендлер напрямую с заголовком; поймал только живый прогон);
+ *   - `ratelimit` с `byUser=false` (/v1/auth/, /v1/spreads, /v1/share) ключевал
+ *     по IP, а IP был пустым — все анонимные юзеры делили ОДИН бакет.
+ *
+ * Поэтому правило живёт здесь и вызывается из fwdHeaders, то есть на всех
+ * прокси-роутах сразу.
+ */
+export function realIP(req: NextRequest): string {
+  const v = req.headers.get("x-real-ip");
+  if (!v) return "unknown";
+  return v.split(",")[0].trim() || "unknown";
+}
+
 export function fwdHeaders(req: NextRequest): Record<string, string> {
   const h: Record<string, string> = {
     "Content-Type": "application/json",
     Cookie: req.headers.get("cookie") || "",
+    "X-Real-IP": realIP(req),
   };
   for (const k of ["X-CSRF", "Idempotency-Key"]) {
     const v = req.headers.get(k);
@@ -103,6 +128,43 @@ export async function passThrough(res: Response) {
   const body = await res.arrayBuffer();
   const out = new NextResponse(body, { status: res.status });
   copyResponseHeaders(res.headers, out.headers);
+  return out;
+}
+
+// relay — ЕДИНАЯ точка возврата ответа Go в браузер (A20/F-13).
+//
+// До A20 каждый роут собирал NextResponse руками и копировал только
+// content-type (иногда вместе с Content-Disposition). Терялись:
+//   - Set-Cookie — вместе с ним ротация CSRF и обновление сессии: браузер
+//     оставался со старым токеном до 401, и «прозрачный» прокси переставал быть
+//     прозрачным;
+//   - Retry-After — при 429 клиент не знал, когда повторить;
+//   - любые будущие заголовки Go (X-Request-Id, RateLimit-*), о которых
+//     Next-роут не знал и потому молча срезал их.
+//
+// Роуты обязаны звать relay/relayStream, а не собирать ответ сами. hop-by-hop
+// заголовки (Connection, Transfer-Encoding и прочие) по-прежнему не копируются:
+// они относятся к соединению Go↔Next, а не к ответу клиенту.
+export function relay(res: Response): Promise<NextResponse> {
+  return passThrough(res);
+}
+
+// relayStream — то же для потоковых ответов (SSE чтения). Тело не буферизуется:
+// буферизация съела бы весь «живой» поток и держала бы соединение до конца
+// генерации.
+export function relayStream(res: Response): NextResponse {
+  const out = new NextResponse(res.body, { status: res.status });
+  copyResponseHeaders(res.headers, out.headers);
+  out.headers.set("Cache-Control", "no-store");
+  return out;
+}
+
+// relayJSON — буферизованный ответ с принудительным no-store. Для приватных
+// данных (история, дневник, профиль) кэш прокси недопустим даже если Go забыл
+// про Cache-Control.
+export async function relayJSON(res: Response): Promise<NextResponse> {
+  const out = await passThrough(res);
+  out.headers.set("Cache-Control", "no-store");
   return out;
 }
 

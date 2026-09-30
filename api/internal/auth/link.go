@@ -37,13 +37,13 @@ func (s *Service) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(CookieName)
 		if err != nil {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Нужен вход")
 			return
 		}
 		claims, err := parseJWT(c.Value)
 		if err != nil || claims.Subject == "" || claims.JTI == "" || !isUUID(claims.Subject) || strings.HasPrefix(claims.Subject, "admin:") {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия истекла, войди снова")
 			return
 		}
@@ -53,7 +53,7 @@ func (s *Service) RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 		if !markerOK {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 			return
 		}
@@ -64,14 +64,14 @@ func (s *Service) RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 		if !active {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 			apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Сессия завершена, войди снова")
 			return
 		}
 		ctx := context.WithValue(r.Context(), userCtxKey{}, claims.Subject)
 		ctx = context.WithValue(ctx, sessionClaimsKey{}, claims)
 		if r.Method == http.MethodDelete && r.URL.Path == "/v1/me" {
-			ExpireAuthCookies(w)
+			ExpireAuthCookies(w, r)
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -84,30 +84,89 @@ func UserID(ctx context.Context) string {
 
 func (s *Service) HandleLink(w http.ResponseWriter, r *http.Request) {
 	current := UserID(r.Context())
-	if current == "" {
-		apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Нужен вход")
-		return
-	}
 	var req struct {
 		InitData    string `json:"initData"`
 		Fingerprint string `json:"fingerprint"`
+		Handoff     string `json:"handoff"`
 	}
 	if !apierr.Decode(w, r, &req) || req.InitData == "" {
 		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Некорректный initData")
 		return
 	}
-	fp := fpOf(r, req.Fingerprint)
-	if !validFingerprint(fp, true) {
-		apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен fingerprint")
+	viaHandoff := req.Handoff != ""
+	if viaHandoff {
+		if !s.handoffEnabled(r.Context()) {
+			apierr.Write(w, http.StatusNotFound, "NOT_FOUND", "Перенос недоступен")
+			return
+		}
+		if s.handoffTooManyTries(r.Context(), req.Handoff) {
+			apierr.Write(w, http.StatusTooManyRequests, apierr.CodeRateLimited, "Слишком много попыток, попробуй позже")
+			return
+		}
+	}
+
+	if current == "" && !viaHandoff {
+		apierr.Write(w, http.StatusUnauthorized, apierr.CodeUnauthorized, "Нужен вход")
 		return
 	}
+	// Fingerprint обязателен для привязки внутри Telegram (это защита от
+	// подделки user_id), но для переноса он бессмыслен: устройство у WebView и
+	// у браузера разное по определению, и требовать совпадения — значит
+	// запретить перенос полностью. Привязку по сети отдаёт токен.
+	fp := req.Fingerprint
+	if !viaHandoff {
+		fp = fpOf(r, req.Fingerprint)
+		if !validFingerprint(fp, true) {
+			apierr.Write(w, http.StatusUnprocessableEntity, apierr.CodeValidation, "Нужен fingerprint")
+			return
+		}
+	}
+	// Живая подпись Telegram проверяется ДО расходования токена. Порядок найден
+	// не рассуждением, а живым прогоном: с обратным порядком битый initData
+	// сжигал одноразовый токен, и человек, у которого WebApp не успел
+	// проинициализироваться, терял перенос и обязан был начинать заново из
+	// браузера. Здесь же отсекается и перебор: без верной подписи до токена
+	// дело не доходит.
 	tgID, err := VerifyInitData(req.InitData, os.Getenv("TG_BOT_TOKEN"))
 	if err != nil {
+		if viaHandoff {
+			// Попытку считаем, токен — нет: иначе перебор подписи по одному
+			// токену стоил бы человеку его перенос.
+			s.noteHandoffTry(r.Context(), req.Handoff)
+		}
 		apierr.Write(w, http.StatusUnauthorized, apierr.CodeInvalidTg, "Не удалось подтвердить Telegram")
 		return
 	}
-	survivor, merged, err := s.Link(r.Context(), current, tgID, fp)
+
+	// Теперь токен можно потратить: подпись настоящая, сеть совпала (внутри
+	// ConsumeHandoff), а GETDEL делает это атомарно — второй раз читать нечего.
+	if viaHandoff {
+		handed, _, herr := s.ConsumeHandoff(r.Context(), req.Handoff, clientIP(r))
+		if herr != nil {
+			s.noteHandoffTry(r.Context(), req.Handoff)
+			linkError(w, herr, false)
+			return
+		}
+		// Именно токен — источник истины, а не cookie.
+		//
+		// Так и задумано: внутри Telegram у WebView НЕТ браузерной сессии
+		// (он никогда не видел cookie анонима), так что пустая сессия здесь —
+		// норма, а не ошибка.
+		//
+		// Сверять current с токеном было бы вредно: у человека, который уже
+		// привязан к Telegram и потом заплатил анонимно с нового устройства,
+		// сессия в WebView есть и указывает на старый аккаунт. Такая сверка
+		// отбила бы перенос с внятным, но неверным HANDOFF_IP_MISMATCH.
+		// Защиту тут даёт не сверка, а связка «токен + живая подпись initData +
+		// сеть» (см. остаточный риск в 04-api-spec).
+		current = handed
+	}
+	survivor, merged, err := s.Link(r.Context(), current, tgID, fp, viaHandoff)
 	if err != nil {
+		if viaHandoff {
+			linkError(w, err, true)
+			return
+		}
 		switch {
 		case errors.Is(err, errAlreadyLinked):
 			apierr.Write(w, http.StatusConflict, "ALREADY_LINKED", "Telegram уже привязан")
@@ -125,17 +184,26 @@ func (s *Service) HandleLink(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	csrf, err := s.issueCSRF(w, r.Context(), survivor)
+	csrf, err := s.issueCSRF(w, r, r.Context(), survivor)
 	if err != nil {
 		if s.rd != nil {
 			_ = s.rd.Del(r.Context(), sessKey(survivor), "csrf:"+survivor).Err()
 		}
-		ExpireAuthCookies(w)
+		ExpireAuthCookies(w, r)
 		apierr.Write(w, http.StatusServiceUnavailable, apierr.CodeUnavailable, "Сервис занят, попробуй позже")
 		return
 	}
-	writeCookie(w, tok, UserTTL)
-	writeFpCookie(w, fp)
+	writeCookie(w, r, tok, UserTTL)
+	writeFpCookie(w, r, fp)
+	// Аудит переноса: без строки «куда ушло слияние» вопрос «мой аккаунт куда
+	// делся» не закрывается (см. auth_handoffs, миграция 040). Пишем ПОСЛЕ
+	// успешного слияния: Redis-токен к этому моменту уже поглощён, и журнал —
+	// единственное, что осталось.
+	if viaHandoff {
+		if err := s.RecordHandoffConsumed(r.Context(), current, tgID); err != nil {
+			_ = err
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"merged": merged, "user_id": survivor, "csrf_token": csrf})
 }
@@ -146,8 +214,19 @@ var (
 	errMergeCycle    = errors.New("merge_cycle")
 )
 
-func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerprint string) (string, bool, error) {
-	if !validFingerprint(fingerprint, true) {
+// Link — слияние аккаунта Telegram и анонимного.
+//
+// viaHandoff меняет ровно две вещи, и обе про безопасность:
+//
+//  1. Проверка fingerprint'а отключается. Внутри Telegram она защищает от
+//     подделки user_id; при переносе user_id приходит из одноразового токена,
+//     а устройство у WebView и у браузера разное по определению. Остальная
+//     защита (живая подпись initData, одноразовость, привязка к сети) на месте.
+//  2. Проигравшая строка не удаляется, а переводится в status='merged' (см.
+//     миграцию 040). Иначе пересланный токен из той же сети отнял бы покупку
+//     безвозвратно, и «обратимость» была бы обещанием без содержания.
+func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerprint string, viaHandoff bool) (string, bool, error) {
+	if !viaHandoff && !validFingerprint(fingerprint, true) {
 		return "", false, fmt.Errorf("fingerprint_required")
 	}
 	tx, err := s.pg.Begin(ctx)
@@ -165,12 +244,12 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if cur.Status != "active" {
 		return "", false, fmt.Errorf("user inactive")
 	}
-	if cur.Fingerprint != "" && !fingerprintsEqual(cur.Fingerprint, fingerprint) {
+	if !viaHandoff && cur.Fingerprint != "" && !fingerprintsEqual(cur.Fingerprint, fingerprint) {
 		return "", false, fmt.Errorf("fp_mismatch")
 	}
 	if cur.TGID != nil {
 		if *cur.TGID == tgID {
-			if cur.Fingerprint != "" && !fingerprintsEqual(cur.Fingerprint, fingerprint) {
+			if !viaHandoff && cur.Fingerprint != "" && !fingerprintsEqual(cur.Fingerprint, fingerprint) {
 				return "", false, fmt.Errorf("fp_mismatch")
 			}
 			if cur.Fingerprint == "" {
@@ -195,8 +274,14 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 		if tag.RowsAffected() != 1 {
 			return "", false, errAlreadyLinked
 		}
-		if _, _, err := grantTrialTx(ctx, tx, current, tgID, fingerprint); err != nil {
-			return "", false, err
+		// Триал при переносе не начисляем: человек уже заплатил, и выдача
+		// триала поверх оплаченного тарифа — это подарок за то, что он
+		// переносится. На обычной привязке внутри Telegram триал, наоборот,
+		// положен.
+		if !viaHandoff {
+			if _, _, err := grantTrialTx(ctx, tx, current, tgID, fingerprint); err != nil {
+				return "", false, err
+			}
 		}
 		if err := s.revokeSessions(ctx, current); err != nil {
 			return "", false, err
@@ -215,7 +300,7 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if other.Status != "active" {
 		return "", false, fmt.Errorf("user inactive")
 	}
-	if other.Fingerprint != "" && !fingerprintsEqual(other.Fingerprint, fingerprint) {
+	if !viaHandoff && other.Fingerprint != "" && !fingerprintsEqual(other.Fingerprint, fingerprint) {
 		return "", false, fmt.Errorf("fp_mismatch")
 	}
 	if err := rejectReferralCyclesTx(ctx, tx, other.ID, current); err != nil {
@@ -224,7 +309,7 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if err := rejectReferralSelfTx(ctx, tx, other.ID, current); err != nil {
 		return "", false, err
 	}
-	if err := mergeMetadataTx(ctx, tx, other, cur, fingerprint); err != nil {
+	if err := mergeMetadataTx(ctx, tx, other, cur, fingerprint, viaHandoff); err != nil {
 		return "", false, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE readings l SET idempotency_key=l.id::text
@@ -252,13 +337,27 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if _, err := tx.Exec(ctx, `UPDATE reading_authorization_receipts SET user_id=$1 WHERE user_id=$2`, other.ID, current); err != nil {
 		return "", false, err
 	}
+	// Схлопывание дублей подписки одного плана (A11/F-25).
+	// payment_id IS NULL — обязательное условие: строка, за которой стоит
+	// платёж, несёт provenance. Если её удалить, возврат по этому платежу
+	// (finalizeRefund: UPDATE subscriptions … WHERE payment_id=$1) перестанет
+	// отзывать entitlement — деньги вернутся, а доступ останется.
+	// Дни при этом не теряются: entitlement считается как max(valid_until)
+	// по активным строкам, а сохранённая строка имеет больший valid_until.
 	if _, err := tx.Exec(ctx, `DELETE FROM subscriptions s USING subscriptions keep
 		WHERE s.user_id=$1 AND keep.user_id=$1 AND s.id<>keep.id
-		  AND s.plan_code=keep.plan_code AND s.valid_until <= keep.valid_until`, other.ID); err != nil {
+		  AND s.plan_code=keep.plan_code AND s.valid_until <= keep.valid_until
+		  AND s.payment_id IS NULL`, other.ID); err != nil {
 		return "", false, err
 	}
-	if _, _, err := grantTrialTx(ctx, tx, other.ID, tgID, fingerprint); err != nil {
-		return "", false, err
+	// Триал при переносе не начисляем: grantTrialTx ведёт учёт по tg_id, и
+	// повторный вызов на уже полученный триал всё равно no-op — но лишний
+	// проход по таблице лишний, а при переносе токен мог быть выдан человеку,
+	// который уже пользовался триалом в Telegram.
+	if !viaHandoff {
+		if _, _, err := grantTrialTx(ctx, tx, other.ID, tgID, fingerprint); err != nil {
+			return "", false, err
+		}
 	}
 	if err := resolveReferralMergeTx(ctx, tx, other.ID, current); err != nil {
 		return "", false, err
@@ -275,7 +374,16 @@ func (s *Service) Link(ctx context.Context, current string, tgID int64, fingerpr
 	if err := s.revokeSessions(ctx, current, other.ID); err != nil {
 		return "", false, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id=$1`, current); err != nil {
+	// Проигравшая строка НЕ удаляется: переводится в 'merged'. Удаление было
+	// необратимым, и пересланный токен из той же сети забирал бы покупку
+	// навсегда — вместе с возможностью это отменить.
+	//
+	// anon_uuid освобождаем: он UNIQUE, и оставленная строка заблокировала бы
+	// пересоздание анонимной личности с тем же uuid из localStorage, то есть
+	// после переноса человек не смог бы зайти вообще.
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET status='merged', anon_uuid=NULL, referral_code=NULL
+		WHERE id=$1`, current); err != nil {
 		return "", false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -305,8 +413,14 @@ func scanUser(row pgx.Row) (mergeUser, error) {
 	return u, err
 }
 
-func mergeMetadataTx(ctx context.Context, tx pgx.Tx, survivor, loser mergeUser, fingerprint string) error {
-	if survivor.Fingerprint != "" && loser.Fingerprint != "" && !fingerprintsEqual(survivor.Fingerprint, loser.Fingerprint) {
+// viaHandoff снимает сверку fingerprint'ов двух аккаунтов. Это САМЫЙ важный
+// момент здесь: без исключения перенос не работал бы вообще никогда. У
+// анонима в браузере fingerprint от клиентского JS, у Telegram-аккаунта — от
+// Telegram WebApp; устройства по определению разные, и совпасть они могут
+// только случайно. Сверка остаётся ровно там, где она что-то защищает:
+// внутри Telegram (Link с viaHandoff=false).
+func mergeMetadataTx(ctx context.Context, tx pgx.Tx, survivor, loser mergeUser, fingerprint string, viaHandoff bool) error {
+	if !viaHandoff && survivor.Fingerprint != "" && loser.Fingerprint != "" && !fingerprintsEqual(survivor.Fingerprint, loser.Fingerprint) {
 		return fmt.Errorf("fp_mismatch")
 	}
 	if survivor.Fingerprint == "" {

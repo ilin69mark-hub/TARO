@@ -50,6 +50,7 @@ func TestE2EAuthGuards(t *testing.T) {
 
 	post := func(tok, path, body, csrfHdr string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.RemoteAddr = testIP(t) + ":1234"
 		req.Header.Set("Content-Type", "application/json")
 		if csrfHdr != "" {
 			req.Header.Set("X-CSRF", csrfHdr)
@@ -63,6 +64,7 @@ func TestE2EAuthGuards(t *testing.T) {
 	}
 	postOrigin := func(tok, path, body, csrfHdr, origin string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.RemoteAddr = testIP(t) + ":1234"
 		req.Header.Set("Content-Type", "application/json")
 		if csrfHdr != "" {
 			req.Header.Set("X-CSRF", csrfHdr)
@@ -231,6 +233,7 @@ func TestE2EUUIDHardening(t *testing.T) {
 	r, _, _, _ := sessionRouter(t)
 	post := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/v1/auth/anon", strings.NewReader(body))
+		req.RemoteAddr = testIP(t) + ":1234"
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)

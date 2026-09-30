@@ -3,9 +3,11 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,9 +19,21 @@ const (
 	defaultWorkerMaxAttempts = 5
 	defaultWorkerBackoff     = 30 * time.Second
 	defaultWorkerMaxBackoff  = 15 * time.Minute
-	workerBatchSize          = 1
 	workerProcessingTimeout  = 30 * time.Second
 	workerLeaseDuration      = 2 * time.Minute
+	// A15/F-06: потолок воркера был 1 чтение за 30 с = 2.00 readings/min
+	// (жёсткие batch=1 и tick=30s). Теперь расписание конфигурируемо, по
+	// умолчанию 10 чтений за 2 с, а обработанный батч обрабатывается ПАРАЛЛЕЛЬНО:
+	// последовательный цикл по 10 строкам при генерации по 5 с давал бы те же
+	// 0.2 чтения/с.
+	defaultWorkerBatchSize = 10
+	defaultWorkerTick      = 2 * time.Second
+	minWorkerTick          = 1 * time.Second
+	maxWorkerTick          = 60 * time.Second
+	// workerFailedReason — машиночитаемая причина терминального провала.
+	// Наружу отдаётся только код: текст ошибки провайдера может содержать
+	// детали запроса/ключа и клиенту не нужен (A12/F-12).
+	workerFailedReason = "provider_failed"
 )
 
 type workerJob struct {
@@ -37,6 +51,10 @@ type workerPolicy struct {
 	maxAttempts int
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
+	// batchSize — сколько чтений воркер захватывает за один drain. Он же
+	// ограничивает параллелизм обработки: отдельного параметра concurrency нет
+	// намеренно, иначе «захватили 10, обработали 1» снова даст потолок.
+	batchSize int
 }
 
 func envInt(name string, fallback, min, max int) int {
@@ -55,11 +73,27 @@ func loadWorkerPolicy() workerPolicy {
 		maxAttempts: envInt("AI_WORKER_MAX_ATTEMPTS", defaultWorkerMaxAttempts, 1, 20),
 		baseBackoff: time.Duration(envInt("AI_WORKER_BACKOFF_SECONDS", int(defaultWorkerBackoff/time.Second), 1, 3600)) * time.Second,
 		maxBackoff:  time.Duration(envInt("AI_WORKER_MAX_BACKOFF_SECONDS", int(defaultWorkerMaxBackoff/time.Second), 1, 86400)) * time.Second,
+		batchSize:   envInt("AI_WORKER_BATCH_SIZE", defaultWorkerBatchSize, 1, 50),
 	}
 	if policy.maxBackoff < policy.baseBackoff {
 		policy.maxBackoff = policy.baseBackoff
 	}
 	return policy
+}
+
+// WorkerTick — экспортная обёртка tick'а для точки сборки (cmd/api). Держим
+// публичным, чтобы main.go не знал про дефолты, а потолок воркера менялся
+// одной правкой здесь (A15/F-06).
+func WorkerTick() time.Duration { return workerTick() }
+
+// workerTick — период ожидания воркера, когда очередь ПУСТА. A15/F-06: раньше
+// здесь стояло жёсткое 30*time.Second в cmd/api/main.go, и вместе с batch=1
+// это давало жёсткий потолок 2.00 readings/min: за 30 секунд пользователь
+// ждал ровно одно чтение независимо от того, что очередь пуста.
+func workerTick() time.Duration {
+	seconds := envInt("AI_WORKER_TICK_SECONDS", int(defaultWorkerTick/time.Second),
+		int(minWorkerTick/time.Second), int(maxWorkerTick/time.Second))
+	return time.Duration(seconds) * time.Second
 }
 
 func (p workerPolicy) backoff(attempt int) time.Duration {
@@ -87,6 +121,21 @@ func (g *Gateway) StartWorker(ctx context.Context, pg *pgxpool.Pool, tick time.D
 	g.startWorker(ctx, pg, tick)
 }
 
+// drainStats — наблюдаемость A15/F-06. В проекте нет метрик-стека (нет
+// prometheus), поэтому глубина очереди и факт обработки уходят в лог входа
+// плюс возвращаются вызывающему: без этого потолок воркера невидим.
+type drainStats struct {
+	claimed    int
+	persisted  int
+	queueDepth int
+	batchSize  int
+	exhausted  int
+}
+
+// full сообщает, что батч забран целиком — значит очередь, скорее всего, не
+// пуста и ждать следующего тика незачем.
+func (s drainStats) full() bool { return s.batchSize > 0 && s.claimed >= s.batchSize }
+
 func (g *Gateway) startWorker(ctx context.Context, pg *pgxpool.Pool, tick time.Duration) <-chan struct{} {
 	done := make(chan struct{})
 	if tick <= 0 {
@@ -98,35 +147,70 @@ func (g *Gateway) startWorker(ctx context.Context, pg *pgxpool.Pool, tick time.D
 		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
 		for {
+			stats := drainStats{}
+			func() {
+				defer func() { _ = recover() }()
+				stats = g.drainOnce(ctx, pg)
+			}()
+			if ctx.Err() != nil {
+				return
+			}
+			// A15/F-06: тик — это период ожидания ПУСТОЙ очереди, а не темп
+			// обработки. Если батч забран целиком, дренируем сразу: иначе
+			// 10 чтений ждали бы следующего тика каждое.
+			if stats.claimed > 0 || stats.exhausted > 0 {
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				func() {
-					defer func() { _ = recover() }()
-					g.drainOnce(ctx, pg)
-				}()
 			}
 		}
 	}()
 	return done
 }
 
-func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) {
+func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) drainStats {
 	defer func() { _ = recover() }()
+	stats := drainStats{batchSize: loadWorkerPolicy().batchSize}
 	if pg == nil {
-		return
+		return stats
 	}
 	policy := loadWorkerPolicy()
+	stats.batchSize = policy.batchSize
 	recovery := entitlements.New(pg, g.rd)
 	_ = recovery.RecoverPendingAuthorizations(ctx, 20)
-	_, _ = pg.Exec(ctx, `
+	// A12/F-12: те же правила освобождения, что и в markFailed — массовый
+	// переход «попытки исчерпаны» тоже обязан вернуть entitlement.
+	exhausted, exhaustedErr := pg.Query(ctx, `
 		UPDATE readings
-		   SET status='failed', worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now()
+		   SET status='failed', failure_reason=$2, failed_at=now(),
+		       worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now()
 		 WHERE status IN ('pending', 'pending_fallback')
 		   AND quota_state='allowed'
 		   AND worker_attempts >= $1
-		   AND (worker_lease_until IS NULL OR worker_lease_until <= now())`, policy.maxAttempts)
+		   AND (worker_lease_until IS NULL OR worker_lease_until <= now())
+		RETURNING id::text`, policy.maxAttempts, workerFailedReason)
+	if exhaustedErr != nil {
+		log.Printf("ai worker: exhausted transition: %v", exhaustedErr)
+	}
+	if exhausted != nil {
+		var ids []string
+		for exhausted.Next() {
+			var id string
+			if exhausted.Scan(&id) == nil {
+				ids = append(ids, id)
+			}
+		}
+		exhausted.Close()
+		stats.exhausted = len(ids)
+		for _, id := range ids {
+			if _, err := recovery.ReleaseReadingAuthorization(ctx, id); err != nil {
+				log.Printf("ai worker: release authorization for failed reading %s: %v", id, err)
+			}
+		}
+	}
 	rows, err := pg.Query(ctx, `
 		WITH candidates AS (
 			SELECT id
@@ -146,11 +230,11 @@ func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) {
 		       updated_at=now()
 		  FROM candidates
 		 WHERE r.id=candidates.id
-		RETURNING r.id::text, r.spread_code, COALESCE(r.question,''), r.cards, r.worker_claim_token::text, r.worker_attempts`, policy.maxAttempts, workerBatchSize, int(workerLeaseDuration/time.Second))
+		RETURNING r.id::text, r.spread_code, COALESCE(r.question,''), r.cards, r.worker_claim_token::text, r.worker_attempts`, policy.maxAttempts, policy.batchSize, int(workerLeaseDuration/time.Second))
 	if err != nil {
-		return
+		return stats
 	}
-	jobs := make([]workerJob, 0, workerBatchSize)
+	jobs := make([]workerJob, 0, policy.batchSize)
 	for rows.Next() {
 		var job workerJob
 		if err := rows.Scan(&job.id, &job.spread, &job.question, &job.cardsRaw, &job.token, &job.attempts); err == nil {
@@ -158,47 +242,98 @@ func (g *Gateway) drainOnce(ctx context.Context, pg *pgxpool.Pool) {
 		}
 	}
 	rows.Close()
+	stats.claimed = len(jobs)
+	stats.queueDepth = pendingQueueDepth(ctx, pg)
+	if len(jobs) == 0 {
+		return stats
+	}
+
+	// A15/F-06: параллельная обработка батча. Каждая задача имеет собственный
+	// claim-токен и собственный контекст, поэтому запись в БД по-прежнему
+	// защищена `worker_claim_token=$4` и две обработки одного чтения
+	// невозможны. Порядок не важен: у каждой строки своя транзакция.
+	var wg sync.WaitGroup
+	persisted := make([]bool, len(jobs))
 	for i := range jobs {
 		job := &jobs[i]
-		jobCtx, cancel := workerJobContext(ctx)
-		cards, ok := loadWorkerCards(jobCtx, pg, job.cardsRaw)
-		if !ok {
-			cancel()
-			g.failClaim(pg, job, policy)
-			continue
-		}
-		job.cards = cards
-		positions, spread, complete := loadWorkerSpread(jobCtx, pg, job.cardsRaw, job.spread)
-		if !complete || !g.Enabled() {
-			cancel()
-			g.persistTerminalFallback(pg, job, FallbackInterpretation(cards))
-			continue
-		}
-		job.positions = positions
-		job.spread = spread
-		text := g.completeReading(jobCtx, job.id, job.spread, job.positions, job.cards, job.question)
-		cancel()
-		if text == "" {
-			g.failClaim(pg, job, policy)
-			continue
-		}
-		status := "done"
-		if ContainsStopWords(text) || text == SafeReplacement {
-			text = SafeReplacement
-			status = "filtered"
-		}
-		persistCtx, persistCancel := persistenceContext()
-		tag, err := pg.Exec(persistCtx, `
-			UPDATE readings
-			   SET interpretation=$1, status=$2, worker_claim_token=NULL,
-			       worker_lease_until=NULL, updated_at=now()
-			 WHERE id=$3 AND worker_claim_token=$4
-			   AND status IN ('pending', 'pending_fallback') AND quota_state='allowed'`, text, status, job.id, job.token)
-		persistCancel()
-		if err != nil || tag.RowsAffected() != 1 {
-			g.failClaim(pg, job, policy)
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			defer func() { _ = recover() }()
+			persisted[index] = g.processClaim(ctx, pg, job, policy)
+		}(i)
+	}
+	wg.Wait()
+	for _, ok := range persisted {
+		if ok {
+			stats.persisted++
 		}
 	}
+	log.Printf("ai worker: drain claimed=%d persisted=%d queue=%d batch=%d exhausted=%d",
+		stats.claimed, stats.persisted, stats.queueDepth, stats.batchSize, stats.exhausted)
+	return stats
+}
+
+// pendingQueueDepth — сколько чтений ждут воркера. Считается по партиальному
+// индексу idx_readings_worker_quota (index-only scan).
+func pendingQueueDepth(ctx context.Context, pg *pgxpool.Pool) int {
+	if pg == nil {
+		return 0
+	}
+	var depth int
+	if err := pg.QueryRow(ctx, `
+		SELECT count(*) FROM readings
+		 WHERE status IN ('pending', 'pending_fallback')
+		   AND quota_state='allowed'`).Scan(&depth); err != nil {
+		return -1
+	}
+	return depth
+}
+
+// processClaim обрабатывает одно захваченное чтение. Возвращает true, если
+// результат записан в БД (done/filtered), false — если чтение отпущено с
+// backoff или помечено failed.
+func (g *Gateway) processClaim(ctx context.Context, pg *pgxpool.Pool, job *workerJob, policy workerPolicy) bool {
+	jobCtx, cancel := workerJobContext(ctx)
+	cards, ok := loadWorkerCards(jobCtx, pg, job.cardsRaw)
+	if !ok {
+		cancel()
+		g.failClaim(pg, job, policy)
+		return false
+	}
+	job.cards = cards
+	positions, spread, complete := loadWorkerSpread(jobCtx, pg, job.cardsRaw, job.spread)
+	if !complete || !g.Enabled() {
+		cancel()
+		g.persistTerminalFallback(pg, job, FallbackInterpretation(cards))
+		return true
+	}
+	job.positions = positions
+	job.spread = spread
+	text := g.completeReading(jobCtx, job.id, job.spread, job.positions, job.cards, job.question)
+	cancel()
+	if text == "" {
+		g.failClaim(pg, job, policy)
+		return false
+	}
+	status := "done"
+	if ContainsStopWords(text) || text == SafeReplacement {
+		text = SafeReplacement
+		status = "filtered"
+	}
+	persistCtx, persistCancel := persistenceContext()
+	tag, err := pg.Exec(persistCtx, `
+		UPDATE readings
+		   SET interpretation=$1, status=$2, worker_claim_token=NULL,
+		       worker_lease_until=NULL, updated_at=now()
+		 WHERE id=$3 AND worker_claim_token=$4
+		   AND status IN ('pending', 'pending_fallback') AND quota_state='allowed'`, text, status, job.id, job.token)
+	persistCancel()
+	if err != nil || tag.RowsAffected() != 1 {
+		g.failClaim(pg, job, policy)
+		return false
+	}
+	return true
 }
 
 func loadWorkerCards(ctx context.Context, pg *pgxpool.Pool, raw json.RawMessage) ([]CardValue, bool) {
@@ -290,11 +425,27 @@ func (g *Gateway) markFailed(pg *pgxpool.Pool, id, token string) {
 	}
 	ctx, cancel := persistenceContext()
 	defer cancel()
-	_, _ = pg.Exec(ctx, `
+	tag, err := pg.Exec(ctx, `
 		UPDATE readings
-		   SET status='failed', worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now()
+		   SET status='failed', failure_reason=$3, failed_at=now(),
+		       worker_claim_token=NULL, worker_lease_until=NULL, updated_at=now()
 		 WHERE id=$1 AND worker_claim_token=$2
-		   AND status IN ('pending', 'pending_fallback') AND quota_state='allowed'`, id, token)
+		   AND status IN ('pending', 'pending_fallback') AND quota_state='allowed'`, id, token, workerFailedReason)
+	if err != nil {
+		// Раньше ошибка молча терялась, и провал выглядел как «воркер не тронул
+		// строку»: слот оставался списанным, а чтение — pending навсегда.
+		log.Printf("ai worker: markFailed(%s): %v", id, err)
+		return
+	}
+	// A12/F-12: списание entitlement было сделано ДО вызова провайдера, поэтому
+	// терминальный провал обязан вернуть слот — иначе пользователь теряет
+	// бесплатное чтение (или оплаченный single) за неоказанную услугу.
+	if tag.RowsAffected() == 1 {
+		recovery := entitlements.New(pg, g.rd)
+		if _, err := recovery.ReleaseReadingAuthorization(ctx, id); err != nil {
+			log.Printf("ai worker: release authorization for failed reading %s: %v", id, err)
+		}
+	}
 }
 
 func (g *Gateway) releaseClaim(pg *pgxpool.Pool, id, token string, delay time.Duration) {

@@ -59,6 +59,7 @@ func TestE2EExistingAnonRequiresFingerprintAndCookieWins(t *testing.T) {
 	})
 	call := func(body, fpCookie string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/v1/auth/anon", strings.NewReader(body))
+		req.RemoteAddr = testIP(t) + ":1234"
 		req.Header.Set("Content-Type", "application/json")
 		if fpCookie != "" {
 			req.AddCookie(&http.Cookie{Name: FpCookie, Value: fpCookie})
@@ -263,7 +264,7 @@ func TestE2EMergeRejectsReferralCycle(t *testing.T) {
 	if _, err := pg.Exec(ctx, `INSERT INTO referrals (referrer_id, referee_id, code) VALUES ($1,$2,$3)`, other, loser, "C2"+fmt.Sprint(tgID)[1:]); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.Link(ctx, loser, tgID, "cycle-fp"); !errors.Is(err, errMergeCycle) {
+	if _, _, err := svc.Link(ctx, loser, tgID, "cycle-fp", false); !errors.Is(err, errMergeCycle) {
 		t.Fatalf("cycle merge error: %v", err)
 	}
 	var users int
@@ -309,7 +310,7 @@ func TestE2EMergePreservesMetadataReferralAndQuota(t *testing.T) {
 	if err := rd.Set(ctx, "ent:"+loser+":merge", 4, time.Hour).Err(); err != nil {
 		t.Fatal(err)
 	}
-	mergedID, merged, err := svc.Link(ctx, loser, tgID, "merge-fp")
+	mergedID, merged, err := svc.Link(ctx, loser, tgID, "merge-fp", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +380,7 @@ func TestE2EMergePreservesAuthorizationReceiptOwnership(t *testing.T) {
 		VALUES ($1,$2,'legacy')`, readingID, loser); err != nil {
 		t.Fatal(err)
 	}
-	mergedID, merged, err := svc.Link(ctx, loser, tgID, "receipt-merge-fp")
+	mergedID, merged, err := svc.Link(ctx, loser, tgID, "receipt-merge-fp", false)
 	if err != nil {
 		t.Fatal(err)
 	}

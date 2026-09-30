@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { paywallHits, csrf } from "@/lib/api";
+import { useScrollLock } from "@/lib/useScrollLock";
+import TelegramLinkCard from "@/components/TelegramLinkCard";
+import { useMe } from "@/lib/me";
 
 // Paywall-sheet: snap снизу, цены из plans (не хардкод, см. 02-functional/05, T18).
 export type Plan = { code: string; price_rub: number; stars_amount: number; duration_days: number | null };
@@ -31,6 +34,10 @@ export default function PaywallSheet({
   // + busy-guard от даблклика.
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [paying, setPaying] = useState<string | null>(null);
+  // Привязка Telegram — до оплаты, а не после. После оплаты подписка уже висит
+  // на анонимной строке, и привязка её спасёт только если человек ещё помнит,
+  // что покупал, и зайдёт в тот же аккаунт.
+  const { me, reload: reloadMe } = useMe();
 
   function keyFor(code: string): string {
     let k = keys[code];
@@ -122,11 +129,18 @@ export default function PaywallSheet({
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Пока окно открыто, страница под ним не крутится.
+  useScrollLock(true);
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-label="Оформление безлимита"
+      // items-end + max-h + ВНУТРЕННИЙ скролл: на низком экране (или при
+      // большем числе тарифов) содержимое не влезает, и раньше верх окна —
+      // с заголовком и чекбоксом 18+ — уезжал за пределы экрана и был
+      // недоступен. dvh, а не vh: адресная строка на мобильных меняет vh.
       className="fixed inset-0 z-20 flex items-end justify-center bg-deep/70"
       onClick={onClose}
     >
@@ -134,21 +148,27 @@ export default function PaywallSheet({
         initial={{ y: "100%" }}
         animate={{ y: 0 }}
         transition={{ type: "spring", damping: 28, stiffness: 300 }}
-        className="w-full max-w-md rounded-t-3xl border-t border-gold/40 bg-elev p-6"
+        className="flex max-h-[90dvh] w-full max-w-md flex-col rounded-t-3xl border-t border-gold/40 bg-elev"
         onClick={(e) => e.stopPropagation()}
       >
-        <p className="text-xl font-semibold text-paper">Заглянем глубже?</p>
-        <p className="mt-1 text-sm text-mist">На сегодня бесплатные карты закончились</p>
-        <label className="mt-3 flex cursor-pointer items-center gap-2 rounded-2xl border border-white/10 p-3">
-          <input
-            type="checkbox"
-            checked={adult}
-            onChange={(e) => confirmAdult(e.target.checked)}
-            className="h-5 w-5 accent-[#D4AF37]"
-          />
-          <span className="text-sm text-paper">Мне есть 18, я понимаю условия выше</span>
-        </label>
-        <ul className="mt-4 space-y-3">
+        {/* Шапка и подвал не уезжают — прокручивается только список тарифов. */}
+        <div className="shrink-0 px-6 pt-6">
+          <p className="text-xl font-semibold text-paper">Заглянем глубже?</p>
+          <p className="mt-1 text-sm text-mist">На сегодня бесплатные карты закончились</p>
+          <label className="mt-3 flex cursor-pointer items-center gap-2 rounded-2xl border border-white/10 p-3">
+            <input
+              type="checkbox"
+              checked={adult}
+              onChange={(e) => confirmAdult(e.target.checked)}
+              className="h-5 w-5 accent-[#D4AF37]"
+            />
+            <span className="text-sm text-paper">Мне есть 18, я понимаю условия выше</span>
+          </label>
+        </div>
+        <div className="shrink-0 px-6 pb-1">
+          <TelegramLinkCard me={me} compact onLinked={reloadMe} />
+        </div>
+        <ul className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-4">
           {ordered.map((p) => (
             <li
               key={p.code}
@@ -174,10 +194,12 @@ export default function PaywallSheet({
             </li>
           ))}
         </ul>
-        <p className="mt-4 text-xs text-mist">Оплата через Telegram Stars.</p>
-        <button onClick={onClose} className="mt-2 w-full py-2 text-sm text-mist">
-          Продолжить бесплатно завтра
-        </button>
+        <div className="shrink-0 px-6 pb-6">
+          <p className="text-xs text-mist">Оплата через Telegram Stars.</p>
+          <button onClick={onClose} className="mt-2 w-full py-2 text-sm text-mist">
+            Продолжить бесплатно завтра
+          </button>
+        </div>
       </motion.div>
     </div>
   );

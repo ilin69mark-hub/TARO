@@ -6,7 +6,9 @@ const state = {
   view: "dashboard",
   config: null,
   payments: [],
+  webhookAudit: null,
   pushStats: [],
+  access: [],
 };
 
 const views = {
@@ -16,6 +18,7 @@ const views = {
   spreads: "Расклады",
   payments: "Платежи",
   push: "Push",
+  access: "Доступ",
 };
 
 class ApiError extends Error {
@@ -237,6 +240,7 @@ function renderShell() {
       navButton("spreads", "Расклады", "04"),
       navButton("payments", "Платежи", "05"),
       navButton("push", "Push", "06"),
+      navButton("access", "Доступ", "07"),
     ]),
     el("div", { className: "sidebar-footer" }, [
       el("div", { className: "session-label", text: "Сессия администратора" }),
@@ -290,6 +294,7 @@ function renderView(content) {
   if (state.view === "spreads") renderSpreads(content);
   if (state.view === "payments") renderPayments(content);
   if (state.view === "push") renderPush(content);
+  if (state.view === "access") renderAccess(content);
 }
 
 function renderDashboard(content) {
@@ -517,11 +522,20 @@ function renderPayments(content) {
     el("option", { value: "", text: "Все статусы" }),
     ...["pending", "succeeded", "refunding", "refunded", "expired", "reconciliation"].map((value) => el("option", { value, text: value })),
   ]);
+  const auditWrap = el("div", { className: "table-wrap" });
   const tableWrap = el("div", { className: "table-wrap" });
   const update = () => renderPaymentRows(tableWrap, search.value, status.value);
   search.addEventListener("input", update);
   status.addEventListener("change", update);
   content.append(
+    // A09/F-09: payment_webhook_events писалась всегда, но читателей не было.
+    el("div", { className: "panel" }, [
+      el("div", { className: "panel-header" }, [
+        el("div", {}, [el("h3", { text: "Аудит вебхуков" }), el("p", { className: "small muted", text: "Дубликаты списаний и расхождения вебхуков. owner_unverified — нормальный первый вебхук." })]),
+        button("Обновить", "btn secondary", loadWebhookAudit),
+      ]),
+      el("div", { "data-webhook-audit": "" }),
+    ]),
     el("div", { className: "panel" }, [
       el("div", { className: "panel-header" }, [
         el("div", {}, [el("h3", { text: "Платежи" }), el("p", { className: "small muted", text: "Возврат доступен только для succeeded и требует подтверждения." })]),
@@ -532,6 +546,43 @@ function renderPayments(content) {
     ]),
   );
   renderPaymentRows(tableWrap, "", "");
+  renderWebhookAudit();
+}
+
+function renderWebhookAudit() {
+  const host = document.querySelector("[data-webhook-audit]");
+  if (!host) return;
+  const items = state.webhookAudit?.items || [];
+  host.replaceChildren();
+  if (!items.length) {
+    host.append(empty("Расхождений вебхуков нет"));
+    return;
+  }
+  const body = el("tbody");
+  for (const item of items) {
+    body.append(el("tr", {}, [
+      el("td", {}, [el("span", { className: "code", text: String(item.payment_id || "").slice(0, 8) })]),
+      el("td", {}, [badge(item.reason, item.needs_attention ? "bad" : "")]),
+      el("td", { text: String(item.events ?? "") }),
+      el("td", { text: String(item.payment_status || "—") }),
+      el("td", { text: String(item.refund_state || "—") }),
+      el("td", { text: formatNumber(item.amount_rub) }),
+      el("td", { text: formatDate(item.last_seen) }),
+    ]));
+  }
+  host.append(el("table", {}, [el("thead", {}, [el("tr", {}, [
+    el("th", { text: "Платёж" }), el("th", { text: "Причина" }), el("th", { text: "Событий" }),
+    el("th", { text: "Статус" }), el("th", { text: "Возврат" }), el("th", { text: "₽" }), el("th", { text: "Последнее" }),
+  ])]), body]));
+}
+
+async function loadWebhookAudit() {
+  try {
+    state.webhookAudit = await request("/v1/admin/payments/audit?limit=50");
+    if (state.view === "payments") render();
+  } catch (error) {
+    showError(error);
+  }
 }
 
 function renderPaymentRows(container, search, status) {
@@ -620,16 +671,146 @@ async function loadPayments() {
 }
 
 async function loadData() {
-  const [config, payments, pushStats] = await Promise.all([
+  // Аудит вебхуков не должен ронять загрузку панели: если endpoint недоступен,
+  // платежи и настройки всё равно показываем, блок аудита — пустой (A09/F-09).
+  const [config, payments, pushStats, audit, accessList] = await Promise.all([
     request("/v1/admin/config"),
     request("/v1/admin/payments?limit=200"),
     request("/v1/admin/push-stats"),
+    request("/v1/admin/payments/audit?limit=50").catch(() => null),
+    request("/v1/admin/access").catch(() => []),
   ]);
   state.config = config;
   state.payments = payments;
   state.pushStats = pushStats;
+  state.webhookAudit = audit;
+  state.access = accessList || [];
   state.authenticated = true;
   render();
 }
 
 renderLogin();
+
+// --- Раздел «Доступ»: ручная выдача безлимита --------------------------
+//
+// Безлимит — это активная подписка, а не флаг роли. Роль admin в лимитах не
+// участвует, поэтому «сделать админом» не помогает. Здесь оператор вставляет
+// user_id и выдаёт доступ; то же самое делает `adminctl access grant`.
+function renderAccess(content) {
+  const userId = el("input", {
+    type: "text",
+    placeholder: "user_id (UUID аккаунта)",
+    maxLength: "36",
+    spellcheck: "false",
+    autocomplete: "off",
+  });
+  const days = el("input", { type: "number", min: "1", max: "36500", step: "1", value: "36500" });
+
+  const grantButton = button("Выдать безлимит", "btn", async () => {
+    const id = userId.value.trim();
+    if (!id) {
+      showToast("Укажи user_id аккаунта", true);
+      return;
+    }
+    const value = Number(days.value) || 36500;
+    setBusy(grantButton, true, "Выдаём…");
+    try {
+      const result = await request("/v1/admin/access/grant", {
+        method: "POST",
+        body: JSON.stringify({ user_id: id, days: value }),
+      });
+      showToast(`Безлимит выдан до ${formatDate(result.valid_until)}`);
+      userId.value = "";
+      await loadAccess();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(grantButton, false);
+    }
+  });
+
+  const form = el("div", { className: "settings-list" }, [
+    el("div", { className: "setting-row" }, [
+      el("label", { text: "user_id" }),
+      userId,
+      el("div", { className: "setting-actions" }, [grantButton]),
+    ]),
+    el("div", { className: "setting-row" }, [
+      el("label", { text: "Срок, дней" }),
+      days,
+      el("div", { className: "setting-actions" }, [
+        el("span", { className: "muted small", text: "36500 — примерно 100 лет" }),
+      ]),
+    ]),
+  ]);
+
+  const table = el("div", { className: "table-wrap" });
+  renderAccessTable(table);
+  content.append(
+    el("div", { className: "panel" }, [
+      el("div", { className: "panel-header" }, [
+        el("div", {}, [
+          el("h3", { text: "Ручной доступ" }),
+          el("p", { className: "small muted", text: "Кто имеет безлимит сейчас. Отзыв не удаляет строку, а помечает её отозванной — ради аудита." }),
+        ]),
+      ]),
+      form,
+    ]),
+    el("div", { className: "panel" }, [el("div", { className: "panel-header" }, [el("h3", { text: "Кому выдано" })]), table]),
+  );
+}
+
+function renderAccessTable(container) {
+  container.replaceChildren();
+  if (!state.access.length) {
+    container.append(empty("Ручного доступа пока нет"));
+    return;
+  }
+  const body = el("tbody");
+  for (const item of state.access) {
+    const status = item.active
+      ? badge("действует", "good")
+      : badge(item.status === "revoked" ? "отозван" : "истёк", item.status === "revoked" ? "bad" : "warn");
+    const revokeButton = item.active
+      ? button("Отозвать", "btn ghost", async () => {
+          setBusy(revokeButton, true, "Отзываем…");
+          try {
+            const result = await request("/v1/admin/access/revoke", {
+              method: "POST",
+              body: JSON.stringify({ user_id: item.user_id }),
+            });
+            showToast(result.revoked ? "Доступ отозван" : "Активного доступа не было");
+            await loadAccess();
+          } catch (error) {
+            showError(error);
+          } finally {
+            setBusy(revokeButton, false);
+          }
+        })
+      : el("span", { className: "muted small", text: "—" });
+    body.append(
+      el("tr", {}, [
+        el("td", {}, [el("code", { text: item.user_id })]),
+        el("td", {}, [status]),
+        el("td", { text: formatDate(item.valid_until) }),
+        el("td", { text: item.source_type }),
+        el("td", {}, [revokeButton]),
+      ]),
+    );
+  }
+  container.append(
+    el("table", {}, [
+      el("thead", {}, [el("tr", {}, [el("th", { text: "Аккаунт" }), el("th", { text: "Состояние" }), el("th", { text: "Действует до" }), el("th", { text: "Источник" }), el("th", { text: "" })])]),
+      body,
+    ]),
+  );
+}
+
+async function loadAccess() {
+  try {
+    state.access = await request("/v1/admin/access");
+  } catch (error) {
+    showError(error);
+  }
+  if (state.view === "access") render();
+}
