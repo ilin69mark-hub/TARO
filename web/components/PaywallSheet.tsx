@@ -153,18 +153,29 @@ export default function PaywallSheet({
       role="dialog"
       aria-modal="true"
       aria-label="Оформление безлимита"
-      // items-end + max-h + ВНУТРЕННИЙ скролл: на низком экране (или при
-      // большем числе тарифов) содержимое не влезает, и раньше верх окна —
-      // с заголовком и чекбоксом 18+ — уезжал за пределы экрана и был
-      // недоступен. dvh, а не vh: адресная строка на мобильных меняет vh.
-      className="fixed inset-0 z-20 flex items-end justify-center bg-deep/70"
+      // По центру, а не прижато к низу (2026-09-30, требование владельца).
+      // Прижатый к низу шит читался как «ещё один слой снизу» и оставлял
+      // половину страницы активной — взгляд цеплялся за неё, а не за тарифы.
+      //
+      // Фон приглушён и размыт по образцу DrawMagic (bg-deep/85 backdrop-blur-md):
+      // размытие убирает остаточные детали страницы, на которые глаз спотыкался
+      // даже сквозь плотную заливку. p-4 — чтобы на узких экранах карточка не
+      // липла к краям.
+      //
+      // Здесь max-h нет намеренно: высоту окна держит сама карточка (max-h
+      // ниже), а оверлей лишь центрирует.
+      className="fixed inset-0 z-20 flex items-center justify-center bg-deep/85 p-4 backdrop-blur-md"
       onClick={onClose}
     >
       <motion.div
-        initial={{ y: "100%" }}
-        animate={{ y: 0 }}
-        transition={{ type: "spring", damping: 28, stiffness: 300 }}
-        className="flex max-h-[90dvh] w-full max-w-md flex-col rounded-t-3xl border-t border-gold/40 bg-elev"
+        // Анимация была «выезд снизу» (y: 100%) — она принадлежала компоновке с
+        // прижатием к низу. Для центрированного окна она выглядела бы как
+        // «выпадающий список», поэтому теперь это мягкое проявление с лёгким
+        // подъёмом: тот же пружинный характер, но без выезда из-за края.
+        initial={{ opacity: 0, y: 16, scale: 0.97 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={{ type: "spring", damping: 26, stiffness: 320 }}
+        className="flex max-h-[90dvh] w-full max-w-md flex-col overflow-y-auto rounded-3xl border border-gold/40 bg-elev shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
 
